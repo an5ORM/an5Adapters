@@ -2,12 +2,15 @@
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "./typescript",
-    "rootDir": "./typescript",
+    "rootDir": "..",
+    "preserveSymlinks": true,
     "declaration": true,
     "declarationMap": true,
     "paths": {
       "@an5/client": ["../an5Client/typescript"],
-      "@an5/client/*": ["../an5Client/typescript/*"]
+      "@an5/client/*": ["../an5Client/typescript/*"],
+      "an5-client/typescript": ["../an5Client/typescript"],
+      "an5-client/typescript/*": ["../an5Client/typescript/*"]
     }
   },
   "include": ["typescript/**/*.ts"],

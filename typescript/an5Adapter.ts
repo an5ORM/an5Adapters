@@ -285,13 +285,15 @@ export class AdapterTableClient<T = any> {
     const fields = modelFields[this.modelName] || {};
     const idFieldName = Object.prototype.hasOwnProperty.call(fields, 'id')
       ? 'id'
-      : Object.keys(fields).find((name) => name.endsWith('_id'));
+      : Object.keys(fields).find((name) => name.endsWith('_id') || name.endsWith('Id') || name.toLowerCase() === 'id');
 
     const data: any = { ...args.data };
     if (idFieldName) {
-      const fieldDef = fields[idFieldName];
-      const tsType = typeof fieldDef === 'string' ? fieldDef : fieldDef?.ts;
-      if (tsType === 'string' && !data[idFieldName]) {
+      const fieldDef: any = fields[idFieldName];
+      const rawType = typeof fieldDef === 'string' ? fieldDef : (fieldDef?.ts || fieldDef?.sql || fieldDef?.type || '');
+      const normalizedType = String(rawType).toLowerCase();
+      const isStringType = ['string', 'uuid', 'uniqueidentifier', 'nvarchar', 'varchar', 'text'].includes(normalizedType);
+      if (isStringType && !data[idFieldName]) {
         data[idFieldName] = randomUUID();
       }
     }

@@ -29,6 +29,7 @@
     "test:python": "python -m compileall python 2>&1"
   },
   "dependencies": {
+    "an5-client": "file:../an5Client",
     "mssql": "^12.5.5"
   },
   "devDependencies": {
