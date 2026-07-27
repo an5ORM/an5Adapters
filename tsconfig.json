@@ -13,6 +13,6 @@
       "an5-client/typescript/*": ["../an5Client/typescript/*"]
     }
   },
-  "include": ["typescript/**/*.ts"],
+  "include": ["typescript/**/*.ts", "googlesheets/**/*.ts"],
   "exclude": ["node_modules", "dist", "python", "dotnet", "test"]
 }

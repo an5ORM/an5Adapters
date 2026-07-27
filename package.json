@@ -10,26 +10,31 @@
     "./typescript": "./typescript/index.js",
     "./typescript/*": "./typescript/*",
     "./python": "./python/an5_adapter.py",
-    "./dotnet": "./dotnet/An5Adapter.cs"
+    "./dotnet": "./dotnet/An5Adapter.cs",
+    "./googlesheets": "./googlesheets/index.js",
+    "./googlesheets/*": "./googlesheets/*",
+    "./unified": "./typescript/unified.js"
   },
   "repository": {
     "type": "git",
     "url": "https://github.com/an5ORM/an5Adapters.git"
   },
-  "keywords": ["an5", "orm", "adapter", "typescript", "python", "dotnet"],
+  "keywords": ["an5", "orm", "adapter", "typescript", "python", "dotnet", "googlesheets", "google-sheets"],
   "files": [
     "typescript/**/*.{ts,js,d.ts}",
     "python/**/*",
     "dotnet/**/*",
+    "googlesheets/**/*",
     "README.md"
   ],
   "scripts": {
     "build": "tsc --noEmit",
-    "test": "node -e \"const fs = require('fs'); const files = ['typescript/an5Adapter.ts', 'typescript/index.ts']; files.forEach(f => { if (!fs.existsSync(f)) { console.error('Missing: ' + f); process.exit(1); } }); console.log('All adapter files exist');\" 2>&1",
+    "test": "node test/unit.test.js",
     "test:python": "python -m compileall python 2>&1"
   },
   "dependencies": {
     "an5-client": "file:../an5Client",
+    "googleapis": "^134.0.0",
     "mssql": "^12.5.5"
   },
   "devDependencies": {

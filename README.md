@@ -1,6 +1,6 @@
 # an5Adapters
 
-Standalone runtime adapters for AN5 ORM. Provides connection pooling, query execution, and typed table clients in TypeScript, Python, and .NET.
+Standalone runtime adapters for AN5 ORM. Provides connection pooling, query execution, typed table clients in TypeScript, Python, .NET, and Google Sheets API.
 
 ## Features
 
@@ -10,6 +10,7 @@ Standalone runtime adapters for AN5 ORM. Provides connection pooling, query exec
 - **Vector search** — Cosine, euclidean, and dot product similarity
 - **Transactions** — Begin/commit/rollback with automatic cleanup
 - **Cross-language** — Same API in TypeScript, Python, and .NET
+- **Google Sheets** — Use spreadsheets as a database with the same CRUD API
 
 ## Installation
 
@@ -93,19 +94,94 @@ db.Transaction(tx => {
 });
 ```
 
+### Google Sheets
+
+```typescript
+import { createAn5SheetsAdapter } from 'an5-adapters/googlesheets';
+
+const db = createAn5SheetsAdapter({
+  spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms',
+  // Option 1: client email + private key
+  clientEmail: 'sa@project.iam.gserviceaccount.com',
+  privateKey: '-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----',
+  // Option 2: full service account JSON
+  // credentials: { client_email: '...', private_key: '...' },
+  // Optional: map model names to sheet names
+  sheetMapping: { users: 'UsersData', orders: 'OrdersData' },
+});
+
+// Table client (same API as SQL adapters)
+const users = db.table<User>('users');
+await users.findMany({ where: { active: true }, take: 10 });
+await users.create({ data: { name: 'John', email: 'john@example.com' } });
+await users.update({ where: { email: 'john@example.com' }, data: { name: 'Johnny' } });
+await users.delete({ where: { email: 'john@example.com' } });
+
+// Raw range access (Google Sheets specific)
+const rawData = await db.readRange('Sheet1!A1:C10');
+await db.writeRange('Sheet1!A1:B2', [['Name', 'Age'], ['Alice', '30']]);
+await db.appendRange('Sheet1!A:A', [['Bob', '25']]);
+
+// Auto-creates sheet + header row on first create()
+await db.table('orders').create({ data: { id: '1', total: 100 } });
+
+// List, delete sheets
+const sheets = await db.listSheets();
+await db.deleteSheet('OldSheet');
+
+// Clear data (keeps headers) or delete all rows
+await db.table('users').clear();
+await db.table('users').deleteAll();
+```
+
+### Unified factory (auto-detect adapter)
+
+```typescript
+import { createAdapter } from 'an5-adapters/unified';
+
+// Auto-detects from connection string
+const sqlDb = createAdapter({ connectionString: 'sqlserver://localhost:1433;database=mydb;user=sa;password=pass' });
+
+const sheetsDb = createAdapter({
+  connectionString: 'googlesheets://spreadsheetId;clientEmail=sa@project.iam.gserviceaccount.com;privateKey=...',
+});
+
+// Or use the Sheets config object directly (also auto-detected)
+const sheetsDb2 = createAdapter({
+  spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms',
+  clientEmail: 'sa@project.iam.gserviceaccount.com',
+  privateKey: '-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----',
+});
+```
+
+**Notes:**
+- Each model/table maps to a **sheet tab** (first row = headers)
+- Sheets without header rows get auto-created on first `create()`
+- Type coercion uses `modelFields` metadata (`number` → `Number`, `boolean` → `Boolean`)
+- Numeric strings (without leading zeros) are auto-coerced; `"00123"` stays string
+- Boolean strings `"true"` / `"false"` are auto-coerced
+- Sheet names with spaces are automatically escaped (A1 notation)
+- Supports service account JSON or individual `clientEmail`+`privateKey`
+- Automatic retry with exponential backoff for rate limits (429/500/503)
+
 ## API Reference
 
-### An5Adapter
+### An5Adapter / An5SheetsAdapter
 
 | Method | Description |
 |--------|-------------|
-| `exec(query, params)` | Execute query, return rows |
+| `exec(query, params)` | Execute query, return rows (SQL only) |
 | `table<T>(name)` | Get typed table client |
 | `$transaction(fn)` | Execute in transaction |
-| `$connect()` | Open connection pool |
-| `$disconnect()` | Close connection pool |
+| `$connect()` | Open connection / authenticate |
+| `$disconnect()` | Close connection / clear auth |
+| `readRange(range)` | Read raw sheet range (Sheets only) |
+| `writeRange(range, values)` | Write raw sheet range (Sheets only) |
+| `appendRange(range, values)` | Append rows to sheet (Sheets only) |
+| `listSheets()` | List all sheet tab names (Sheets only) |
+| `deleteSheet(name)` | Delete a sheet tab (Sheets only) |
 
-### AdapterTableClient
+### AdapterTableClient / SheetsTableClient
 
 | Method | Description |
 |--------|-------------|
@@ -123,6 +199,8 @@ db.Transaction(tx => {
 | `aggregate(args)` | SUM, AVG, MIN, MAX, COUNT |
 | `groupBy(args)` | Group by fields |
 | `vectorSearch(args)` | Semantic similarity search |
+| `clear()` | Clear all data rows, keep headers (Sheets only) |
+| `deleteAll()` | Delete all data rows including headers (Sheets only) |
 
 ## Testing
 
