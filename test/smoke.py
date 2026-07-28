@@ -20,7 +20,13 @@ assert _resolve_table('backgroundJob') == '[dbo].[background_jobs]'
 
 set_adapter_metadata({
     'model_to_table': {'lLMProvider': '[dbo].[llm_providers]'},
-    'model_fields': {'lLMProvider': {'id': 'string', 'provider': 'string', 'apiKey': 'string?'}},
+    'model_fields': {
+        'lLMProvider': [
+            {'name': 'id', 'type': 'string', 'isId': False},
+            {'name': 'provider', 'type': 'string', 'isId': False},
+            {'name': 'apiKey', 'type': 'string?', 'isId': False},
+        ]
+    },
 })
 
 class FakeAdapter:
@@ -50,5 +56,15 @@ creator = FakeAdapter('mssql')
 created = AdapterTableClient(creator, 'lLMProvider').create({'id': '1', 'provider': 'openai', 'apiKey': 'secret'})
 assert created['provider'] == 'openai'
 assert 'INSERT INTO [dbo].[llm_providers]' in creator.query
+
+set_adapter_metadata({
+    'model_to_table': {'legacyModel': '[dbo].[legacy_models]'},
+    'model_fields': {'legacyModel': {'id': 'string'}},
+})
+try:
+    AdapterTableClient(FakeAdapter('mssql'), 'legacyModel').create({'id': '1'})
+    raise AssertionError('Expected dict-shaped metadata to fail')
+except TypeError as exc:
+    assert 'Regenerate with @an5/orm >= 1.0.4' in str(exc)
 
 print('an5Adapters smoke test passed')

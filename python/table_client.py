@@ -30,13 +30,10 @@ class AdapterTableClient:
     def _fields(self) -> List[Dict]:
         fields = model_fields.get(self._model, [])
         if isinstance(fields, dict):
-            normalized = []
-            for name, value in fields.items():
-                if isinstance(value, dict):
-                    normalized.append({"name": name, **value})
-                else:
-                    normalized.append({"name": name, "type": value})
-            return normalized
+            raise TypeError(
+                "AN5 Python metadata is out of date. Regenerate with @an5/orm >= 1.0.4 "
+                "so MODEL_FIELDS uses a list of field objects."
+            )
         return fields
 
     def _pagination(self, take: Optional[int], skip: int, order_sql: str) -> str:
