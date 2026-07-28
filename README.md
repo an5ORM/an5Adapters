@@ -97,7 +97,7 @@ db.Transaction(tx => {
 ### Google Sheets
 
 ```typescript
-import { createAn5SheetsAdapter } from 'an5-adapters/googlesheets';
+import { createAn5SheetsAdapter } from 'an5-adapters';
 
 const db = createAn5SheetsAdapter({
   spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms',
@@ -134,15 +134,15 @@ await db.table('users').clear();
 await db.table('users').deleteAll();
 ```
 
-### Unified factory (auto-detect adapter)
+### Integrated factory (auto-detect adapter)
 
 ```typescript
-import { createAdapter } from 'an5-adapters/unified';
+import { createAn5Adapter, createAdapter, An5Adapter } from 'an5-adapters';
 
 // Auto-detects from connection string
-const sqlDb = createAdapter({ connectionString: 'sqlserver://localhost:1433;database=mydb;user=sa;password=pass' });
+const sqlDb = createAn5Adapter({ connectionString: 'sqlserver://localhost:1433;database=mydb;user=sa;password=pass' });
 
-const sheetsDb = createAdapter({
+const sheetsDb = createAn5Adapter({
   connectionString: 'googlesheets://spreadsheetId;clientEmail=sa@project.iam.gserviceaccount.com;privateKey=...',
 });
 
@@ -152,12 +152,17 @@ const sheetsDb2 = createAdapter({
   clientEmail: 'sa@project.iam.gserviceaccount.com',
   privateKey: '-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----',
 });
+
+// Constructor form also delegates googlesheets:// to the Sheets adapter
+const sheetsDb3 = new An5Adapter({
+  connectionString: 'googlesheets://spreadsheetId;clientEmail=sa@project.iam.gserviceaccount.com;privateKey=...',
+});
 ```
 
 **Notes:**
 - Each model/table maps to a **sheet tab** (first row = headers)
 - Sheets without header rows get auto-created on first `create()`
-- Type coercion uses `modelFields` metadata (`number` → `Number`, `boolean` → `Boolean`)
+- Type coercion can use optional adapter metadata (`setAdapterMetadata`) for field types and model-to-table mapping
 - Numeric strings (without leading zeros) are auto-coerced; `"00123"` stays string
 - Boolean strings `"true"` / `"false"` are auto-coerced
 - Sheet names with spaces are automatically escaped (A1 notation)
@@ -201,6 +206,13 @@ const sheetsDb2 = createAdapter({
 | `vectorSearch(args)` | Semantic similarity search |
 | `clear()` | Clear all data rows, keep headers (Sheets only) |
 | `deleteAll()` | Delete all data rows including headers (Sheets only) |
+
+## Provider Layout
+
+- TypeScript providers live under `typescript/{base,mssql,postgres,mysql,sqlite,googlesheets}`.
+- Python providers live under `python/{base,mssql,postgres}`, with `python/an5_adapter.py` kept as the public facade.
+- .NET providers live under `dotnet/{Base,Mssql,Postgres}`, with `dotnet/an5Adapter.cs` kept as the public facade.
+- Adapters do not depend on generated `an5-client` artifacts; generated clients may pass metadata in explicitly when they need model/table mapping.
 
 ## Testing
 

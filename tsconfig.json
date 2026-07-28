@@ -3,16 +3,19 @@
   "compilerOptions": {
     "outDir": "./typescript",
     "rootDir": "..",
+    "ignoreDeprecations": "6.0",
     "preserveSymlinks": true,
     "declaration": true,
-    "declarationMap": true,
-    "paths": {
-      "@an5/client": ["../an5Client/typescript"],
-      "@an5/client/*": ["../an5Client/typescript/*"],
-      "an5-client/typescript": ["../an5Client/typescript"],
-      "an5-client/typescript/*": ["../an5Client/typescript/*"]
-    }
+    "declarationMap": true
   },
-  "include": ["typescript/**/*.ts", "googlesheets/**/*.ts"],
-  "exclude": ["node_modules", "dist", "python", "dotnet", "test"]
+  "include": [
+    "typescript/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "python",
+    "dotnet",
+    "test"
+  ]
 }

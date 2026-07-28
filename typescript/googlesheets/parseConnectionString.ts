@@ -1,4 +1,4 @@
-import { An5SheetsAdapterConfig } from './an5SheetsAdapter';
+import type { An5SheetsAdapterConfig } from './config';
 
 /**
  * Parse a `googlesheets://` connection string into An5SheetsAdapterConfig.

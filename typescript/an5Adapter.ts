@@ -1,109 +1,110 @@
-/**
- * an5Adapter.ts
- * Standalone TypeScript runtime adapter for AN5 ORM.
- * Provides query execution and table client factory - can be used independently
- * from the main project runtime (an5Orm.ts).
- *
- * Usage:
- *   import { createAn5Adapter } from './an5Client/typescript/an5Adapter';
- *   const db = createAn5Adapter({ connectionString: process.env.DATABASE_URL });
- */
-
-import sql from 'mssql';
 import { randomUUID } from 'crypto';
-import { An5 } from 'an5-client/typescript';
-import { modelToTable, relationMap, RelationDef, modelFields } from 'an5-client/typescript/an5Metadata';
 
-// ─── Connection Config ────────────────────────────────────────────────────────
+import {
+  An5SheetsAdapter,
+  An5SheetsAdapterConfig,
+  SheetsTableClient,
+} from './googlesheets';
+import { parseSheetsConnectionString } from './googlesheets/parseConnectionString';
+import type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
+import { buildOrderBy, parseWhere, quote } from './base/sql';
+import { getFieldsForModel, getModelToTable, setAdapterMetadata, type AdapterMetadata } from './base/metadata';
+import { MssqlEngine } from './mssql';
+import { PostgresEngine } from './postgres';
+import { MysqlEngine } from './mysql';
+import { SqliteEngine } from './sqlite';
 
-export interface An5AdapterConfig {
-  connectionString: string;
-  /** Max pool connections (default: 10) */
-  poolMax?: number;
-  /** Request timeout ms (default: 60000) */
-  requestTimeout?: number;
-  /** Connection timeout ms (default: 15000) */
-  connectionTimeout?: number;
+export type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
+export { setAdapterMetadata, type AdapterMetadata } from './base/metadata';
+
+export type AnyAdapter = An5Adapter | An5SheetsAdapter;
+export type AnyAdapterConfig = An5AdapterConfig | An5SheetsAdapterConfig | { connectionString: string };
+
+function isSheetsConfig(config: AnyAdapterConfig): config is An5SheetsAdapterConfig {
+  return (config as any).spreadsheetId !== undefined;
 }
 
-function parseConnectionString(url: string): sql.config {
-  const cleanUrl = (url || '').replace('sqlserver://', '');
-  const parts = cleanUrl.split(';');
-  const [server, portStr] = parts[0].split(':');
-  const port = portStr ? parseInt(portStr, 10) : 1433;
-
-  const config: any = {
-    server,
-    port,
-    options: { encrypt: true, trustServerCertificate: true },
-    pool: { max: 10, min: 0, idleTimeoutMillis: 30000 },
-    requestTimeout: 60000,
-    connectionTimeout: 15000,
-  };
-
-  for (let i = 1; i < parts.length; i++) {
-    const part = parts[i].trim();
-    if (!part) continue;
-    const eqIdx = part.indexOf('=');
-    if (eqIdx === -1) continue;
-    const key = part.slice(0, eqIdx).trim().toLowerCase();
-    const value = decodeURIComponent(part.slice(eqIdx + 1).trim());
-    if (key === 'database') config.database = value;
-    else if (key === 'user' || key === 'uid') config.user = value;
-    else if (key === 'password' || key === 'pwd') config.password = value;
-    else if (key === 'encrypt') config.options.encrypt = value === 'true';
-    else if (key === 'trustservercertificate') config.options.trustServerCertificate = value === 'true';
-  }
-  return config;
-}
-
-// ─── Query Engine ─────────────────────────────────────────────────────────────
+// ─── An5Adapter ────────────────────────────────────────────────────────────────────
 
 export class An5Adapter {
-  private pool: Promise<sql.ConnectionPool> | null = null;
-  private config: sql.config;
+  private engine: QueryEngine | null = null;
+  private sheetsAdapter: An5SheetsAdapter | null = null;
 
-  constructor(adapterConfig: An5AdapterConfig) {
-    this.config = parseConnectionString(adapterConfig.connectionString);
-    if (adapterConfig.poolMax) this.config.pool = { ...this.config.pool, max: adapterConfig.poolMax };
-    if (adapterConfig.requestTimeout) this.config.requestTimeout = adapterConfig.requestTimeout;
-    if (adapterConfig.connectionTimeout) this.config.connectionTimeout = adapterConfig.connectionTimeout;
+  get dialect(): Dialect { return this.sheetsAdapter ? 'googlesheets' : this.requireEngine().dialect; }
+
+  constructor(adapterConfig: An5AdapterConfig | An5SheetsAdapterConfig) {
+    if (isSheetsConfig(adapterConfig)) {
+      this.sheetsAdapter = new An5SheetsAdapter(adapterConfig);
+      return;
+    }
+
+    const cs = adapterConfig.connectionString.trim();
+    if (cs.startsWith('googlesheets://')) {
+      this.sheetsAdapter = new An5SheetsAdapter(parseSheetsConnectionString(cs));
+      return;
+    }
+
+    if (cs.startsWith('postgres://') || cs.startsWith('postgresql://')) {
+      this.engine = new PostgresEngine(adapterConfig);
+    } else if (cs.startsWith('mysql://') || cs.startsWith('mariadb://')) {
+      this.engine = new MysqlEngine(adapterConfig);
+    } else if (cs.startsWith('sqlite://') || cs.endsWith('.sqlite') || cs.endsWith('.db')) {
+      this.engine = new SqliteEngine(adapterConfig);
+    } else {
+      this.engine = new MssqlEngine(adapterConfig);
+    }
   }
 
-  async getPool(): Promise<sql.ConnectionPool> {
-    if (!this.pool) {
-      this.pool = new sql.ConnectionPool(this.config).connect();
-    }
-    return this.pool;
+  private requireEngine(): QueryEngine {
+    if (!this.engine) throw new Error('SQL engine is not available for Google Sheets adapter');
+    return this.engine;
+  }
+
+  private requireSheetsAdapter(): An5SheetsAdapter {
+    if (!this.sheetsAdapter) throw new Error('Google Sheets methods require a googlesheets:// connection or Sheets config');
+    return this.sheetsAdapter;
   }
 
   async exec<T = any>(query: string, params?: Record<string, any>): Promise<T[]> {
-    const pool = await this.getPool();
-    const req = new sql.Request(pool);
-    if (params) {
-      for (const [k, v] of Object.entries(params)) {
-        req.input(k, v ?? null);
-      }
-    }
-    const result = await req.query(query);
-    return (result.recordset || []) as T[];
+    if (this.sheetsAdapter) return this.sheetsAdapter.exec<T>(query, params);
+    return this.requireEngine().exec<T>(query, params);
   }
 
+  /** INTERNAL: used by AdapterTableClient for DML statements needing row count */
+  async _executeRaw(query: string, params?: Record<string, any>): Promise<number> {
+    return this.requireEngine().executeRaw(query, params);
+  }
+
+  /** Execute a raw query with positional values → @p_0, @p_1, ... per dialect */
   async $queryRawUnsafe<T = any>(query: string, ...values: any[]): Promise<T[]> {
+    if (this.sheetsAdapter) return this.sheetsAdapter.$queryRawUnsafe<T>(query, ...values);
     const params: Record<string, any> = {};
     values.forEach((v, i) => { params[`p_${i}`] = v; });
-    const paramQuery = query.replace(/@p_(\d+)/g, (_, i) => `@p_${i}`);
-    return this.exec<T>(paramQuery, params);
+    // Normalise external positional placeholders → @p_N so each engine can re-transform
+    let q = query;
+    if (this.dialect === 'postgres') {
+      let idx = 0;
+      q = q.replace(/\$\d+/g, () => `@p_${idx++}`);
+    } else if (this.dialect === 'mysql') {
+      let idx = 0;
+      q = q.replace(/\?/g, () => `@p_${idx++}`);
+    }
+    return this.exec<T>(q, params);
   }
 
   async $executeRaw(query: string, ...values: any[]): Promise<number> {
+    if (this.sheetsAdapter) return this.sheetsAdapter.$executeRaw(query, ...values);
     const params: Record<string, any> = {};
     values.forEach((v, i) => { params[`p_${i}`] = v; });
-    const pool = await this.getPool();
-    const req = new sql.Request(pool);
-    for (const [k, v] of Object.entries(params)) req.input(k, v ?? null);
-    const result = await req.query(query);
-    return result.rowsAffected[0] ?? 0;
+    let q = query;
+    if (this.dialect === 'postgres') {
+      let idx = 0;
+      q = q.replace(/\$\d+/g, () => `@p_${idx++}`);
+    } else if (this.dialect === 'mysql') {
+      let idx = 0;
+      q = q.replace(/\?/g, () => `@p_${idx++}`);
+    }
+    return this.requireEngine().executeRaw(q, params);
   }
 
   async $executeRawUnsafe(query: string, ...values: any[]): Promise<number> {
@@ -111,116 +112,94 @@ export class An5Adapter {
   }
 
   async $connect(): Promise<void> {
-    await this.getPool();
+    if (this.sheetsAdapter) return this.sheetsAdapter.$connect();
+    await this.requireEngine().connect();
   }
 
   async $disconnect(): Promise<void> {
-    if (this.pool) {
-      const p = await this.pool;
-      await p.close();
-      this.pool = null;
+    if (this.sheetsAdapter) return this.sheetsAdapter.$disconnect();
+    await this.requireEngine().disconnect();
+  }
+
+  /** Real transaction with BEGIN / COMMIT / ROLLBACK */
+  async $transaction<R>(fn: (tx: An5AdapterTx) => Promise<R>, options?: { timeout?: number }): Promise<R>;
+  async $transaction<R>(list: Promise<R>[]): Promise<R[]>;
+  async $transaction(fn: any, _options?: any): Promise<any> {
+    if (this.sheetsAdapter) return this.sheetsAdapter.$transaction(fn, _options);
+    if (Array.isArray(fn)) return Promise.all(fn);
+    const handle = await this.requireEngine().beginTransaction();
+    const txAdapter = new An5AdapterTx(handle, this.dialect);
+    try {
+      const result = await fn(txAdapter);
+      await handle.commit();
+      return result;
+    } catch (err) {
+      await handle.rollback();
+      throw err;
     }
   }
 
-  async $transaction<R>(fn: (tx: An5Adapter) => Promise<R>, options?: { timeout?: number }): Promise<R>;
-  async $transaction<R>(list: Promise<R>[]): Promise<R[]>;
-  async $transaction(fn: any, options?: any): Promise<any> {
-    if (typeof fn === 'function') return fn(this);
-    return Promise.all(fn);
+  table<T = any>(modelName: string): AdapterTableClient<T> | SheetsTableClient<T> {
+    if (this.sheetsAdapter) return this.sheetsAdapter.table<T>(modelName);
+    return new AdapterTableClient<T>(this, modelName);
   }
 
-  // ── Table client factory ──────────────────────────────────────────────────
+  async readRange<T = any>(range: string): Promise<T[][]> {
+    return this.requireSheetsAdapter().readRange<T>(range);
+  }
+
+  async writeRange(range: string, values: any[][]): Promise<void> {
+    await this.requireSheetsAdapter().writeRange(range, values);
+  }
+
+  async appendRange(range: string, values: any[][]): Promise<void> {
+    await this.requireSheetsAdapter().appendRange(range, values);
+  }
+
+  async listSheets(): Promise<string[]> {
+    return this.requireSheetsAdapter().listSheets();
+  }
+
+  async deleteSheet(name: string): Promise<void> {
+    await this.requireSheetsAdapter().deleteSheet(name);
+  }
+}
+
+// ─── Transaction-scoped adapter ────────────────────────────────────────────────────
+
+export class An5AdapterTx {
+  constructor(
+    private readonly handle: TransactionHandle,
+    public readonly dialect: Dialect,
+  ) { }
+
+  async exec<T = any>(query: string, params?: Record<string, any>): Promise<T[]> {
+    return this.handle.exec<T>(query, params);
+  }
+
+  async _executeRaw(query: string, params?: Record<string, any>): Promise<number> {
+    return this.handle.executeRaw(query, params);
+  }
 
   table<T = any>(modelName: string): AdapterTableClient<T> {
     return new AdapterTableClient<T>(this, modelName);
   }
 }
 
-// ─── Table Client ─────────────────────────────────────────────────────────────
-
-function parseWhere(modelName: string, where: any, params: Record<string, any>, prefix = ''): string {
-  if (!where) return '';
-  const conditions: string[] = [];
-  const tableName = modelToTable[modelName] || modelName;
-
-  const cleanWhere: Record<string, any> = {};
-  for (const [key, value] of Object.entries(where)) {
-    if (
-      key.includes('_') &&
-      value && typeof value === 'object' &&
-      !(value instanceof Date) &&
-      !(value as any).in && !(value as any).contains &&
-      !(value as any).not && !(value as any).gte &&
-      !(value as any).lte && !(value as any).gt && !(value as any).lt
-    ) {
-      Object.assign(cleanWhere, value);
-    } else {
-      cleanWhere[key] = value;
-    }
-  }
-
-  for (const [key, value] of Object.entries(cleanWhere)) {
-    if (key === 'OR' && Array.isArray(value)) {
-      const sub = value.map((v, i) => parseWhere(modelName, v, params, `${prefix}or_${i}_`)).filter(Boolean);
-      if (sub.length > 0) conditions.push(`(${sub.join(' OR ')})`);
-    } else if (key === 'AND' && Array.isArray(value)) {
-      const sub = value.map((v, i) => parseWhere(modelName, v, params, `${prefix}and_${i}_`)).filter(Boolean);
-      if (sub.length > 0) conditions.push(`(${sub.join(' AND ')})`);
-    } else {
-      const pname = `${prefix}${key}`;
-      const col = `[${key}]`;
-
-      if (value === null) {
-        conditions.push(`${col} IS NULL`);
-      } else if (typeof value === 'object' && !(value instanceof Date)) {
-        const v = value as any;
-        if (v.not !== undefined) {
-          if (v.not === null) { conditions.push(`${col} IS NOT NULL`); }
-          else { const p = `${pname}_not`; params[p] = v.not; conditions.push(`${col} <> @${p}`); }
-        }
-        if (v.equals !== undefined) { const p = `${pname}_eq`; params[p] = v.equals; conditions.push(`${col} = @${p}`); }
-        if (v.contains !== undefined) { const p = `${pname}_co`; params[p] = `%${v.contains}%`; conditions.push(`${col} LIKE @${p}`); }
-        if (v.startsWith !== undefined) { const p = `${pname}_sw`; params[p] = `${v.startsWith}%`; conditions.push(`${col} LIKE @${p}`); }
-        if (v.endsWith !== undefined) { const p = `${pname}_ew`; params[p] = `%${v.endsWith}`; conditions.push(`${col} LIKE @${p}`); }
-        if (v.gte !== undefined) { const p = `${pname}_gte`; params[p] = v.gte; conditions.push(`${col} >= @${p}`); }
-        if (v.lte !== undefined) { const p = `${pname}_lte`; params[p] = v.lte; conditions.push(`${col} <= @${p}`); }
-        if (v.gt !== undefined) { const p = `${pname}_gt`; params[p] = v.gt; conditions.push(`${col} > @${p}`); }
-        if (v.lt !== undefined) { const p = `${pname}_lt`; params[p] = v.lt; conditions.push(`${col} < @${p}`); }
-        if (v.in !== undefined) {
-          if (Array.isArray(v.in) && v.in.length > 0) {
-            const ps = v.in.map((x: any, i: number) => { const p = `${pname}_in${i}`; params[p] = x; return `@${p}`; });
-            conditions.push(`${col} IN (${ps.join(', ')})`);
-          } else {
-            conditions.push('1=0');
-          }
-        }
-      } else {
-        params[pname] = value;
-        conditions.push(`${col} = @${pname}`);
-      }
-    }
-  }
-  return conditions.join(' AND ');
-}
-
-function buildOrderBy(orderBy: any): string {
-  if (!orderBy) return '';
-  const entries = Array.isArray(orderBy) ? orderBy : [orderBy];
-  const parts: string[] = [];
-  for (const entry of entries) {
-    for (const [key, dir] of Object.entries(entry)) {
-      parts.push(`[${key}] ${(dir as string).toUpperCase()}`);
-    }
-  }
-  return parts.length > 0 ? `ORDER BY ${parts.join(', ')}` : '';
-}
+// ─── Table Client ──────────────────────────────────────────────────────────────────
 
 export class AdapterTableClient<T = any> {
-  constructor(private adapter: An5Adapter, private modelName: string) {}
+  constructor(
+    private readonly adapter: An5Adapter | An5AdapterTx,
+    private readonly modelName: string,
+  ) { }
+
+  private get dialect(): Dialect { return this.adapter.dialect; }
 
   private get tableName(): string {
     const name = this.modelName;
     let t = name;
+    const modelToTable = getModelToTable();
     if (modelToTable[name]) t = modelToTable[name];
     else {
       const camel = name.charAt(0).toLowerCase() + name.slice(1);
@@ -230,37 +209,50 @@ export class AdapterTableClient<T = any> {
         if (modelToTable[lower]) t = modelToTable[lower];
       }
     }
+    if (t.startsWith('[') || t.startsWith('"') || t.startsWith('`')) return t;
+    if (t.includes('.')) return t.split('.').map(p => quote(p, this.dialect)).join('.');
+    return quote(t, this.dialect);
+  }
 
-    if (t.startsWith('[')) return t;
-    if (t.includes('.')) {
-      return t.split('.').map(p => `[${p}]`).join('.');
-    }
-    return `[${t}]`;
+  private get nolock(): string {
+    return this.dialect === 'mssql' ? ' WITH (NOLOCK)' : '';
+  }
+
+  private async doExec<U = any>(query: string, params?: Record<string, any>): Promise<U[]> {
+    return this.adapter.exec<U>(query, params);
+  }
+
+  private async doExecuteRaw(query: string, params?: Record<string, any>): Promise<number> {
+    return this.adapter._executeRaw(query, params);
   }
 
   async findMany(args?: { where?: any; orderBy?: any; skip?: number; take?: number; select?: any }): Promise<T[]> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args?.where, params);
-    const orderSql = buildOrderBy(args?.orderBy);
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
+    const orderSql = buildOrderBy(args?.orderBy, this.dialect);
     const take = args?.take;
     const skip = args?.skip ?? 0;
 
     let query: string;
     if (take !== undefined) {
-      query = `SELECT * FROM ${this.tableName} WITH (NOLOCK)`;
-      if (whereSql) query += ` WHERE ${whereSql}`;
-      if (orderSql) {
-        query += ` ${orderSql}`;
+      if (this.dialect === 'postgres' || this.dialect === 'mysql' || this.dialect === 'sqlite') {
+        query = `SELECT * FROM ${this.tableName}`;
+        if (whereSql) query += ` WHERE ${whereSql}`;
+        if (orderSql) query += ` ${orderSql}`;
+        query += ` LIMIT ${take} OFFSET ${skip}`;
       } else {
-        query += ` ORDER BY (SELECT NULL)`;
+        // mssql requires ORDER BY before OFFSET/FETCH
+        query = `SELECT * FROM ${this.tableName}${this.nolock}`;
+        if (whereSql) query += ` WHERE ${whereSql}`;
+        query += ` ${orderSql || 'ORDER BY (SELECT NULL)'}`;
+        query += ` OFFSET ${skip} ROWS FETCH NEXT ${take} ROWS ONLY`;
       }
-      query += ` OFFSET ${skip} ROWS FETCH NEXT ${take} ROWS ONLY`;
     } else {
-      query = `SELECT * FROM ${this.tableName} WITH (NOLOCK)`;
+      query = `SELECT * FROM ${this.tableName}${this.nolock}`;
       if (whereSql) query += ` WHERE ${whereSql}`;
       if (orderSql) query += ` ${orderSql}`;
     }
-    return this.adapter.exec<T>(query, params);
+    return this.doExec<T>(query, params);
   }
 
   async findFirst(args?: { where?: any; orderBy?: any; select?: any }): Promise<T | null> {
@@ -274,15 +266,16 @@ export class AdapterTableClient<T = any> {
 
   async count(args?: { where?: any }): Promise<number> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args?.where, params);
-    let query = `SELECT COUNT(*) AS cnt FROM ${this.tableName} WITH (NOLOCK)`;
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
+    // Add NOLOCK for mssql count too
+    let query = `SELECT COUNT(*) AS cnt FROM ${this.tableName}${this.nolock}`;
     if (whereSql) query += ` WHERE ${whereSql}`;
-    const rows = await this.adapter.exec<any>(query, params);
-    return Number(rows[0]?.cnt ?? 0);
+    const rows = await this.doExec<any>(query, params);
+    return Number(rows[0]?.cnt ?? rows[0]?.CNT ?? 0);
   }
 
   async create(args: { data: Partial<T> }): Promise<T> {
-    const fields = modelFields[this.modelName] || {};
+    const fields = getFieldsForModel(this.modelName);
     const idFieldName = Object.prototype.hasOwnProperty.call(fields, 'id')
       ? 'id'
       : Object.keys(fields).find((name) => name.endsWith('_id') || name.endsWith('Id') || name.toLowerCase() === 'id');
@@ -293,9 +286,7 @@ export class AdapterTableClient<T = any> {
       const rawType = typeof fieldDef === 'string' ? fieldDef : (fieldDef?.ts || fieldDef?.sql || fieldDef?.type || '');
       const normalizedType = String(rawType).toLowerCase();
       const isStringType = ['string', 'uuid', 'uniqueidentifier', 'nvarchar', 'varchar', 'text'].includes(normalizedType);
-      if (isStringType && !data[idFieldName]) {
-        data[idFieldName] = randomUUID();
-      }
+      if (isStringType && !data[idFieldName]) data[idFieldName] = randomUUID();
     }
 
     const cols = Object.keys(data).filter(k => data[k] !== undefined);
@@ -304,109 +295,132 @@ export class AdapterTableClient<T = any> {
 
     for (const col of cols) {
       const p = `c_${col}`;
-      params[p] = data[col] instanceof Date ? data[col] : data[col];
+      params[p] = data[col];
       vals.push(`@${p}`);
     }
 
-    const query = `INSERT INTO ${this.tableName} (${cols.map(c => `[${c}]`).join(', ')}) VALUES (${vals.join(', ')})`;
-    await this.adapter.exec(query, params);
+    const query = `INSERT INTO ${this.tableName} (${cols.map(c => quote(c, this.dialect)).join(', ')}) VALUES (${vals.join(', ')})`;
+    await this.doExec(query, params);
     return (await this.findFirst({ where: idFieldName ? { [idFieldName]: data[idFieldName] } : data })) as T;
   }
 
   async createMany(args: { data: Partial<T>[]; skipDuplicates?: boolean }): Promise<{ count: number }> {
+    if (args.data.length === 0) return { count: 0 };
+
+    const firstCols = Object.keys(args.data[0]).filter(k => (args.data[0] as any)[k] !== undefined);
+
+    // Bulk INSERT for the common case (same columns, no skipDuplicates)
+    if (firstCols.length > 0 && !args.skipDuplicates) {
+      const params: Record<string, any> = {};
+      const rowPlaceholders: string[] = [];
+
+      for (let r = 0; r < args.data.length; r++) {
+        const row = args.data[r] as any;
+        const vals = firstCols.map(col => {
+          const p = `r${r}_${col}`;
+          params[p] = row[col] ?? null;
+          return `@${p}`;
+        });
+        rowPlaceholders.push(`(${vals.join(', ')})`);
+      }
+
+      const query = `INSERT INTO ${this.tableName} (${firstCols.map(c => quote(c, this.dialect)).join(', ')}) VALUES ${rowPlaceholders.join(', ')}`;
+      try {
+        await this.doExecuteRaw(query, params);
+        return { count: args.data.length };
+      } catch {
+        // fallback below if bulk fails (e.g. mixed column sets)
+      }
+    }
+
+    // Row-by-row fallback
     let count = 0;
     for (const row of args.data) {
-      try {
-        await this.create({ data: row });
-        count++;
-      } catch (e) {
-        if (!args.skipDuplicates) throw e;
-      }
+      try { await this.create({ data: row }); count++; }
+      catch (e) { if (!args.skipDuplicates) throw e; }
     }
     return { count };
   }
 
   async update(args: { where: any; data: Partial<T> }): Promise<T> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args.where, params, 'w_');
+    const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, 'w_');
     const setCols = Object.keys(args.data).filter(k => (args.data as any)[k] !== undefined);
     const sets: string[] = [];
 
     for (const col of setCols) {
       const p = `s_${col}`;
       params[p] = (args.data as any)[col];
-      sets.push(`[${col}] = @${p}`);
+      sets.push(`${quote(col, this.dialect)} = @${p}`);
     }
 
     const query = `UPDATE ${this.tableName} SET ${sets.join(', ')}${whereSql ? ` WHERE ${whereSql}` : ''}`;
-    await this.adapter.exec(query, params);
+    await this.doExecuteRaw(query, params);
     return (await this.findFirst({ where: args.where })) as T;
   }
 
   async updateMany(args: { where?: any; data: Partial<T> }): Promise<{ count: number }> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args.where, params, 'w_');
+    const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, 'w_');
     const setCols = Object.keys(args.data).filter(k => (args.data as any)[k] !== undefined);
     const sets: string[] = [];
 
     for (const col of setCols) {
       const p = `s_${col}`;
       params[p] = (args.data as any)[col];
-      sets.push(`[${col}] = @${p}`);
+      sets.push(`${quote(col, this.dialect)} = @${p}`);
     }
 
     const query = `UPDATE ${this.tableName} SET ${sets.join(', ')}${whereSql ? ` WHERE ${whereSql}` : ''}`;
-    const rows = await this.adapter.exec(query, params);
-    return { count: (rows as any).rowsAffected ?? 0 };
+    const count = await this.doExecuteRaw(query, params);
+    return { count };
   }
 
   async delete(args: { where: any }): Promise<T> {
     const existing = await this.findFirst({ where: args.where });
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args.where, params);
-    const query = `DELETE FROM ${this.tableName} WHERE ${whereSql}`;
-    await this.adapter.exec(query, params);
+    const whereSql = parseWhere(this.modelName, args.where, params, this.dialect);
+    await this.doExecuteRaw(`DELETE FROM ${this.tableName} WHERE ${whereSql}`, params);
     return existing as T;
   }
 
   async deleteMany(args?: { where?: any }): Promise<{ count: number }> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args?.where, params);
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
     const query = `DELETE FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''}`;
-    await this.adapter.exec(query, params);
-    return { count: 0 };
+    const count = await this.doExecuteRaw(query, params);
+    return { count };
   }
 
   async upsert(args: { where: any; create: Partial<T>; update: Partial<T> }): Promise<T> {
     const existing = await this.findFirst({ where: args.where });
-    if (existing) {
-      return this.update({ where: args.where, data: args.update });
-    } else {
-      return this.create({ data: args.create });
-    }
+    return existing
+      ? this.update({ where: args.where, data: args.update })
+      : this.create({ data: args.create });
   }
 
   async aggregate(args: any): Promise<any> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args?.where, params);
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
     const aggs: string[] = [];
+
     if (args._count) aggs.push('COUNT(*) AS _count');
-    if (args._sum) for (const f of Object.keys(args._sum)) aggs.push(`SUM([${f}]) AS _sum_${f}`);
-    if (args._avg) for (const f of Object.keys(args._avg)) aggs.push(`AVG([${f}]) AS _avg_${f}`);
-    if (args._min) for (const f of Object.keys(args._min)) aggs.push(`MIN([${f}]) AS _min_${f}`);
-    if (args._max) for (const f of Object.keys(args._max)) aggs.push(`MAX([${f}]) AS _max_${f}`);
+    if (args._sum) for (const f of Object.keys(args._sum)) aggs.push(`SUM(${quote(f, this.dialect)}) AS _sum_${f}`);
+    if (args._avg) for (const f of Object.keys(args._avg)) aggs.push(`AVG(${quote(f, this.dialect)}) AS _avg_${f}`);
+    if (args._min) for (const f of Object.keys(args._min)) aggs.push(`MIN(${quote(f, this.dialect)}) AS _min_${f}`);
+    if (args._max) for (const f of Object.keys(args._max)) aggs.push(`MAX(${quote(f, this.dialect)}) AS _max_${f}`);
 
     const query = `SELECT ${aggs.join(', ')} FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''}`;
-    const rows = await this.adapter.exec(query, params);
+    const rows = await this.doExec(query, params);
     return rows[0] ?? {};
   }
 
   async groupBy(args: any): Promise<any[]> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args?.where, params);
-    const byCols = (args.by || []).map((b: string) => `[${b}]`).join(', ');
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
+    const byCols = (args.by || []).map((b: string) => quote(b, this.dialect)).join(', ');
     const query = `SELECT ${byCols}, COUNT(*) AS _count FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''} GROUP BY ${byCols}`;
-    return this.adapter.exec(query, params);
+    return this.doExec(query, params);
   }
 
   async vectorSearch(args: {
@@ -435,7 +449,11 @@ export class AdapterTableClient<T = any> {
         m2 += vec[i] ** 2;
       }
       const cosine = m1 && m2 ? dot / (Math.sqrt(m1) * Math.sqrt(m2)) : 0;
-      const dist = metric === 'cosine' ? 1 - cosine : metric === 'dot' ? -dot : Math.sqrt(args.vector.reduce((s, v, i) => s + (v - vec[i]) ** 2, 0));
+      const dist = metric === 'cosine'
+        ? 1 - cosine
+        : metric === 'dot'
+          ? -dot
+          : Math.sqrt(args.vector.reduce((s, v, i) => s + (v - vec[i]) ** 2, 0));
       scored.push({ row, dist });
     }
     scored.sort((a, b) => a.dist - b.dist);
@@ -443,12 +461,14 @@ export class AdapterTableClient<T = any> {
   }
 }
 
-// ─── Factory ──────────────────────────────────────────────────────────────────
+// ─── Factory ──────────────────────────────────────────────────────────────────────
 
-/**
- * Create a typed an5Adapter instance from a connection string.
- * Returns the adapter with dynamic table access via .table(modelName).
- */
-export function createAn5Adapter(config: An5AdapterConfig): An5Adapter {
+export function createAn5Adapter(config: AnyAdapterConfig): AnyAdapter {
+  if (isSheetsConfig(config)) return new An5SheetsAdapter(config);
+  if (config.connectionString.trim().startsWith('googlesheets://')) {
+    return new An5SheetsAdapter(parseSheetsConnectionString(config.connectionString));
+  }
   return new An5Adapter(config);
 }
+
+export const createAdapter = createAn5Adapter;

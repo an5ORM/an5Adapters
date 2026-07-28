@@ -1,155 +1,57 @@
 // An5Adapter.cs
 // Standalone .NET runtime adapter for AN5 ORM.
-// Provides connection, query execution, and typed TableClient<T>.
-// Works independently - no EF Core dependency.
-//
-// Usage:
-//   var db = new An5Adapter(connectionString);
-//   var users = db.Table<User>("dbo.users").FindMany("IsActive = @p", new { p = true });
 
 using System;
 using System.Collections.Generic;
-using System.Data;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
-using Microsoft.Data.SqlClient;
 
 namespace An5Orm
 {
-    // ─── Config ────────────────────────────────────────────────────────────────
-
-    public class An5AdapterOptions
-    {
-        public string ConnectionString { get; set; }
-        public int CommandTimeout { get; set; } = 60;
-        public int ConnectRetryCount { get; set; } = 3;
-    }
-
-    // ─── Adapter ────────────────────────────────────────────────────────────────
+// ─── Adapter ────────────────────────────────────────────────────────────────
 
     public class An5Adapter : IDisposable
     {
         public string ConnectionString { get; }
+        public Dialect Dialect => _engine.Dialect;
+        private readonly IQueryEngine _engine;
         private readonly int _commandTimeout;
-
-        [ThreadStatic]
-        private static SqlConnection _txConn;
-        [ThreadStatic]
-        private static SqlTransaction _tx;
 
         public An5Adapter(string connectionString, int commandTimeout = 60)
         {
             ConnectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
             _commandTimeout = commandTimeout;
+            _engine = DialectDetector.Detect(connectionString) switch
+            {
+                Dialect.Postgres => new PostgresEngine(connectionString, commandTimeout),
+                _ => new MssqlEngine(connectionString, commandTimeout)
+            };
         }
 
         public An5Adapter(An5AdapterOptions options) : this(options.ConnectionString, options.CommandTimeout) { }
 
-        // ── Connection management ──────────────────────────────────────────────
-
-        private SqlConnection OpenConnection(out bool isInTransaction)
-        {
-            if (_txConn != null) { isInTransaction = true; return _txConn; }
-            isInTransaction = false;
-            var conn = new SqlConnection(ConnectionString);
-            conn.Open();
-            return conn;
-        }
-
-        private static SqlTransaction ActiveTransaction => _tx;
-
-        private SqlCommand BuildCommand(SqlConnection conn, string sql, Dictionary<string, object> parameters = null)
-        {
-            var cmd = new SqlCommand(sql, conn) { CommandTimeout = _commandTimeout };
-            if (ActiveTransaction != null) cmd.Transaction = ActiveTransaction;
-            if (parameters != null)
-            {
-                foreach (var kv in parameters)
-                {
-                    var paramName = kv.Key.StartsWith("@") ? kv.Key : "@" + kv.Key;
-                    cmd.Parameters.AddWithValue(paramName, kv.Value ?? DBNull.Value);
-                }
-            }
-            return cmd;
-        }
-
         // ── Raw query execution ────────────────────────────────────────────────
 
         public List<Dictionary<string, object>> QueryRaw(string sql, Dictionary<string, object> parameters = null)
-        {
-            var results = new List<Dictionary<string, object>>();
-            var conn = OpenConnection(out bool isTx);
-            try
-            {
-                using var cmd = BuildCommand(conn, sql, parameters);
-                using var reader = cmd.ExecuteReader();
-                while (reader.Read())
-                {
-                    var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-                    for (int i = 0; i < reader.FieldCount; i++)
-                    {
-                        row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-                    }
-                    results.Add(row);
-                }
-            }
-            finally { if (!isTx) conn.Dispose(); }
-            return results;
-        }
+            => _engine.QueryRaw(sql, parameters);
 
         public List<T> QueryRaw<T>(string sql, Dictionary<string, object> parameters = null) where T : new()
-        {
-            var results = new List<T>();
-            var conn = OpenConnection(out bool isTx);
-            try
-            {
-                using var cmd = BuildCommand(conn, sql, parameters);
-                using var reader = cmd.ExecuteReader();
-                var props = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
-                while (reader.Read())
-                {
-                    var item = new T();
-                    foreach (var prop in props)
-                    {
-                        if (!HasColumn(reader, prop.Name)) continue;
-                        var val = reader[prop.Name];
-                        if (val == DBNull.Value) continue;
-                        try { prop.SetValue(item, Convert.ChangeType(val, prop.PropertyType)); } catch { }
-                    }
-                    results.Add(item);
-                }
-            }
-            finally { if (!isTx) conn.Dispose(); }
-            return results;
-        }
+            => _engine.QueryRaw<T>(sql, parameters);
 
         public int ExecuteRaw(string sql, Dictionary<string, object> parameters = null)
-        {
-            var conn = OpenConnection(out bool isTx);
-            try
-            {
-                using var cmd = BuildCommand(conn, sql, parameters);
-                return cmd.ExecuteNonQuery();
-            }
-            finally { if (!isTx) conn.Dispose(); }
-        }
+            => _engine.ExecuteRaw(sql, parameters);
 
         // ── Transaction ────────────────────────────────────────────────────────
 
         public An5Transaction BeginTransaction()
         {
-            var conn = new SqlConnection(ConnectionString);
-            conn.Open();
-            var tx = conn.BeginTransaction();
-            _txConn = conn;
-            _tx = tx;
-            return new An5Transaction(conn, tx, () => { _txConn = null; _tx = null; });
+            return new An5Transaction(_engine.BeginTransaction());
         }
 
         public TResult Transaction<TResult>(Func<An5Adapter, TResult> fn)
         {
-            using var txScope = BeginTransaction();
+            using var txScope = _engine.BeginTransaction();
             try
             {
                 var result = fn(this);
@@ -166,44 +68,65 @@ namespace An5Orm
         // ── Table client factory ───────────────────────────────────────────────
 
         public AdapterTableClient<T> Table<T>(string tableName) where T : new()
-            => new AdapterTableClient<T>(this, tableName);
-
-        // ── Utilities ──────────────────────────────────────────────────────────
-
-        private static bool HasColumn(SqlDataReader reader, string name)
-        {
-            for (int i = 0; i < reader.FieldCount; i++)
-                if (reader.GetName(i).Equals(name, StringComparison.OrdinalIgnoreCase)) return true;
-            return false;
-        }
+            => new AdapterTableClient<T>(this, tableName, _engine.Dialect);
 
         public void Dispose() { }
     }
 
-    // ─── Typed Table Client ────────────────────────────────────────────────────
+// ─── Transaction wrapper ───────────────────────────────────────────────────
+
+    public class An5Transaction : IDisposable
+    {
+        private readonly An5TransactionBase _inner;
+
+        internal An5Transaction(An5TransactionBase inner) => _inner = inner;
+
+        public void Commit() => _inner.Commit();
+        public void Rollback() => _inner.Rollback();
+        public void Dispose() => _inner.Dispose();
+    }
+
+// ─── Typed Table Client ────────────────────────────────────────────────────
 
     public class AdapterTableClient<T> where T : new()
     {
         private readonly An5Adapter _adapter;
         private readonly string _tableName;
+        private readonly Dialect _dialect;
 
-        public AdapterTableClient(An5Adapter adapter, string tableName)
+        public AdapterTableClient(An5Adapter adapter, string tableName, Dialect dialect)
         {
             _adapter = adapter;
-            _tableName = tableName;
+            _tableName = SqlQuote.QuoteTable(tableName, dialect);
+            _dialect = dialect;
+        }
+
+        private string Nolock => _dialect == Dialect.Mssql ? " WITH (NOLOCK)" : "";
+
+        private string BuildPagination(string orderBy, int? skip, int? take)
+        {
+            if (take == null) return "";
+            if (_dialect == Dialect.Postgres)
+                return $" LIMIT {take.Value} OFFSET {skip ?? 0}";
+            var o = !string.IsNullOrEmpty(orderBy) ? $" ORDER BY {orderBy}" : " ORDER BY (SELECT NULL)";
+            return $"{o} OFFSET {skip ?? 0} ROWS FETCH NEXT {take.Value} ROWS ONLY";
         }
 
         public List<T> FindMany(string whereClause = null, Dictionary<string, object> parameters = null,
             string orderBy = null, int? skip = null, int? take = null)
         {
-            var sb = new StringBuilder($"SELECT * FROM {_tableName} WITH (NOLOCK)");
+            var sb = new StringBuilder($"SELECT * FROM {_tableName}{Nolock}");
             if (!string.IsNullOrEmpty(whereClause)) sb.Append($" WHERE {whereClause}");
-            if (!string.IsNullOrEmpty(orderBy)) sb.Append($" ORDER BY {orderBy}");
-            if (skip.HasValue && take.HasValue)
-                sb.Append($" OFFSET {skip.Value} ROWS FETCH NEXT {take.Value} ROWS ONLY");
-            else if (take.HasValue)
-                sb.Append($" OFFSET 0 ROWS FETCH NEXT {take.Value} ROWS ONLY");
-
+            if (take != null && _dialect == Dialect.Postgres)
+            {
+                if (!string.IsNullOrEmpty(orderBy)) sb.Append($" ORDER BY {orderBy}");
+                sb.Append(BuildPagination(orderBy, skip, take));
+            }
+            else
+            {
+                if (!string.IsNullOrEmpty(orderBy)) sb.Append($" ORDER BY {orderBy}");
+                sb.Append(BuildPagination(orderBy, skip, take));
+            }
             return _adapter.QueryRaw<T>(sb.ToString(), parameters);
         }
 
@@ -215,7 +138,8 @@ namespace An5Orm
 
         public T FindUnique(object id, string idColumnName = "Id")
         {
-            return FindFirst($"{idColumnName} = @id", new Dictionary<string, object> { { "id", id } });
+            return FindFirst($"{SqlQuote.QuoteName(idColumnName, _dialect)} = @id",
+                new Dictionary<string, object> { { "id", id } });
         }
 
         public int Count(string whereClause = null, Dictionary<string, object> parameters = null)
@@ -243,7 +167,7 @@ namespace An5Orm
             {
                 var val = prop.GetValue(entity);
                 if (val == null) continue;
-                cols.Add(prop.Name);
+                cols.Add(SqlQuote.QuoteName(prop.Name, _dialect));
                 vals.Add("@" + prop.Name);
                 parameters["@" + prop.Name] = val;
             }
@@ -269,21 +193,23 @@ namespace An5Orm
                 }
                 else if (val != null)
                 {
-                    sets.Add($"{prop.Name} = @{prop.Name}");
+                    sets.Add($"{SqlQuote.QuoteName(prop.Name, _dialect)} = @{prop.Name}");
                     parameters["@" + prop.Name] = val;
                 }
             }
 
             if (idVal == null) throw new InvalidOperationException($"Cannot update entity without {idColumnName}");
             parameters["@_id"] = idVal;
-            var sql = $"UPDATE {_tableName} SET {string.Join(", ", sets)} WHERE {idColumnName} = @_id";
+            var quotedIdCol = SqlQuote.QuoteName(idColumnName, _dialect);
+            var sql = $"UPDATE {_tableName} SET {string.Join(", ", sets)} WHERE {quotedIdCol} = @_id";
             _adapter.ExecuteRaw(sql, parameters);
             return entity;
         }
 
         public bool Delete(object id, string idColumnName = "Id")
         {
-            var sql = $"DELETE FROM {_tableName} WHERE {idColumnName} = @id";
+            var quotedIdCol = SqlQuote.QuoteName(idColumnName, _dialect);
+            var sql = $"DELETE FROM {_tableName} WHERE {quotedIdCol} = @id";
             var n = _adapter.ExecuteRaw(sql, new Dictionary<string, object> { { "@id", id } });
             return n > 0;
         }

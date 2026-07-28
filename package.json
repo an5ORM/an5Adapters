@@ -11,20 +11,17 @@
     "./typescript/*": "./typescript/*",
     "./python": "./python/an5_adapter.py",
     "./dotnet": "./dotnet/An5Adapter.cs",
-    "./googlesheets": "./googlesheets/index.js",
-    "./googlesheets/*": "./googlesheets/*",
-    "./unified": "./typescript/unified.js"
+    "./config": "./typescript/config.js"
   },
   "repository": {
     "type": "git",
     "url": "https://github.com/an5ORM/an5Adapters.git"
   },
-  "keywords": ["an5", "orm", "adapter", "typescript", "python", "dotnet", "googlesheets", "google-sheets"],
+  "keywords": ["an5", "orm", "adapter", "typescript", "python", "dotnet"],
   "files": [
     "typescript/**/*.{ts,js,d.ts}",
     "python/**/*",
     "dotnet/**/*",
-    "googlesheets/**/*",
     "README.md"
   ],
   "scripts": {
@@ -33,13 +30,14 @@
     "test:python": "python -m compileall python 2>&1"
   },
   "dependencies": {
-    "an5-client": "file:../an5Client",
     "googleapis": "^134.0.0",
-    "mssql": "^12.5.5"
+    "mssql": "^12.5.5",
+    "pg": "^8.13.0"
   },
   "devDependencies": {
     "@types/mssql": "^9.1.8",
     "@types/node": "^20.11.0",
+    "@types/pg": "^8.11.0",
     "typescript": "^6.0.3"
   },
   "publishConfig": {
