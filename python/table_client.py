@@ -1,7 +1,10 @@
 import json
 import uuid
 from typing import Dict, List, Optional
-from .base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table
+try:
+    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table
+except ImportError:
+    from base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table
 
 # ─── Table Client ───────────────────────────────────────────────────────────────────
 
@@ -28,8 +31,8 @@ class AdapterTableClient:
             return ""
         if self._dialect == DIALECT_POSTGRES:
             return f" LIMIT {take} OFFSET {skip}"
-        o = order_sql or " ORDER BY (SELECT NULL)"
-        return f"{o} OFFSET {skip} ROWS FETCH NEXT {take} ROWS ONLY"
+        order_prefix = "" if order_sql else " ORDER BY (SELECT NULL)"
+        return f"{order_prefix} OFFSET {skip} ROWS FETCH NEXT {take} ROWS ONLY"
 
     def find_many(self, where=None, order_by=None, skip: int = 0, take: Optional[int] = None, select=None) -> List[Dict]:
         params: Dict = {}
@@ -39,12 +42,9 @@ class AdapterTableClient:
         query = f"SELECT * FROM {self._table_sql}{self._nolock}"
         if where_sql:
             query += f" WHERE {where_sql}"
-        if take is not None and self._dialect == DIALECT_POSTGRES:
-            query += self._pagination(take, skip, order_sql)
-        else:
-            if order_sql:
-                query += f" {order_sql}"
-            query += self._pagination(take, skip, order_sql)
+        if order_sql:
+            query += f" {order_sql}"
+        query += self._pagination(take, skip, order_sql)
         return self._adapter.exec(query, list(params.values()))
 
     def find_first(self, where=None, order_by=None, select=None) -> Optional[Dict]:
@@ -205,5 +205,3 @@ class AdapterTableClient:
 
         scored.sort(key=lambda x: x[1])
         return [{**row, "distance": dist} for row, dist in scored[:take]]
-
-
