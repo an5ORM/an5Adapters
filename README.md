@@ -2,6 +2,8 @@
 
 Standalone runtime adapters for AN5 ORM. Provides connection pooling, query execution, typed table clients in TypeScript, Python, .NET, and Google Sheets API.
 
+Adapters are runtime packages only. They do not import generated `an5Client` artifacts; generated clients or applications can pass model metadata explicitly when table-name mapping or field type coercion is needed.
+
 ## Features
 
 - **Connection pooling** — Managed connection pools with configurable limits
@@ -37,7 +39,17 @@ dotnet add package An5Adapters
 ### TypeScript
 
 ```typescript
-import { createAn5Adapter } from 'an5-adapters';
+import { createAn5Adapter, setAdapterMetadata } from 'an5-adapters';
+
+setAdapterMetadata({
+  modelToTable: { User: 'dbo.users' },
+  modelFields: {
+    User: {
+      id: { ts: 'string', sql: 'uniqueidentifier', isId: true },
+      active: { ts: 'boolean', sql: 'bit' },
+    },
+  },
+});
 
 const db = createAn5Adapter({
   connectionString: 'sqlserver://localhost:1433;database=mydb;user=sa;password=pass',
@@ -60,6 +72,17 @@ await db.$transaction(async (tx) => {
 
 ```python
 from an5_adapter import create_an5_adapter
+from base.metadata import set_adapter_metadata
+
+set_adapter_metadata({
+    "modelToTable": {"User": "dbo.users"},
+    "modelFields": {
+        "User": {
+            "id": {"py": "str", "sql": "uniqueidentifier", "isId": True},
+            "active": {"py": "bool", "sql": "bit"},
+        }
+    },
+})
 
 db = create_an5_adapter("sqlserver://localhost:1433;database=mydb;user=sa;password=pass")
 
@@ -97,9 +120,9 @@ db.Transaction(tx => {
 ### Google Sheets
 
 ```typescript
-import { createAn5SheetsAdapter } from 'an5-adapters';
+import { createAn5Adapter } from 'an5-adapters';
 
-const db = createAn5SheetsAdapter({
+const db = createAn5Adapter({
   spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms',
   // Option 1: client email + private key
   clientEmail: 'sa@project.iam.gserviceaccount.com',
@@ -169,6 +192,16 @@ const sheetsDb3 = new An5Adapter({
 - Supports service account JSON or individual `clientEmail`+`privateKey`
 - Automatic retry with exponential backoff for rate limits (429/500/503)
 
+### Provider Imports
+
+Use the package root for normal applications:
+
+```typescript
+import { createAn5Adapter } from 'an5-adapters';
+```
+
+Provider folders are still available to source-level consumers through `typescript/*`, but the public factory in `typescript/an5Adapter.ts` is the preferred entry point. The old `unified.ts` entry point has been removed because the factory now lives directly in `An5Adapter`.
+
 ## API Reference
 
 ### An5Adapter / An5SheetsAdapter
@@ -212,7 +245,7 @@ const sheetsDb3 = new An5Adapter({
 - TypeScript providers live under `typescript/{base,mssql,postgres,mysql,sqlite,googlesheets}`.
 - Python providers live under `python/{base,mssql,postgres}`, with `python/an5_adapter.py` kept as the public facade.
 - .NET providers live under `dotnet/{Base,Mssql,Postgres}`, with `dotnet/an5Adapter.cs` kept as the public facade.
-- Adapters do not depend on generated `an5-client` artifacts; generated clients may pass metadata in explicitly when they need model/table mapping.
+- Adapters do not depend on generated `an5Client` artifacts; generated clients may pass metadata in explicitly when they need model/table mapping.
 
 ## Testing
 

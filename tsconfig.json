@@ -3,7 +3,6 @@
   "compilerOptions": {
     "outDir": "./typescript",
     "rootDir": "..",
-    "ignoreDeprecations": "6.0",
     "preserveSymlinks": true,
     "declaration": true,
     "declarationMap": true
