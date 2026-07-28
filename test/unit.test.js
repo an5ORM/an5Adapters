@@ -571,7 +571,7 @@ console.log('\nPackage & Config:');
 
 test('package.json is valid', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
-  assertIncludes(pkg.name, 'an5-adapters');
+  assertIncludes(pkg.name, '@an5/adapters');
   assertIncludes(pkg.description, 'adapters');
 });
 
