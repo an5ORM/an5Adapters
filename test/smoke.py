@@ -18,6 +18,11 @@ set_adapter_metadata({
 })
 assert _resolve_table('backgroundJob') == '[dbo].[background_jobs]'
 
+set_adapter_metadata({
+    'model_to_table': {'lLMProvider': '[dbo].[llm_providers]'},
+    'model_fields': {'lLMProvider': {'id': 'string', 'provider': 'string', 'apiKey': 'string?'}},
+})
+
 class FakeAdapter:
     def __init__(self, dialect):
         self._dialect = dialect
@@ -26,6 +31,10 @@ class FakeAdapter:
     def exec(self, query, params=None):
         self.query = query
         return []
+
+    def execute(self, query, params=None):
+        self.query = query
+        return 1
 
 mssql = FakeAdapter('mssql')
 AdapterTableClient(mssql, 'backgroundJob').find_many(order_by={'createdAt': 'desc'}, take=25, skip=0)
@@ -36,5 +45,10 @@ assert mssql.query.count('ORDER BY') == 1
 postgres = FakeAdapter('postgres')
 AdapterTableClient(postgres, 'backgroundJob').find_many(order_by={'createdAt': 'desc'}, take=25, skip=0)
 assert 'ORDER BY "createdAt" DESC LIMIT 25 OFFSET 0' in postgres.query
+
+creator = FakeAdapter('mssql')
+created = AdapterTableClient(creator, 'lLMProvider').create({'id': '1', 'provider': 'openai', 'apiKey': 'secret'})
+assert created['provider'] == 'openai'
+assert 'INSERT INTO [dbo].[llm_providers]' in creator.query
 
 print('an5Adapters smoke test passed')

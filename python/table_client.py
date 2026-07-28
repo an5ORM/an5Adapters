@@ -26,6 +26,19 @@ class AdapterTableClient:
     def _nolock(self) -> str:
         return "" if self._dialect == DIALECT_POSTGRES else " WITH (NOLOCK)"
 
+    @property
+    def _fields(self) -> List[Dict]:
+        fields = model_fields.get(self._model, [])
+        if isinstance(fields, dict):
+            normalized = []
+            for name, value in fields.items():
+                if isinstance(value, dict):
+                    normalized.append({"name": name, **value})
+                else:
+                    normalized.append({"name": name, "type": value})
+            return normalized
+        return fields
+
     def _pagination(self, take: Optional[int], skip: int, order_sql: str) -> str:
         if take is None:
             return ""
@@ -64,8 +77,7 @@ class AdapterTableClient:
         return int(rows[0]["cnt"]) if rows else 0
 
     def create(self, data: Dict) -> Dict:
-        fields = model_fields.get(self._model, [])
-        id_field = next((f for f in fields if f.get("isId")), None)
+        id_field = next((f for f in self._fields if f.get("isId")), None)
         if id_field and id_field["name"] not in data:
             data = {**data, id_field["name"]: str(uuid.uuid4())}
 
