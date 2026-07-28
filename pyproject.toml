@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "an5-adapters"
+version = "0.1.0"
+description = "Python adapter helpers for AN5 ORM."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "an5ORM" }]
+license = { text = "MIT" }
+keywords = ["an5", "orm", "adapter"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License"
+]
+dependencies = [
+  "pyodbc>=5.0",
+  "psycopg2-binary>=2.9"
+]
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+py-modules = ["an5_adapter", "table_client"]
+packages = ["base", "mssql", "postgres"]

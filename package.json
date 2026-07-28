@@ -1,0 +1,46 @@
+{
+  "name": "an5-adapters",
+  "version": "0.1.0",
+  "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET query execution.",
+  "license": "MIT",
+  "main": "typescript/index.js",
+  "types": "typescript/index.d.ts",
+  "exports": {
+    ".": "./typescript/index.js",
+    "./typescript": "./typescript/index.js",
+    "./typescript/*": "./typescript/*",
+    "./python": "./python/an5_adapter.py",
+    "./dotnet": "./dotnet/An5Adapter.cs",
+    "./config": "./typescript/config.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/an5ORM/an5Adapters.git"
+  },
+  "keywords": ["an5", "orm", "adapter", "typescript", "python", "dotnet"],
+  "files": [
+    "typescript/**/*.{ts,js,d.ts}",
+    "python/**/*",
+    "dotnet/**/*",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "node test/unit.test.js",
+    "test:python": "python -m compileall python 2>&1"
+  },
+  "dependencies": {
+    "googleapis": "^134.0.0",
+    "mssql": "^12.5.5",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/mssql": "^9.1.8",
+    "@types/node": "^20.11.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^6.0.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
