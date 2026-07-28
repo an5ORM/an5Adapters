@@ -23,8 +23,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install Node dependencies
-        run: |
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+        run: npm install
       - name: Run Node tests
         run: npm test
       - name: Build Python package
@@ -42,7 +41,7 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
-      - run: npm ci
+      - run: npm install
       - run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
