@@ -20,7 +20,7 @@
   "keywords": ["an5", "orm", "adapter", "typescript", "python", "dotnet"],
   "files": [
     "typescript/**/*.{ts,js,d.ts}",
-    "python/**/*",
+    "python/**/*.py",
     "dotnet/**/*",
     "README.md"
   ],
