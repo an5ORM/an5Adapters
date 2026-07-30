@@ -351,13 +351,14 @@ export class SheetsTableClient<T = any> {
     if (args._count !== undefined) result._count = rows.length;
     if (args._sum) {
       for (const f of Object.keys(args._sum)) {
-        result[`_sum_${f}`] = rows.reduce((s, r: any) => s + (Number(r[f]) || 0), 0);
+        const nums = rows.map((r: any) => Number(r[f])).filter(n => !isNaN(n));
+        result[`_sum_${f}`] = nums.length > 0 ? nums.reduce((s, n) => s + n, 0) : null;
       }
     }
     if (args._avg) {
       for (const f of Object.keys(args._avg)) {
-        const sum = rows.reduce((s, r: any) => s + (Number(r[f]) || 0), 0);
-        result[`_avg_${f}`] = rows.length > 0 ? sum / rows.length : 0;
+        const nums = rows.map((r: any) => Number(r[f])).filter(n => !isNaN(n));
+        result[`_avg_${f}`] = nums.length > 0 ? nums.reduce((s, n) => s + n, 0) / nums.length : null;
       }
     }
     if (args._min) {
