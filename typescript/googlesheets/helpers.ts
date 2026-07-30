@@ -75,7 +75,7 @@ export function buildOrderBy(orderBy: any): string {
   const parts: string[] = [];
   for (const entry of entries) {
     for (const [key, dir] of Object.entries(entry)) {
-      parts.push(`${key} ${(dir as string).toUpperCase()}`);
+      parts.push(`${key} ${String(dir || 'asc').toUpperCase()}`);
     }
   }
   return parts.join(', ');
