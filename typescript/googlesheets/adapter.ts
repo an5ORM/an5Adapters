@@ -5,10 +5,70 @@ import { SheetsTableClient } from './tableClient';
 import { SheetMeta } from './types';
 import { withRetry } from './retry';
 
+// ─── Fetch-based API proxy for OAuth Access Token (browser-compatible) ────────
+
+function createFetchApi(spreadsheetId: string, accessToken: string) {
+  const base = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}`;
+  const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' };
+
+  async function request<T>(method: string, path: string, body?: any): Promise<T> {
+    const url = path.startsWith('http') ? path : `${base}${path}`;
+    const opts: RequestInit = { method, headers };
+    if (body) opts.body = JSON.stringify(body);
+    const res = await fetch(url, opts);
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      const err = new Error(`Google Sheets API error (${res.status}): ${text}`);
+      (err as any).status = res.status;
+      throw err;
+    }
+    const text = await res.text();
+    return text ? JSON.parse(text) : undefined;
+  }
+
+  function fmtRange(range: string): string {
+    return `/${encodeURIComponent(range)}`;
+  }
+
+  return {
+    spreadsheets: {
+      get: async (params: any) => {
+        const data = await request<any>('GET', `?fields=${params.fields || ''}`);
+        return { data };
+      },
+      batchUpdate: async (params: any) => {
+        const data = await request<any>('POST', ':batchUpdate', params.requestBody);
+        return { data };
+      },
+      values: {
+        get: async (params: any) => {
+          const data = await request<any>('GET', fmtRange(params.range));
+          return { data };
+        },
+        update: async (params: any) => {
+          const qs = `?valueInputOption=${params.valueInputOption || 'RAW'}`;
+          const data = await request<any>('PUT', `${fmtRange(params.range)}${qs}`, params.requestBody);
+          return { data };
+        },
+        append: async (params: any) => {
+          const qs = `?valueInputOption=${params.valueInputOption || 'RAW'}&insertDataOption=${params.insertDataOption || 'INSERT_ROWS'}`;
+          await request<any>('POST', `${fmtRange(params.range)}:append${qs}`, params.requestBody);
+          return { data: { updates: { updatedRows: (params.requestBody?.values || []).length } } };
+        },
+        clear: async (params: any) => {
+          await request<any>('POST', `${fmtRange(params.range)}:clear`);
+          return { data: {} };
+        },
+      },
+    },
+  };
+}
+
 // ─── Adapter ──────────────────────────────────────────────────────────────────
 
 export class An5SheetsAdapter {
   private sheets: sheets_v4.Sheets | null = null;
+  private fetchApi: ReturnType<typeof createFetchApi> | null = null;
   config: ReturnType<typeof resolveConfig>;
   private sheetsCache: Promise<SheetMeta[]> | null = null;
 
@@ -16,7 +76,17 @@ export class An5SheetsAdapter {
     this.config = resolveConfig(config);
   }
 
-  async getSheets(): Promise<sheets_v4.Sheets> {
+  private get isOAuth(): boolean {
+    return !!(this.config as any).accessToken;
+  }
+
+  async getSheets(): Promise<any> {
+    if (this.isOAuth) {
+      if (!this.fetchApi) {
+        this.fetchApi = createFetchApi(this.config.spreadsheetId, (this.config as any).accessToken);
+      }
+      return this.fetchApi;
+    }
     if (!this.sheets) {
       const auth = new google.auth.JWT({
         email: this.config.clientEmail,

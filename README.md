@@ -124,11 +124,13 @@ import { createAn5Adapter } from '@an5/adapters';
 
 const db = createAn5Adapter({
   spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms',
-  // Option 1: client email + private key
+  // Option 1: client email + private key (Node.js, server-side)
   clientEmail: 'sa@project.iam.gserviceaccount.com',
   privateKey: '-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----',
-  // Option 2: full service account JSON
+  // Option 2: full service account JSON (Node.js, server-side)
   // credentials: { client_email: '...', private_key: '...' },
+  // Option 3: OAuth2 access token (browser-compatible, e.g. from Firebase Auth)
+  // accessToken: 'ya29...',
   // Optional: map model names to sheet names
   sheetMapping: { users: 'UsersData', orders: 'OrdersData' },
 });
@@ -176,6 +178,13 @@ const sheetsDb2 = createAdapter({
   privateKey: '-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----',
 });
 
+// OAuth access token (browser-compatible, uses fetch() instead of googleapis)
+const sheetsDbOAuth = createAdapter({
+  spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms',
+  accessToken: 'ya29...', // from Firebase Auth, Google OAuth, etc.
+  sheetMapping: { users: 'UsersData' },
+});
+
 // Constructor form also delegates googlesheets:// to the Sheets adapter
 const sheetsDb3 = new An5Adapter({
   connectionString: 'googlesheets://spreadsheetId;clientEmail=sa@project.iam.gserviceaccount.com;privateKey=...',
@@ -189,7 +198,9 @@ const sheetsDb3 = new An5Adapter({
 - Numeric strings (without leading zeros) are auto-coerced; `"00123"` stays string
 - Boolean strings `"true"` / `"false"` are auto-coerced
 - Sheet names with spaces are automatically escaped (A1 notation)
-- Supports service account JSON or individual `clientEmail`+`privateKey`
+- Supports service account JSON, individual `clientEmail`+`privateKey`, or OAuth2 `accessToken`
+- `accessToken` mode uses raw `fetch()` (no googleapis dependency), making it compatible with browser environments (e.g. Firebase Auth Google sign-in)
+- OAuth scope required: `https://www.googleapis.com/auth/spreadsheets`
 - Automatic retry with exponential backoff for rate limits (429/500/503)
 
 ### Provider Imports
