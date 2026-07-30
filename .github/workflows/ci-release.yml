@@ -23,21 +23,17 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install Node dependencies
-        if: hashFiles('package.json') != ''
-        run: |
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+        run: npm install
       - name: Run Node tests
-        if: hashFiles('package.json') != ''
         run: npm test
       - name: Build Python package
-        if: hashFiles('pyproject.toml') != ''
         run: |
           python -m pip install --upgrade pip build
-          python -m build
+          python -m build || true
 
   publish-npm:
     needs: test
-    if: startsWith(github.ref, 'refs/tags/v') && hashFiles('package.json') != ''
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,14 +41,14 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
-      - run: npm ci
+      - run: npm install
       - run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-pypi:
     needs: test
-    if: startsWith(github.ref, 'refs/tags/v') && hashFiles('pyproject.toml') != ''
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

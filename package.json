@@ -1,6 +1,6 @@
 {
-  "name": "an5-adapters",
-  "version": "0.1.0",
+  "name": "@an5/adapters",
+  "version": "0.2.0",
   "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET query execution.",
   "license": "MIT",
   "main": "typescript/index.js",
@@ -20,12 +20,12 @@
   "keywords": ["an5", "orm", "adapter", "typescript", "python", "dotnet"],
   "files": [
     "typescript/**/*.{ts,js,d.ts}",
-    "python/**/*",
+    "python/**/*.py",
     "dotnet/**/*",
     "README.md"
   ],
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "tsc -p tsconfig.json",
     "test": "node test/unit.test.js",
     "test:python": "python -m compileall python 2>&1"
   },

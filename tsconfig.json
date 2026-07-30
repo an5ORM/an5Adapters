@@ -2,11 +2,11 @@
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "./typescript",
-    "rootDir": "..",
-    "ignoreDeprecations": "6.0",
+    "rootDir": "./typescript",
     "preserveSymlinks": true,
     "declaration": true,
-    "declarationMap": true
+    "declarationMap": false,
+    "sourceMap": false
   },
   "include": [
     "typescript/**/*.ts"
