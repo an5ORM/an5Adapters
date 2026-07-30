@@ -20,6 +20,9 @@ function createFetchApi(spreadsheetId: string, accessToken: string) {
       const text = await res.text().catch(() => '');
       const err = new Error(`Google Sheets API error (${res.status}): ${text}`);
       (err as any).status = res.status;
+      (err as any).body = text;
+      const retryAfter = res.headers.get('Retry-After');
+      if (retryAfter) (err as any).retryAfter = parseInt(retryAfter, 10);
       throw err;
     }
     const text = await res.text();
