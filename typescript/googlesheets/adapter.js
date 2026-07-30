@@ -7,14 +7,83 @@ const config_1 = require("./config");
 const sqlExecutor_1 = require("./sqlExecutor");
 const tableClient_1 = require("./tableClient");
 const retry_1 = require("./retry");
+// ─── Fetch-based API proxy for OAuth Access Token (browser-compatible) ────────
+function createFetchApi(spreadsheetId, accessToken) {
+    const base = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}`;
+    const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' };
+    async function request(method, path, body) {
+        const url = path.startsWith('http') ? path : `${base}${path}`;
+        const opts = { method, headers };
+        if (body)
+            opts.body = JSON.stringify(body);
+        const res = await fetch(url, opts);
+        if (!res.ok) {
+            const text = await res.text().catch(() => '');
+            const err = new Error(`Google Sheets API error (${res.status}): ${text}`);
+            err.status = res.status;
+            err.body = text;
+            const retryAfter = res.headers.get('Retry-After');
+            if (retryAfter)
+                err.retryAfter = parseInt(retryAfter, 10);
+            throw err;
+        }
+        const text = await res.text();
+        return text ? JSON.parse(text) : undefined;
+    }
+    function fmtRange(range) {
+        return `/${encodeURIComponent(range)}`;
+    }
+    return {
+        spreadsheets: {
+            get: async (params) => {
+                const data = await request('GET', `?fields=${params.fields || ''}`);
+                return { data };
+            },
+            batchUpdate: async (params) => {
+                const data = await request('POST', ':batchUpdate', params.requestBody);
+                return { data };
+            },
+            values: {
+                get: async (params) => {
+                    const data = await request('GET', fmtRange(params.range));
+                    return { data };
+                },
+                update: async (params) => {
+                    const qs = `?valueInputOption=${params.valueInputOption || 'RAW'}`;
+                    const data = await request('PUT', `${fmtRange(params.range)}${qs}`, params.requestBody);
+                    return { data };
+                },
+                append: async (params) => {
+                    const qs = `?valueInputOption=${params.valueInputOption || 'RAW'}&insertDataOption=${params.insertDataOption || 'INSERT_ROWS'}`;
+                    await request('POST', `${fmtRange(params.range)}:append${qs}`, params.requestBody);
+                    return { data: { updates: { updatedRows: (params.requestBody?.values || []).length } } };
+                },
+                clear: async (params) => {
+                    await request('POST', `${fmtRange(params.range)}:clear`);
+                    return { data: {} };
+                },
+            },
+        },
+    };
+}
 // ─── Adapter ──────────────────────────────────────────────────────────────────
 class An5SheetsAdapter {
     constructor(config) {
         this.sheets = null;
+        this.fetchApi = null;
         this.sheetsCache = null;
         this.config = (0, config_1.resolveConfig)(config);
     }
+    get isOAuth() {
+        return !!this.config.accessToken;
+    }
     async getSheets() {
+        if (this.isOAuth) {
+            if (!this.fetchApi) {
+                this.fetchApi = createFetchApi(this.config.spreadsheetId, this.config.accessToken);
+            }
+            return this.fetchApi;
+        }
         if (!this.sheets) {
             const auth = new googleapis_1.google.auth.JWT({
                 email: this.config.clientEmail,
@@ -37,7 +106,7 @@ class An5SheetsAdapter {
             spreadsheetId: this.config.spreadsheetId,
             fields: 'sheets.properties.title',
         }));
-        return (res.data.sheets || []).map(s => s.properties?.title || '');
+        return (res.data.sheets || []).map((s) => s.properties?.title || '');
     }
     async getSheetMeta(name) {
         const api = await this.getApi();
@@ -47,14 +116,14 @@ class An5SheetsAdapter {
                     spreadsheetId: this.config.spreadsheetId,
                     fields: 'sheets.properties',
                 });
-                return (res.data.sheets || []).map(s => ({
+                return (res.data.sheets || []).map((s) => ({
                     sheetId: s.properties?.sheetId ?? -1,
                     title: s.properties?.title ?? '',
-                })).filter(m => m.sheetId >= 0);
+                })).filter((m) => m.sheetId >= 0);
             });
         }
         const all = await this.sheetsCache;
-        return all.find(m => m.title === name) || null;
+        return all.find((m) => m.title === name) || null;
     }
     async deleteSheet(name) {
         const meta = await this.getSheetMeta(name);
@@ -74,6 +143,7 @@ class An5SheetsAdapter {
     }
     async $disconnect() {
         this.sheets = null;
+        this.fetchApi = null;
         this.sheetsCache = null;
     }
     async exec(query, params) {

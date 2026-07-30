@@ -43,7 +43,7 @@ export class SheetsTableClient<T = any> {
 
   private async readAllRows(): Promise<{ headers: string[]; rows: Record<string, any>[] }> {
     const api = await this.adapter.getSheets();
-    const res = await withRetry(() =>
+    const res: any = await withRetry(() =>
       api.spreadsheets.values.get({
         spreadsheetId: this.adapter.config.spreadsheetId,
         range: `${this.escSheetName}!A:ZZ`,
@@ -68,7 +68,7 @@ export class SheetsTableClient<T = any> {
     const api = await this.adapter.getSheets();
     await this.ensureSheetExists();
 
-    const res = await withRetry(() =>
+    const res: any = await withRetry(() =>
       api.spreadsheets.values.get({
         spreadsheetId: this.adapter.config.spreadsheetId,
         range: `${this.escSheetName}!A1:ZZ1`,

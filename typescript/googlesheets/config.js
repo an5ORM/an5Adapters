@@ -12,6 +12,13 @@ function normalizeKey(key) {
     return `-----BEGIN PRIVATE KEY-----\n${lines}\n-----END PRIVATE KEY-----`;
 }
 function resolveConfig(config) {
+    if (config.accessToken) {
+        return {
+            spreadsheetId: config.spreadsheetId,
+            accessToken: config.accessToken,
+            sheetMapping: config.sheetMapping,
+        };
+    }
     if (config.credentials) {
         return {
             spreadsheetId: config.spreadsheetId,

@@ -26,7 +26,7 @@ function createFetchApi(spreadsheetId: string, accessToken: string) {
       throw err;
     }
     const text = await res.text();
-    return text ? JSON.parse(text) : undefined;
+    return text ? JSON.parse(text) : (undefined as T);
   }
 
   function fmtRange(range: string): string {
@@ -111,31 +111,31 @@ export class An5SheetsAdapter {
 
   async listSheets(): Promise<string[]> {
     const api = await this.getApi();
-    const res = await withRetry(() =>
+    const res: any = await withRetry(() =>
       api.spreadsheets.get({
         spreadsheetId: this.config.spreadsheetId,
         fields: 'sheets.properties.title',
       })
     );
-    return (res.data.sheets || []).map(s => s.properties?.title || '');
+    return (res.data.sheets || []).map((s: any) => s.properties?.title || '');
   }
 
   async getSheetMeta(name: string): Promise<SheetMeta | null> {
     const api = await this.getApi();
     if (this.sheetsCache == null) {
       this.sheetsCache = withRetry(async () => {
-        const res = await api.spreadsheets.get({
+        const res: any = await api.spreadsheets.get({
           spreadsheetId: this.config.spreadsheetId,
           fields: 'sheets.properties',
         });
-        return (res.data.sheets || []).map(s => ({
+        return (res.data.sheets || []).map((s: any) => ({
           sheetId: s.properties?.sheetId ?? -1,
           title: s.properties?.title ?? '',
-        })).filter(m => m.sheetId >= 0);
+        })).filter((m: SheetMeta) => m.sheetId >= 0);
       });
     }
     const all = await this.sheetsCache;
-    return all.find(m => m.title === name) || null;
+    return all.find((m: SheetMeta) => m.title === name) || null;
   }
 
   async deleteSheet(name: string): Promise<void> {
@@ -200,7 +200,7 @@ export class An5SheetsAdapter {
 
   async readRange<T = any>(range: string): Promise<T[][]> {
     const api = await this.getApi();
-    const res = await withRetry(() =>
+    const res: any = await withRetry(() =>
       api.spreadsheets.values.get({
         spreadsheetId: this.config.spreadsheetId,
         range,

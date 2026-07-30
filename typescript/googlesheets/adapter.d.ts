@@ -1,13 +1,14 @@
-import { sheets_v4 } from 'googleapis';
 import { An5SheetsAdapterConfig, resolveConfig } from './config';
 import { SheetsTableClient } from './tableClient';
 import { SheetMeta } from './types';
 export declare class An5SheetsAdapter {
     private sheets;
+    private fetchApi;
     config: ReturnType<typeof resolveConfig>;
     private sheetsCache;
     constructor(config: An5SheetsAdapterConfig);
-    getSheets(): Promise<sheets_v4.Sheets>;
+    private get isOAuth();
+    getSheets(): Promise<any>;
     private getApi;
     invalidateCache(): void;
     listSheets(): Promise<string[]>;
