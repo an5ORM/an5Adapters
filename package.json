@@ -1,6 +1,6 @@
 {
   "name": "@an5/adapters",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET query execution.",
   "license": "MIT",
   "main": "typescript/index.js",
@@ -17,7 +17,14 @@
     "type": "git",
     "url": "https://github.com/an5ORM/an5Adapters.git"
   },
-  "keywords": ["an5", "orm", "adapter", "typescript", "python", "dotnet"],
+  "keywords": [
+    "an5",
+    "orm",
+    "adapter",
+    "typescript",
+    "python",
+    "dotnet"
+  ],
   "files": [
     "typescript/**/*.{ts,js,d.ts}",
     "python/**/*.py",
