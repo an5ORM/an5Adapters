@@ -156,6 +156,7 @@ export class An5SheetsAdapter {
 
   async $disconnect(): Promise<void> {
     this.sheets = null;
+    this.fetchApi = null;
     this.sheetsCache = null;
   }
 
