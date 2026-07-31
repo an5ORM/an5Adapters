@@ -7,8 +7,10 @@ export type AnyAdapterConfig = An5AdapterConfig | An5SheetsAdapterConfig | {
     connectionString: string;
 };
 export declare class An5Adapter {
-    private engine;
-    private sheetsAdapter;
+    private _engine;
+    private _engineType;
+    private _engineConfig;
+    sheetsAdapter: An5SheetsAdapter | null;
     get dialect(): Dialect;
     constructor(adapterConfig: An5AdapterConfig | An5SheetsAdapterConfig);
     private requireEngine;

@@ -15,6 +15,15 @@ venv/
 env/
 .pytest_cache/
 .mypy_cache/
+*.egg-info/
+
+# Compiled output
+typescript/*.js
+typescript/*.d.ts
+typescript/*.js.map
+typescript/*/*.js
+typescript/*/*.d.ts
+typescript/*/*.js.map
 
 # OS/editor
 .DS_Store

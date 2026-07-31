@@ -2,20 +2,24 @@
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "./typescript",
-    "rootDir": "./typescript",
+    "rootDir": "./typescript/src",
     "preserveSymlinks": true,
     "declaration": true,
     "declarationMap": false,
     "sourceMap": false
   },
   "include": [
-    "typescript/**/*.ts"
+    "typescript/src/**/*.ts"
   ],
   "exclude": [
     "node_modules",
     "dist",
     "python",
     "dotnet",
-    "test"
+    "test",
+    "typescript/*.js",
+    "typescript/*.d.ts",
+    "typescript/*/*.js",
+    "typescript/*/*.d.ts"
   ]
 }

@@ -34,8 +34,16 @@ function assertExists(filePath) {
   }
 }
 
+function getTsFile(relativePath) {
+  const p1 = path.join(__dirname, '..', 'typescript', 'src', relativePath);
+  if (fs.existsSync(p1)) return p1;
+  const p2 = path.join(__dirname, '..', 'typescript', relativePath);
+  if (fs.existsSync(p2)) return p2;
+  return p1;
+}
+
 function readGoogleSheetsSource() {
-  const dir = path.join(__dirname, '..', 'typescript', 'googlesheets');
+  const dir = getTsFile('googlesheets');
   return fs.readdirSync(dir)
     .filter(name => name.endsWith('.ts'))
     .map(name => fs.readFileSync(path.join(dir, name), 'utf8'))
@@ -63,40 +71,40 @@ console.log('\n=== an5Adapters Unit Tests ===\n');
 console.log('TypeScript Adapter:');
 
 test('an5Adapter.ts exists', () => {
-  assertExists(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'));
+  assertExists(getTsFile('an5Adapter.ts'));
 });
 
 test('exports An5Adapter class', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
-  const typesContent = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'base', 'types.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
+  const typesContent = fs.readFileSync(getTsFile(path.join('base', 'types.ts')), 'utf8');
   assertIncludes(content, 'export class An5Adapter');
   assertIncludes(typesContent, 'export interface An5AdapterConfig');
   assertIncludes(content, 'export function createAn5Adapter');
 });
 
 test('An5Adapter has exec method', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
   assertIncludes(content, 'async exec<T = any>(query: string');
 });
 
 test('An5Adapter has table factory method', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
   assertIncludes(content, 'table<T = any>(modelName: string)');
 });
 
 test('An5Adapter has transaction support', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
   assertIncludes(content, '$transaction');
 });
 
 test('An5Adapter has connect/disconnect', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
   assertIncludes(content, '$connect');
   assertIncludes(content, '$disconnect');
 });
 
 test('AdapterTableClient has full CRUD', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
   assertIncludes(content, 'async findMany');
   assertIncludes(content, 'async findFirst');
   assertIncludes(content, 'async findUnique');
@@ -108,24 +116,24 @@ test('AdapterTableClient has full CRUD', () => {
 });
 
 test('AdapterTableClient has aggregate and groupBy', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
   assertIncludes(content, 'async aggregate');
   assertIncludes(content, 'async groupBy');
 });
 
 test('AdapterTableClient has vectorSearch', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
   assertIncludes(content, 'async vectorSearch');
 });
 
 test('parseWhere handles OR/AND operators', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'base', 'sql.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile(path.join('base', 'sql.ts')), 'utf8');
   assertIncludes(content, "key === 'OR'");
   assertIncludes(content, "key === 'AND'");
 });
 
 test('parseWhere handles comparison operators', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'base', 'sql.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile(path.join('base', 'sql.ts')), 'utf8');
   assertIncludes(content, 'contains');
   assertIncludes(content, 'startsWith');
   assertIncludes(content, 'endsWith');
@@ -135,10 +143,10 @@ test('parseWhere handles comparison operators', () => {
 });
 
 test('TypeScript adapter supports PostgreSQL dialect', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
-  const typesContent = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'base', 'types.ts'), 'utf8');
-  const postgresContent = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'postgres', 'engine.ts'), 'utf8');
-  const mssqlContent = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'mssql', 'engine.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
+  const typesContent = fs.readFileSync(getTsFile(path.join('base', 'types.ts')), 'utf8');
+  const postgresContent = fs.readFileSync(getTsFile(path.join('postgres', 'engine.ts')), 'utf8');
+  const mssqlContent = fs.readFileSync(getTsFile(path.join('mssql', 'engine.ts')), 'utf8');
   assertIncludes(typesContent, "'postgres'");
   assertIncludes(postgresContent, 'class PostgresEngine');
   assertIncludes(mssqlContent, 'class MssqlEngine');
@@ -149,8 +157,8 @@ test('TypeScript adapter supports PostgreSQL dialect', () => {
 });
 
 test('TypeScript adapter uses dialect-aware quoting', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'base', 'sql.ts'), 'utf8');
-  const tableContent = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile(path.join('base', 'sql.ts')), 'utf8');
+  const tableContent = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
   assertIncludes(content, 'function quote(name: string, dialect: Dialect)');
   assertIncludes(content, 'dialect === \'postgres\'');
   assertIncludes(tableContent, 'LIMIT');
@@ -158,17 +166,17 @@ test('TypeScript adapter uses dialect-aware quoting', () => {
 });
 
 test('TypeScript SQL providers are split by provider folder', () => {
-  assertExists(path.join(__dirname, '..', 'typescript', 'base', 'types.ts'));
-  assertExists(path.join(__dirname, '..', 'typescript', 'base', 'sql.ts'));
-  assertExists(path.join(__dirname, '..', 'typescript', 'mssql', 'engine.ts'));
-  assertExists(path.join(__dirname, '..', 'typescript', 'postgres', 'engine.ts'));
-  assertExists(path.join(__dirname, '..', 'typescript', 'mysql', 'engine.ts'));
-  assertExists(path.join(__dirname, '..', 'typescript', 'sqlite', 'engine.ts'));
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
-  assertIncludes(content, "from './mssql'");
-  assertIncludes(content, "from './postgres'");
-  assertIncludes(content, "from './mysql'");
-  assertIncludes(content, "from './sqlite'");
+  assertExists(getTsFile(path.join('base', 'types.ts')));
+  assertExists(getTsFile(path.join('base', 'sql.ts')));
+  assertExists(getTsFile(path.join('mssql', 'engine.ts')));
+  assertExists(getTsFile(path.join('postgres', 'engine.ts')));
+  assertExists(getTsFile(path.join('mysql', 'engine.ts')));
+  assertExists(getTsFile(path.join('sqlite', 'engine.ts')));
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
+  assertIncludes(content, './mssql');
+  assertIncludes(content, './postgres');
+  assertIncludes(content, './mysql');
+  assertIncludes(content, './sqlite');
 });
 
 // ─── Config Module (DB-backed config) ─────────────────────────────────────────
@@ -176,11 +184,11 @@ test('TypeScript SQL providers are split by provider folder', () => {
 console.log('\nConfig Module:');
 
 test('config.ts exists', () => {
-  assertExists(path.join(__dirname, '..', 'typescript', 'config.ts'));
+  assertExists(getTsFile('config.ts'));
 });
 
 test('config.ts exports config functions', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'config.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('config.ts'), 'utf8');
   assertIncludes(content, 'getLlmConfig');
   assertIncludes(content, 'setLlmConfig');
   assertIncludes(content, 'getEmbeddingConfig');
@@ -190,7 +198,7 @@ test('config.ts exports config functions', () => {
 });
 
 test('config.ts exports from index.ts barrel', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'index.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('index.ts'), 'utf8');
   assertIncludes(content, 'getLlmConfig');
   assertIncludes(content, 'getEmbeddingConfig');
   assertIncludes(content, 'setEmbeddingConfig');
@@ -354,11 +362,11 @@ test('.NET providers are split by provider folder', () => {
 console.log('\nGoogle Sheets Adapter:');
 
 test('an5SheetsAdapter.ts exists', () => {
-  assertExists(path.join(__dirname, '..', 'typescript', 'googlesheets', 'an5SheetsAdapter.ts'));
+  assertExists(getTsFile(path.join('googlesheets', 'an5SheetsAdapter.ts')));
 });
 
 test('index.ts exists', () => {
-  assertExists(path.join(__dirname, '..', 'typescript', 'googlesheets', 'index.ts'));
+  assertExists(getTsFile(path.join('googlesheets', 'index.ts')));
 });
 
 test('exports An5SheetsAdapter class and factory', () => {
@@ -545,7 +553,7 @@ test('extractColsAndVals parses INSERT cols/values', () => {
 });
 
 test('An5Adapter factory handles Google Sheets directly', () => {
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'an5Adapter.ts'), 'utf8');
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
   assertIncludes(content, 'function createAn5Adapter');
   assertIncludes(content, 'createAdapter');
   assertIncludes(content, 'googlesheet');
@@ -559,8 +567,8 @@ test('package no longer exports unified subpath', () => {
 });
 
 test('connection string parser exists', () => {
-  assertExists(path.join(__dirname, '..', 'typescript', 'googlesheets', 'parseConnectionString.ts'));
-  const content = fs.readFileSync(path.join(__dirname, '..', 'typescript', 'googlesheets', 'parseConnectionString.ts'), 'utf8');
+  assertExists(getTsFile(path.join('googlesheets', 'parseConnectionString.ts')));
+  const content = fs.readFileSync(getTsFile(path.join('googlesheets', 'parseConnectionString.ts')), 'utf8');
   assertIncludes(content, 'parseSheetsConnectionString');
   assertIncludes(content, 'googlesheet');
 });

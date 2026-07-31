@@ -2,7 +2,6 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.An5SheetsAdapter = void 0;
 exports.createAn5SheetsAdapter = createAn5SheetsAdapter;
-const googleapis_1 = require("googleapis");
 const config_1 = require("./config");
 const sqlExecutor_1 = require("./sqlExecutor");
 const tableClient_1 = require("./tableClient");
@@ -85,12 +84,13 @@ class An5SheetsAdapter {
             return this.fetchApi;
         }
         if (!this.sheets) {
-            const auth = new googleapis_1.google.auth.JWT({
+            const { google } = await import('googleapis');
+            const auth = new google.auth.JWT({
                 email: this.config.clientEmail,
                 key: this.config.privateKey,
                 scopes: ['https://www.googleapis.com/auth/spreadsheets'],
             });
-            this.sheets = googleapis_1.google.sheets({ version: 'v4', auth });
+            this.sheets = google.sheets({ version: 'v4', auth });
         }
         return this.sheets;
     }

@@ -1,5 +1,5 @@
-import { google, sheets_v4 } from 'googleapis';
 import { An5SheetsAdapterConfig, resolveConfig } from './config';
+import type { sheets_v4 } from 'googleapis';
 import { execQuery } from './sqlExecutor';
 import { SheetsTableClient } from './tableClient';
 import { SheetMeta } from './types';
@@ -91,6 +91,7 @@ export class An5SheetsAdapter {
       return this.fetchApi;
     }
     if (!this.sheets) {
+      const { google } = await import('googleapis');
       const auth = new google.auth.JWT({
         email: this.config.clientEmail,
         key: this.config.privateKey,

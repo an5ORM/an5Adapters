@@ -7,10 +7,6 @@ const googlesheets_1 = require("./googlesheets");
 const parseConnectionString_1 = require("./googlesheets/parseConnectionString");
 const sql_1 = require("./base/sql");
 const metadata_1 = require("./base/metadata");
-const mssql_1 = require("./mssql");
-const postgres_1 = require("./postgres");
-const mysql_1 = require("./mysql");
-const sqlite_1 = require("./sqlite");
 var metadata_2 = require("./base/metadata");
 Object.defineProperty(exports, "setAdapterMetadata", { enumerable: true, get: function () { return metadata_2.setAdapterMetadata; } });
 function isSheetsConfig(config) {
@@ -18,9 +14,23 @@ function isSheetsConfig(config) {
 }
 // ─── An5Adapter ────────────────────────────────────────────────────────────────────
 class An5Adapter {
-    get dialect() { return this.sheetsAdapter ? 'googlesheets' : this.requireEngine().dialect; }
+    get dialect() {
+        if (this.sheetsAdapter)
+            return 'googlesheets';
+        if (this._engine)
+            return this._engine.dialect;
+        if (this._engineType === 'postgres')
+            return 'postgres';
+        if (this._engineType === 'mysql')
+            return 'mysql';
+        if (this._engineType === 'sqlite')
+            return 'sqlite';
+        return 'mssql';
+    }
     constructor(adapterConfig) {
-        this.engine = null;
+        this._engine = null;
+        this._engineType = null;
+        this._engineConfig = null;
         this.sheetsAdapter = null;
         if (isSheetsConfig(adapterConfig)) {
             this.sheetsAdapter = new googlesheets_1.An5SheetsAdapter(adapterConfig);
@@ -31,23 +41,48 @@ class An5Adapter {
             this.sheetsAdapter = new googlesheets_1.An5SheetsAdapter((0, parseConnectionString_1.parseSheetsConnectionString)(cs));
             return;
         }
+        this._engineConfig = adapterConfig;
         if (cs.startsWith('postgres://') || cs.startsWith('postgresql://')) {
-            this.engine = new postgres_1.PostgresEngine(adapterConfig);
+            this._engineType = 'postgres';
         }
         else if (cs.startsWith('mysql://') || cs.startsWith('mariadb://')) {
-            this.engine = new mysql_1.MysqlEngine(adapterConfig);
+            this._engineType = 'mysql';
         }
         else if (cs.startsWith('sqlite://') || cs.endsWith('.sqlite') || cs.endsWith('.db')) {
-            this.engine = new sqlite_1.SqliteEngine(adapterConfig);
+            this._engineType = 'sqlite';
         }
         else {
-            this.engine = new mssql_1.MssqlEngine(adapterConfig);
+            this._engineType = 'mssql';
         }
     }
-    requireEngine() {
-        if (!this.engine)
+    async requireEngine() {
+        if (!this._engine && this._engineType) {
+            switch (this._engineType) {
+                case 'postgres': {
+                    const { PostgresEngine } = require('./postgres.js');
+                    this._engine = new PostgresEngine(this._engineConfig);
+                    break;
+                }
+                case 'mysql': {
+                    const { MysqlEngine } = require('./mysql.js');
+                    this._engine = new MysqlEngine(this._engineConfig);
+                    break;
+                }
+                case 'sqlite': {
+                    const { SqliteEngine } = require('./sqlite.js');
+                    this._engine = new SqliteEngine(this._engineConfig);
+                    break;
+                }
+                case 'mssql': {
+                    const { MssqlEngine } = require('./mssql.js');
+                    this._engine = new MssqlEngine(this._engineConfig);
+                    break;
+                }
+            }
+        }
+        if (!this._engine)
             throw new Error('SQL engine is not available for Google Sheets adapter');
-        return this.engine;
+        return this._engine;
     }
     requireSheetsAdapter() {
         if (!this.sheetsAdapter)
@@ -57,19 +92,19 @@ class An5Adapter {
     async exec(query, params) {
         if (this.sheetsAdapter)
             return this.sheetsAdapter.exec(query, params);
-        return this.requireEngine().exec(query, params);
+        return (await this.requireEngine()).exec(query, params);
     }
     /** INTERNAL: used by AdapterTableClient for DML statements needing row count */
     async _executeRaw(query, params) {
-        return this.requireEngine().executeRaw(query, params);
+        return (await this.requireEngine()).executeRaw(query, params);
     }
     /** Execute a raw query with positional values → @p_0, @p_1, ... per dialect */
     async $queryRawUnsafe(query, ...values) {
         if (this.sheetsAdapter)
             return this.sheetsAdapter.$queryRawUnsafe(query, ...values);
+        const engine = await this.requireEngine();
         const params = {};
         values.forEach((v, i) => { params[`p_${i}`] = v; });
-        // Normalise external positional placeholders → @p_N so each engine can re-transform
         let q = query;
         if (this.dialect === 'postgres') {
             let idx = 0;
@@ -79,11 +114,12 @@ class An5Adapter {
             let idx = 0;
             q = q.replace(/\?/g, () => `@p_${idx++}`);
         }
-        return this.exec(q, params);
+        return engine.exec(q, params);
     }
     async $executeRaw(query, ...values) {
         if (this.sheetsAdapter)
             return this.sheetsAdapter.$executeRaw(query, ...values);
+        const engine = await this.requireEngine();
         const params = {};
         values.forEach((v, i) => { params[`p_${i}`] = v; });
         let q = query;
@@ -95,7 +131,7 @@ class An5Adapter {
             let idx = 0;
             q = q.replace(/\?/g, () => `@p_${idx++}`);
         }
-        return this.requireEngine().executeRaw(q, params);
+        return engine.executeRaw(q, params);
     }
     async $executeRawUnsafe(query, ...values) {
         return this.$executeRaw(query, ...values);
@@ -103,19 +139,20 @@ class An5Adapter {
     async $connect() {
         if (this.sheetsAdapter)
             return this.sheetsAdapter.$connect();
-        await this.requireEngine().connect();
+        await (await this.requireEngine()).connect();
     }
     async $disconnect() {
         if (this.sheetsAdapter)
             return this.sheetsAdapter.$disconnect();
-        await this.requireEngine().disconnect();
+        await (await this.requireEngine()).disconnect();
     }
     async $transaction(fn, _options) {
         if (this.sheetsAdapter)
             return this.sheetsAdapter.$transaction(fn, _options);
         if (Array.isArray(fn))
             return Promise.all(fn);
-        const handle = await this.requireEngine().beginTransaction();
+        const engine = await this.requireEngine();
+        const handle = await engine.beginTransaction();
         const txAdapter = new An5AdapterTx(handle, this.dialect);
         try {
             const result = await fn(txAdapter);
