@@ -2,7 +2,7 @@
 
 ## [0.2.4] - 2026-07-31
 
-- chore: update misc, build
+- chore: update docs, build, misc
 
 ## [0.2.3] - 2026-07-31
 

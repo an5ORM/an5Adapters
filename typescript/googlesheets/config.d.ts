@@ -11,11 +11,14 @@ export interface An5SheetsAdapterConfig {
      * When provided, the adapter uses raw fetch() instead of googleapis JWT, making it compatible
      * with browser environments. Mutually exclusive with clientEmail/privateKey/credentials. */
     accessToken?: string;
+    /** Google API key for browser-based API access. */
+    apiKey?: string;
 }
 export declare function normalizeKey(key: string): string;
 export declare function resolveConfig(config: An5SheetsAdapterConfig): {
     spreadsheetId: string;
-    accessToken: string;
+    accessToken: string | undefined;
+    apiKey: string | undefined;
     sheetMapping: Record<string, string> | undefined;
     clientEmail?: undefined;
     privateKey?: undefined;
@@ -25,4 +28,5 @@ export declare function resolveConfig(config: An5SheetsAdapterConfig): {
     privateKey: string;
     sheetMapping: Record<string, string> | undefined;
     accessToken?: undefined;
+    apiKey?: undefined;
 };

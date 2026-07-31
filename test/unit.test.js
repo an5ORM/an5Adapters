@@ -566,11 +566,19 @@ test('package no longer exports unified subpath', () => {
   assert.strictEqual(pkg.exports['./unified'], undefined);
 });
 
-test('connection string parser exists', () => {
+test('connection string parser handles accessToken and apiKey', () => {
   assertExists(getTsFile(path.join('googlesheets', 'parseConnectionString.ts')));
   const content = fs.readFileSync(getTsFile(path.join('googlesheets', 'parseConnectionString.ts')), 'utf8');
   assertIncludes(content, 'parseSheetsConnectionString');
-  assertIncludes(content, 'googlesheet');
+  assertIncludes(content, 'accessToken');
+  assertIncludes(content, 'apiKey');
+});
+
+test('browser entry exports Sheets adapter and metadata helpers', () => {
+  const content = fs.readFileSync(getTsFile('browser.ts'), 'utf8');
+  assertIncludes(content, 'An5SheetsAdapter');
+  assertIncludes(content, 'createAn5SheetsAdapter');
+  assertIncludes(content, 'setAdapterMetadata');
 });
 
 // ─── Package & Config ────────────────────────────────────────────────────────

@@ -5,14 +5,21 @@ import { SheetsTableClient } from './tableClient';
 import { SheetMeta } from './types';
 import { withRetry } from './retry';
 
-// ─── Fetch-based API proxy for OAuth Access Token (browser-compatible) ────────
+// ─── Fetch-based API proxy for OAuth Access Token / API Key (browser-compatible) ──
 
-function createFetchApi(spreadsheetId: string, accessToken: string) {
+function createFetchApi(spreadsheetId: string, accessToken?: string, apiKey?: string) {
   const base = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}`;
-  const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' };
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (accessToken) {
+    headers['Authorization'] = `Bearer ${accessToken}`;
+  }
 
   async function request<T>(method: string, path: string, body?: any): Promise<T> {
-    const url = path.startsWith('http') ? path : `${base}${path}`;
+    let url = path.startsWith('http') ? path : `${base}${path}`;
+    if (apiKey) {
+      const sep = url.includes('?') ? '&' : '?';
+      url += `${sep}key=${encodeURIComponent(apiKey)}`;
+    }
     const opts: RequestInit = { method, headers };
     if (body) opts.body = JSON.stringify(body);
     const res = await fetch(url, opts);
@@ -79,16 +86,26 @@ export class An5SheetsAdapter {
     this.config = resolveConfig(config);
   }
 
-  private get isOAuth(): boolean {
-    return !!(this.config as any).accessToken;
+  private get isFetchMode(): boolean {
+    return !!(this.config as any).accessToken || !!(this.config as any).apiKey;
   }
 
   async getSheets(): Promise<any> {
-    if (this.isOAuth) {
+    if (this.isFetchMode) {
       if (!this.fetchApi) {
-        this.fetchApi = createFetchApi(this.config.spreadsheetId, (this.config as any).accessToken);
+        this.fetchApi = createFetchApi(
+          this.config.spreadsheetId,
+          (this.config as any).accessToken,
+          (this.config as any).apiKey
+        );
       }
       return this.fetchApi;
+    }
+    const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'undefined';
+    if (isBrowser) {
+      throw new Error(
+        'Google Sheets adapter in browser mode requires "accessToken" or "apiKey" configuration.'
+      );
     }
     if (!this.sheets) {
       const { google } = await import('googleapis');

@@ -31,6 +31,10 @@ function parseSheetsConnectionString(url) {
         result.clientEmail = config.clientemail;
     if (config.privatekey)
         result.privateKey = config.privatekey;
+    if (config.accesstoken)
+        result.accessToken = config.accesstoken;
+    if (config.apikey)
+        result.apiKey = config.apikey;
     if (config.sheetmapping) {
         const mapping = {};
         for (const pair of config.sheetmapping.split(',')) {

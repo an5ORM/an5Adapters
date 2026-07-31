@@ -1,10 +1,16 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.SheetsTableClient = void 0;
-const crypto_1 = require("crypto");
+const uuid_1 = require("../base/uuid");
 const metadata_1 = require("../base/metadata");
 const helpers_1 = require("./helpers");
 const retry_1 = require("./retry");
+// ─── Utility ──────────────────────────────────────────────────────────────────
+function resolveIdField(fields) {
+    if (Object.prototype.hasOwnProperty.call(fields, 'id'))
+        return 'id';
+    return Object.keys(fields).find(name => name.endsWith('_id') || name.endsWith('Id') || name.toLowerCase() === 'id');
+}
 // ─── Table Client ─────────────────────────────────────────────────────────────
 class SheetsTableClient {
     constructor(adapter, modelName, sheetMapping) {
@@ -146,20 +152,20 @@ class SheetsTableClient {
         const rows = await this.findMany({ where: args?.where });
         return rows.length;
     }
-    async create(args) {
-        const fields = this.fields;
-        const idFieldName = Object.prototype.hasOwnProperty.call(fields, 'id')
-            ? 'id'
-            : Object.keys(fields).find(name => name.endsWith('_id') || name.endsWith('Id') || name.toLowerCase() === 'id');
-        const data = { ...args.data };
-        if (idFieldName) {
-            const fieldDef = fields[idFieldName];
-            const rawType = typeof fieldDef === 'string' ? fieldDef : (fieldDef?.ts || fieldDef?.sql || '');
-            const isStringType = ['string', 'uuid', 'uniqueidentifier', 'nvarchar', 'varchar', 'text'].includes(rawType.toLowerCase());
-            if (isStringType && !data[idFieldName]) {
-                data[idFieldName] = (0, crypto_1.randomUUID)();
-            }
+    assignId(data, fields) {
+        const idFieldName = resolveIdField(fields);
+        if (!idFieldName)
+            return;
+        const fieldDef = fields[idFieldName];
+        const rawType = typeof fieldDef === 'string' ? fieldDef : (fieldDef?.ts || fieldDef?.sql || '');
+        const isStringType = ['string', 'uuid', 'uniqueidentifier', 'nvarchar', 'varchar', 'text'].includes(rawType.toLowerCase());
+        if (isStringType && !data[idFieldName]) {
+            data[idFieldName] = (0, uuid_1.generateUUID)();
         }
+    }
+    async create(args) {
+        const data = { ...args.data };
+        this.assignId(data, this.fields);
         const cols = Object.keys(data).filter(k => data[k] !== undefined);
         const headers = await this.getOrCreateHeaders(cols);
         for (const h of headers) {
@@ -174,28 +180,16 @@ class SheetsTableClient {
     async createMany(args) {
         if (args.data.length === 0)
             return { count: 0 };
-        const allKeys = new Set();
-        for (const row of args.data) {
-            Object.keys(row).forEach(k => allKeys.add(k));
-        }
-        const cols = [...allKeys];
         const fields = this.fields;
-        const idFieldName = Object.prototype.hasOwnProperty.call(fields, 'id')
-            ? 'id'
-            : Object.keys(fields).find(name => name.endsWith('_id') || name.endsWith('Id') || name.toLowerCase() === 'id');
-        const prepared = [];
-        for (const item of args.data) {
+        const allKeys = new Set();
+        for (const row of args.data)
+            Object.keys(row).forEach(k => allKeys.add(k));
+        const cols = [...allKeys];
+        const prepared = args.data.map(item => {
             const data = { ...item };
-            if (idFieldName) {
-                const fieldDef = fields[idFieldName];
-                const rawType = typeof fieldDef === 'string' ? fieldDef : (fieldDef?.ts || fieldDef?.sql || '');
-                const isStringType = ['string', 'uuid', 'uniqueidentifier', 'nvarchar', 'varchar', 'text'].includes(rawType.toLowerCase());
-                if (isStringType && !data[idFieldName]) {
-                    data[idFieldName] = (0, crypto_1.randomUUID)();
-                }
-            }
-            prepared.push(data);
-        }
+            this.assignId(data, fields);
+            return data;
+        });
         const headers = await this.getOrCreateHeaders(cols);
         const batchValues = prepared.map(data => {
             for (const h of headers) {
@@ -238,16 +232,26 @@ class SheetsTableClient {
     async updateMany(args) {
         const { headers, rows } = await this.readAllRows();
         const matching = rows.filter(r => (0, helpers_1.matchWhere)(r, args.where));
-        for (const target of matching) {
-            const updated = { ...target, ...args.data, __row: target.__row };
-            await this.adapter.writeRange(`${this.escSheetName}!A${target.__row}`, [
-                this.rowToValues(updated, headers),
-            ]);
-        }
+        if (matching.length === 0)
+            return { count: 0 };
+        // Batch all writes into a single batchUpdate call
+        const api = await this.adapter.getSheets();
+        const spreadsheetId = this.adapter.config.spreadsheetId;
+        const valueRanges = matching.map(target => {
+            const updated = { ...target, ...args.data };
+            return {
+                range: `${this.escSheetName}!A${target.__row}`,
+                values: [this.rowToValues(updated, headers)],
+            };
+        });
+        await (0, retry_1.withRetry)(() => api.spreadsheets.values.batchUpdate({
+            spreadsheetId,
+            requestBody: { valueInputOption: 'RAW', data: valueRanges },
+        }));
         return { count: matching.length };
     }
     async delete(args) {
-        const { headers, rows } = await this.readAllRows();
+        const { rows } = await this.readAllRows();
         const matching = rows.filter(r => (0, helpers_1.matchWhere)(r, args.where));
         if (matching.length === 0)
             throw new Error('No record found matching where clause');
@@ -260,17 +264,30 @@ class SheetsTableClient {
         return rest;
     }
     async deleteMany(args) {
-        const { headers, rows } = await this.readAllRows();
+        const { rows } = await this.readAllRows();
         const matching = rows.filter(r => (0, helpers_1.matchWhere)(r, args?.where));
         if (matching.length === 0)
             return { count: 0 };
         const meta = await this.adapter.getSheetMeta(this.sheetName);
         if (!meta)
             throw new Error(`Sheet "${this.sheetName}" not found`);
+        // Batch all deletes into a single batchUpdate (sorted DESC to keep row indices stable)
+        const api = await this.adapter.getSheets();
         const sorted = [...matching].sort((a, b) => b.__row - a.__row);
-        for (const target of sorted) {
-            await this.deleteRowByIndex(target.__row, meta.sheetId);
-        }
+        const requests = sorted.map(target => ({
+            deleteDimension: {
+                range: {
+                    sheetId: meta.sheetId,
+                    dimension: 'ROWS',
+                    startIndex: target.__row - 1,
+                    endIndex: target.__row,
+                },
+            },
+        }));
+        await (0, retry_1.withRetry)(() => api.spreadsheets.batchUpdate({
+            spreadsheetId: this.adapter.config.spreadsheetId,
+            requestBody: { requests },
+        }));
         return { count: matching.length };
     }
     async deleteAll() {

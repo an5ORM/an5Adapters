@@ -2,7 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createAdapter = exports.AdapterTableClient = exports.An5AdapterTx = exports.An5Adapter = exports.setAdapterMetadata = void 0;
 exports.createAn5Adapter = createAn5Adapter;
-const crypto_1 = require("crypto");
+const uuid_1 = require("./base/uuid");
 const googlesheets_1 = require("./googlesheets");
 const parseConnectionString_1 = require("./googlesheets/parseConnectionString");
 const sql_1 = require("./base/sql");
@@ -304,7 +304,7 @@ class AdapterTableClient {
             const normalizedType = String(rawType).toLowerCase();
             const isStringType = ['string', 'uuid', 'uniqueidentifier', 'nvarchar', 'varchar', 'text'].includes(normalizedType);
             if (isStringType && !data[idFieldName])
-                data[idFieldName] = (0, crypto_1.randomUUID)();
+                data[idFieldName] = (0, uuid_1.generateUUID)();
         }
         const cols = Object.keys(data).filter(k => data[k] !== undefined);
         const params = {};

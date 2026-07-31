@@ -10,6 +10,8 @@ export interface An5SheetsAdapterConfig {
    * When provided, the adapter uses raw fetch() instead of googleapis JWT, making it compatible
    * with browser environments. Mutually exclusive with clientEmail/privateKey/credentials. */
   accessToken?: string;
+  /** Google API key for browser-based API access. */
+  apiKey?: string;
 }
 
 export function normalizeKey(key: string): string {
@@ -20,10 +22,11 @@ export function normalizeKey(key: string): string {
 }
 
 export function resolveConfig(config: An5SheetsAdapterConfig) {
-  if (config.accessToken) {
+  if (config.accessToken || config.apiKey) {
     return {
       spreadsheetId: config.spreadsheetId,
       accessToken: config.accessToken,
+      apiKey: config.apiKey,
       sheetMapping: config.sheetMapping,
     };
   }

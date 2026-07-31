@@ -7,7 +7,7 @@ export declare class An5SheetsAdapter {
     config: ReturnType<typeof resolveConfig>;
     private sheetsCache;
     constructor(config: An5SheetsAdapterConfig);
-    private get isOAuth();
+    private get isFetchMode();
     getSheets(): Promise<any>;
     private getApi;
     invalidateCache(): void;

@@ -30,6 +30,7 @@ export declare class SheetsTableClient<T = any> {
     count(args?: {
         where?: any;
     }): Promise<number>;
+    private assignId;
     create(args: {
         data: Partial<T>;
     }): Promise<T>;

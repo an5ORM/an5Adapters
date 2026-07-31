@@ -45,6 +45,12 @@ function matchWhere(row, where) {
                 return false;
             continue;
         }
+        if (key === 'NOT') {
+            const notClauses = Array.isArray(value) ? value : [value];
+            if (notClauses.some((v) => matchWhere(row, v)))
+                return false;
+            continue;
+        }
         const cellVal = row[key];
         if (value === null) {
             if (cellVal !== null && cellVal !== undefined)
@@ -52,22 +58,30 @@ function matchWhere(row, where) {
         }
         else if (typeof value === 'object' && !(value instanceof Date)) {
             const v = value;
+            const caseInsensitive = v.mode === 'insensitive';
+            const normalize = (s) => caseInsensitive ? String(s ?? '').toLowerCase() : s;
             if (v.not !== undefined) {
                 if (v.not === null) {
                     if (cellVal === null || cellVal === undefined)
                         return false;
                 }
-                else if (cellVal == v.not)
+                else if (normalize(cellVal) == normalize(v.not))
                     return false;
             }
-            if (v.equals !== undefined && cellVal != v.equals)
+            if (v.equals !== undefined && normalize(cellVal) != normalize(v.equals))
                 return false;
-            if (v.contains !== undefined && (!cellVal || !String(cellVal).includes(v.contains)))
-                return false;
-            if (v.startsWith !== undefined && (!cellVal || !String(cellVal).startsWith(v.startsWith)))
-                return false;
-            if (v.endsWith !== undefined && (!cellVal || !String(cellVal).endsWith(v.endsWith)))
-                return false;
+            if (v.contains !== undefined) {
+                if (!cellVal || !normalize(String(cellVal)).includes(normalize(v.contains)))
+                    return false;
+            }
+            if (v.startsWith !== undefined) {
+                if (!cellVal || !normalize(String(cellVal)).startsWith(normalize(v.startsWith)))
+                    return false;
+            }
+            if (v.endsWith !== undefined) {
+                if (!cellVal || !normalize(String(cellVal)).endsWith(normalize(v.endsWith)))
+                    return false;
+            }
             if (v.gte !== undefined && !(Number(cellVal) >= Number(v.gte)))
                 return false;
             if (v.lte !== undefined && !(Number(cellVal) <= Number(v.lte)))
@@ -77,11 +91,16 @@ function matchWhere(row, where) {
             if (v.lt !== undefined && !(Number(cellVal) < Number(v.lt)))
                 return false;
             if (v.in !== undefined) {
-                if (!Array.isArray(v.in) || !v.in.includes(cellVal))
+                if (!Array.isArray(v.in) || !v.in.some((item) => item == cellVal))
+                    return false;
+            }
+            if (v.notIn !== undefined) {
+                if (Array.isArray(v.notIn) && v.notIn.some((item) => item == cellVal))
                     return false;
             }
         }
         else {
+            // loose equality to handle string/number coercion from sheet cells
             if (cellVal != value)
                 return false;
         }

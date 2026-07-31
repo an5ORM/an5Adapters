@@ -12,10 +12,11 @@ function normalizeKey(key) {
     return `-----BEGIN PRIVATE KEY-----\n${lines}\n-----END PRIVATE KEY-----`;
 }
 function resolveConfig(config) {
-    if (config.accessToken) {
+    if (config.accessToken || config.apiKey) {
         return {
             spreadsheetId: config.spreadsheetId,
             accessToken: config.accessToken,
+            apiKey: config.apiKey,
             sheetMapping: config.sheetMapping,
         };
     }

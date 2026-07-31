@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { generateUUID } from './base/uuid';
 
 import {
   An5SheetsAdapter,
@@ -317,7 +317,7 @@ export class AdapterTableClient<T = any> {
       const rawType = typeof fieldDef === 'string' ? fieldDef : (fieldDef?.ts || fieldDef?.sql || fieldDef?.type || '');
       const normalizedType = String(rawType).toLowerCase();
       const isStringType = ['string', 'uuid', 'uniqueidentifier', 'nvarchar', 'varchar', 'text'].includes(normalizedType);
-      if (isStringType && !data[idFieldName]) data[idFieldName] = randomUUID();
+      if (isStringType && !data[idFieldName]) data[idFieldName] = generateUUID();
     }
 
     const cols = Object.keys(data).filter(k => data[k] !== undefined);

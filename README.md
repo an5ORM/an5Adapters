@@ -19,7 +19,7 @@ Adapters are runtime packages only. They do not import generated `an5Client` art
 ### TypeScript
 
 ```bash
-npm install an5-adapters
+npm install @an5/adapters
 ```
 
 ### Python
@@ -39,7 +39,7 @@ dotnet add package An5Adapters
 ### TypeScript
 
 ```typescript
-import { createAn5Adapter, setAdapterMetadata } from 'an5-adapters';
+import { createAn5Adapter, setAdapterMetadata } from '@an5/adapters';
 
 setAdapterMetadata({
   modelToTable: { User: 'dbo.users' },
@@ -120,7 +120,7 @@ db.Transaction(tx => {
 ### Google Sheets
 
 ```typescript
-import { createAn5SheetsAdapter } from 'an5-adapters';
+import { createAn5SheetsAdapter } from '@an5/adapters';
 
 const db = createAn5SheetsAdapter({
   spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms',
@@ -157,10 +157,30 @@ await db.table('users').clear();
 await db.table('users').deleteAll();
 ```
 
+### Browser Mode (Google Sheets)
+
+For browser environments (React, Vue, Svelte, Next.js client components), import from `@an5/adapters/browser` and configure `accessToken` or `apiKey`. In browser mode, the adapter uses native `fetch()` without importing Node.js modules (`googleapis`, `crypto`, `fs`).
+
+```typescript
+import { createAn5SheetsAdapter } from '@an5/adapters/browser';
+
+// Option 1: OAuth2 Access Token (e.g. from Firebase Auth or Google Sign-In)
+const db = createAn5SheetsAdapter({
+  spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms',
+  accessToken: userOAuthAccessToken,
+});
+
+// Option 2: Google API Key
+const db2 = createAn5SheetsAdapter({
+  spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms',
+  apiKey: 'AIzaSy...',
+});
+```
+
 ### Integrated factory (auto-detect adapter)
 
 ```typescript
-import { createAn5Adapter, createAdapter, An5Adapter } from 'an5-adapters';
+import { createAn5Adapter, createAdapter, An5Adapter } from '@an5/adapters';
 
 // Auto-detects from connection string
 const sqlDb = createAn5Adapter({ connectionString: 'sqlserver://localhost:1433;database=mydb;user=sa;password=pass' });
@@ -197,7 +217,7 @@ const sheetsDb3 = new An5Adapter({
 Use the package root for normal applications:
 
 ```typescript
-import { createAn5Adapter, createAn5SheetsAdapter } from 'an5-adapters';
+import { createAn5Adapter, createAn5SheetsAdapter } from '@an5/adapters';
 ```
 
 Provider folders are still available to source-level consumers through `typescript/*`, but the public factory in `typescript/an5Adapter.ts` is the preferred entry point. The old `unified.ts` entry point has been removed because the factory now lives directly in `An5Adapter`.
