@@ -24,3 +24,7 @@ dependencies = [
 package-dir = {"" = "python"}
 py-modules = ["an5_adapter", "table_client"]
 packages = ["base", "mssql", "postgres"]
+
+[tool.pyright]
+extraPaths = ["python"]
+
