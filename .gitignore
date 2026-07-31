@@ -1,6 +1,7 @@
 # Node
 node_modules/
 dist/
+dist-py/
 build/
 *.tsbuildinfo
 npm-debug.log*
