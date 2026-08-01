@@ -1,6 +1,6 @@
 {
   "name": "@an5/adapters",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET query execution.",
   "license": "MIT",
   "main": "dist/index.js",
