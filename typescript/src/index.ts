@@ -17,3 +17,12 @@ export {
 export type {
   LlmConfigData, EmbeddingConfigData,
 } from './config';
+export {
+  An5SheetsAdapter,
+  SheetsTableClient,
+  createAn5SheetsAdapter,
+  parseSheetsConnectionString,
+} from './googlesheets';
+export type {
+  An5SheetsAdapterConfig,
+} from './googlesheets';

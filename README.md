@@ -234,10 +234,11 @@ Use the package root for normal SQL applications:
 import { createAn5Adapter, An5Adapter } from '@an5/adapters';
 ```
 
-The Sheets adapter is exposed through its own subpath:
+The Sheets adapter is exposed from the package root and through its own subpath:
 
 ```typescript
-import { createAn5SheetsAdapter, An5SheetsAdapter } from '@an5/adapters/googlesheets';
+import { createAn5SheetsAdapter, An5SheetsAdapter, SheetsTableClient, parseSheetsConnectionString } from '@an5/adapters';
+import { An5SheetsAdapter, createAn5SheetsAdapter } from '@an5/adapters/googlesheets';
 import { parseSheetsConnectionString } from '@an5/adapters/googlesheets';
 ```
 
