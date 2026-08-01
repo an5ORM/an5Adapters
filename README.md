@@ -100,27 +100,41 @@ db.transaction(lambda tx: tx.table("User").create({"name": "John"}))
 ### .NET
 
 ```csharp
+using System.Collections.Generic;
 using An5Orm;
 
-var db = new An5Adapter(connectionString);
+var db = new An5Adapter("sqlserver://localhost:1433;database=mydb;user=sa;password=pass");
 
 // Table client
 var users = db.Table<User>("dbo.users");
-var activeUsers = users.FindMany("IsActive = @p", new { p = true });
+var activeUsers = users.FindMany(
+    "IsActive = @p",
+    new Dictionary<string, object> { ["p"] = true });
 
 // Raw queries
-var rows = db.QueryRaw("SELECT * FROM users WHERE Id = @id", new { id = "123" });
+var rows = db.QueryRaw("SELECT * FROM users WHERE Id = @id",
+    new Dictionary<string, object> { ["id"] = "123" });
 
-// Transactions
-db.Transaction(tx => {
+// Create / Update / Delete
+users.Create(new User { Name = "John", IsActive = true });
+users.Update(existingUser);            // uses the Id property as the key
+users.Delete("123");
+
+// Transactions (must return a value; use db.Transaction<int> for void-style)
+db.Transaction(tx =>
+{
     tx.Table<User>("dbo.users").Create(new User { Name = "John" });
+    return 0;
 });
 ```
+
+Note: `QueryRaw`/`FindMany` take parameters as a `Dictionary<string, object>`,
+not anonymous objects. See `dotnet/An5Adapter.cs` for the full API.
 
 ### Google Sheets
 
 ```typescript
-import { createAn5SheetsAdapter } from '@an5/adapters';
+import { createAn5SheetsAdapter } from '@an5/adapters/googlesheets';
 
 const db = createAn5SheetsAdapter({
   spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms',
@@ -180,7 +194,7 @@ const db2 = createAn5SheetsAdapter({
 ### Integrated factory (auto-detect adapter)
 
 ```typescript
-import { createAn5Adapter, createAdapter, An5Adapter } from '@an5/adapters';
+import { createAn5Adapter, An5Adapter } from '@an5/adapters';
 
 // Auto-detects from connection string
 const sqlDb = createAn5Adapter({ connectionString: 'sqlserver://localhost:1433;database=mydb;user=sa;password=pass' });
@@ -190,7 +204,7 @@ const sheetsDb = createAn5Adapter({
 });
 
 // Or use the Sheets config object directly (also auto-detected)
-const sheetsDb2 = createAdapter({
+const sheetsDb2 = createAn5Adapter({
   spreadsheetId: '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms',
   clientEmail: 'sa@project.iam.gserviceaccount.com',
   privateKey: '-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----',
@@ -214,13 +228,20 @@ const sheetsDb3 = new An5Adapter({
 
 ### Provider Imports
 
-Use the package root for normal applications:
+Use the package root for normal SQL applications:
 
 ```typescript
-import { createAn5Adapter, createAn5SheetsAdapter } from '@an5/adapters';
+import { createAn5Adapter, An5Adapter } from '@an5/adapters';
 ```
 
-Provider folders are still available to source-level consumers through `typescript/*`, but the public factory in `typescript/an5Adapter.ts` is the preferred entry point. The old `unified.ts` entry point has been removed because the factory now lives directly in `An5Adapter`.
+The Sheets adapter is exposed through its own subpath:
+
+```typescript
+import { createAn5SheetsAdapter, An5SheetsAdapter } from '@an5/adapters/googlesheets';
+import { parseSheetsConnectionString } from '@an5/adapters/googlesheets';
+```
+
+Browser builds (no Node.js modules) use `@an5/adapters/browser`. The public SQL factory `createAn5Adapter` lives in `typescript/src/an5Adapter.ts` and auto-detects `googlesheets://` connection strings.
 
 ## API Reference
 
@@ -262,8 +283,8 @@ Provider folders are still available to source-level consumers through `typescri
 
 ## Provider Layout
 
-- TypeScript providers live under `typescript/{base,mssql,postgres,mysql,sqlite,googlesheets}`.
-- Python providers live under `python/{base,mssql,postgres}`, with `python/an5_adapter.py` kept as the public facade.
+- TypeScript source providers live under `typescript/src/{base,mssql,postgres,mysql,sqlite,googlesheets}`; `npm run build` compiles them into `dist/` (also exposed via `@an5/adapters/base`, `@an5/adapters/mssql`, … subpaths).
+- Python providers live under `python/{base,mssql,postgres}`, with `python/an5_adapter.py` kept as the public facade. `npm run build:python` (or `python -m build --outdir dist-py`) builds the package into `dist-py/`.
 - .NET providers live under `dotnet/{Base,Mssql,Postgres}`, with `dotnet/an5Adapter.cs` kept as the public facade.
 - Adapters do not depend on generated `an5-client` artifacts; generated clients may pass metadata in explicitly when they need model/table mapping.
 

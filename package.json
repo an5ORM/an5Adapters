@@ -3,16 +3,24 @@
   "version": "0.2.3",
   "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET query execution.",
   "license": "MIT",
-  "main": "typescript/index.js",
-  "types": "typescript/index.d.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
-    ".": "./typescript/index.js",
-    "./browser": "./typescript/browser.js",
-    "./typescript": "./typescript/index.js",
-    "./typescript/*": "./typescript/*",
+    ".": "./dist/index.js",
+    "./browser": "./dist/browser.js",
+    "./config": "./dist/config.js",
+    "./base": "./dist/base/index.js",
+    "./base/*": "./dist/base/*",
+    "./mssql": "./dist/mssql/index.js",
+    "./postgres": "./dist/postgres/index.js",
+    "./mysql": "./dist/mysql/index.js",
+    "./sqlite": "./dist/sqlite/index.js",
+    "./googlesheets": "./dist/googlesheets/index.js",
+    "./googlesheets/*": "./dist/googlesheets/*",
+    "./typescript": "./dist/index.js",
+    "./typescript/*": "./dist/*",
     "./python": "./python/an5_adapter.py",
-    "./dotnet": "./dotnet/An5Adapter.cs",
-    "./config": "./typescript/config.js"
+    "./dotnet": "./dotnet/An5Adapter.cs"
   },
   "author": "an5ORM",
   "homepage": "https://github.com/an5ORM/an5",
@@ -29,13 +37,15 @@
     "dotnet"
   ],
   "files": [
-    "typescript/**/*.{ts,js,d.ts}",
+    "dist/**/*.{js,d.ts}",
+    "typescript/src/**/*.ts",
     "python/**/*.py",
     "dotnet/**/*",
     "README.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:python": "python -m build --outdir dist-py",
     "test": "node test/unit.test.js",
     "test:python": "python -m compileall python 2>&1"
   },

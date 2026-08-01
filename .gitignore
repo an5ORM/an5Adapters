@@ -18,14 +18,6 @@ env/
 .mypy_cache/
 *.egg-info/
 
-# Compiled output
-typescript/*.js
-typescript/*.d.ts
-typescript/*.js.map
-typescript/*/*.js
-typescript/*/*.d.ts
-typescript/*/*.js.map
-
 # OS/editor
 .DS_Store
 .vscode/
