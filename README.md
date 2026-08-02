@@ -282,6 +282,25 @@ Browser builds (no Node.js modules) use `@an5/adapters/browser`. The public SQL 
 | `clear()` | Clear all data rows, keep headers (Sheets only) |
 | `deleteAll()` | Delete all data rows including headers (Sheets only) |
 
+### Config functions
+
+Exported from the package root (and from the `@an5/adapters/config` subpath):
+
+| Function | Description |
+|----------|-------------|
+| `getLlmConfig()` / `setLlmConfig(config)` | Read/update the active LLM configuration |
+| `getEmbeddingConfig()` / `setEmbeddingConfig(config)` | Read/update the active embedding configuration |
+| `resetAdapter()` | Clear cached adapter/config state |
+| `setAdapterMetadata(metadata)` | Pass schema metadata explicitly to the adapter |
+
+```typescript
+import { getLlmConfig, setLlmConfig, setEmbeddingConfig, resetAdapter } from '@an5/adapters';
+
+setLlmConfig({ provider: 'openai', model: 'gpt-4o-mini', apiKey: '...' });
+setEmbeddingConfig({ provider: 'openai', model: 'text-embedding-3-small', apiKey: '...' });
+resetAdapter();
+```
+
 ## Provider Layout
 
 - TypeScript source providers live under `typescript/src/{base,mssql,postgres,mysql,sqlite,googlesheets}`; `npm run build` compiles them into `dist/` (also exposed via `@an5/adapters/base`, `@an5/adapters/mssql`, … subpaths).
@@ -294,6 +313,10 @@ Browser builds (no Node.js modules) use `@an5/adapters/browser`. The public SQL 
 ```bash
 # TypeScript/Node
 node test/unit.test.js
+node test/package.test.js
+
+# Package smoke test: npm pack + install into a fresh project + verify
+npm run test:package:smoke
 
 # Python
 python -m compileall python
