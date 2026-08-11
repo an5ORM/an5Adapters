@@ -60,6 +60,7 @@ function readSourceTree(dirPath, extension) {
   const files = [];
   function walk(dir) {
     for (const name of fs.readdirSync(dir)) {
+      if (name === 'dist' || name === 'build' || name === 'node_modules' || name === '.git') continue;
       const full = path.join(dir, name);
       const stat = fs.statSync(full);
       if (stat.isDirectory()) walk(full);
