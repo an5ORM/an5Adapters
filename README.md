@@ -70,6 +70,15 @@ const rows = await db.exec('SELECT * FROM users WHERE id = @id', { id: '123' });
 await db.$transaction(async (tx) => {
   await tx.table('users').create({ data: { name: 'John' } });
 });
+
+const tx = await db.$begin();
+try {
+  await tx.table('users').create({ data: { name: 'Jane' } });
+  await tx.$commit();
+} catch (error) {
+  await tx.$rollback();
+  throw error;
+}
 ```
 
 ### Python

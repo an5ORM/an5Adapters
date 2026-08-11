@@ -101,6 +101,9 @@ test('An5Adapter has table factory method', () => {
 test('An5Adapter has transaction support', () => {
   const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
   assertIncludes(content, '$transaction');
+  assertIncludes(content, 'async $begin()');
+  assertIncludes(content, 'async $commit()');
+  assertIncludes(content, 'async $rollback()');
 });
 
 test('An5Adapter has connect/disconnect', () => {

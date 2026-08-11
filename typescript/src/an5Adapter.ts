@@ -225,6 +225,14 @@ export class An5Adapter {
     }
   }
 
+  async $begin(): Promise<An5AdapterTx> {
+    if (this.sheetsAdapter) {
+      throw new Error('Interactive transactions are not supported by the Google Sheets adapter');
+    }
+    const engine = await this.requireEngine();
+    return new An5AdapterTx(await engine.beginTransaction(), this.dialect);
+  }
+
   table<T = any>(modelName: string): AdapterTableClient<T> | SheetsTableClient<T> {
     if (this.sheetsAdapter) return this.sheetsAdapter.table<T>(modelName);
     return new AdapterTableClient<T>(this, modelName);
@@ -254,21 +262,41 @@ export class An5Adapter {
 // ─── Transaction-scoped adapter ────────────────────────────────────────────────────
 
 export class An5AdapterTx {
+  private closed = false;
+
   constructor(
     private readonly handle: TransactionHandle,
     public readonly dialect: Dialect,
   ) { }
 
   async exec<T = any>(query: string, params?: Record<string, any>): Promise<T[]> {
+    this.ensureOpen();
     return this.handle.exec<T>(query, params);
   }
 
   async _executeRaw(query: string, params?: Record<string, any>): Promise<number> {
+    this.ensureOpen();
     return this.handle.executeRaw(query, params);
+  }
+
+  async $commit(): Promise<void> {
+    this.ensureOpen();
+    this.closed = true;
+    await this.handle.commit();
+  }
+
+  async $rollback(): Promise<void> {
+    this.ensureOpen();
+    this.closed = true;
+    await this.handle.rollback();
   }
 
   table<T = any>(modelName: string): AdapterTableClient<T> {
     return new AdapterTableClient<T>(this, modelName);
+  }
+
+  private ensureOpen(): void {
+    if (this.closed) throw new Error('Transaction is already closed');
   }
 }
 
