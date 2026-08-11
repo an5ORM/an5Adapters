@@ -610,12 +610,14 @@ export class AdapterTableClient<T = any> {
           msg.includes('type vector') ||
           msg.includes('type "vector"') ||
           msg.includes('data type vector') ||
+          msg.includes('incorrect syntax') ||
           msg.includes('not a recognized built-in function') ||
           msg.includes('not a defined system type') ||
           msg.includes('pgvector') ||
           msg.includes('operator does not exist') ||
           msg.includes('limit of 1998') ||
-          err?.number === 195;
+          err?.number === 195 ||
+          err?.number === 102;
         if (!isUnsupported) throw err;
       }
     }
