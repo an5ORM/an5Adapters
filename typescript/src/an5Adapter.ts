@@ -119,22 +119,22 @@ export class An5Adapter {
     if (!this._engine && this._engineType) {
       switch (this._engineType) {
         case 'postgres': {
-          const { PostgresEngine } = require('./postgres.js');
+          const { PostgresEngine } = require('./postgres/index.js');
           this._engine = new PostgresEngine(this._engineConfig!);
           break;
         }
         case 'mysql': {
-          const { MysqlEngine } = require('./mysql.js');
+          const { MysqlEngine } = require('./mysql/index.js');
           this._engine = new MysqlEngine(this._engineConfig!);
           break;
         }
         case 'sqlite': {
-          const { SqliteEngine } = require('./sqlite.js');
+          const { SqliteEngine } = require('./sqlite/index.js');
           this._engine = new SqliteEngine(this._engineConfig!);
           break;
         }
         case 'mssql': {
-          const { MssqlEngine } = require('./mssql.js');
+          const { MssqlEngine } = require('./mssql/index.js');
           this._engine = new MssqlEngine(this._engineConfig!);
           break;
         }
