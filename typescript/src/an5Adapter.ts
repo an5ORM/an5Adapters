@@ -605,19 +605,22 @@ export class AdapterTableClient<T = any> {
         const rows = await this.doExec(query, params);
         return rows as (T & { distance: number })[];
       } catch (err: any) {
-        const msg = String(err?.message || '').toLowerCase();
+        const msg = (String(err?.message || '') + ' ' + String(err?.originalError?.message || '')).toLowerCase();
         const isUnsupported = msg.includes('vector_distance') ||
           msg.includes('type vector') ||
           msg.includes('type "vector"') ||
           msg.includes('data type vector') ||
           msg.includes('incorrect syntax') ||
+          msg.includes('syntax near') ||
           msg.includes('not a recognized built-in function') ||
           msg.includes('not a defined system type') ||
           msg.includes('pgvector') ||
           msg.includes('operator does not exist') ||
           msg.includes('limit of 1998') ||
           err?.number === 195 ||
-          err?.number === 102;
+          err?.number === 102 ||
+          err?.number === 319 ||
+          err?.originalError?.number === 319;
         if (!isUnsupported) throw err;
       }
     }
