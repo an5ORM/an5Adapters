@@ -1,6 +1,6 @@
 # an5Adapters
 
-Standalone runtime adapters for AN5 ORM. Provides connection pooling, query execution, typed table clients in TypeScript, Python, .NET, and Google Sheets API.
+Standalone runtime adapters for AN5 ORM. Provides connection pooling, query execution, typed table clients in TypeScript, Python, .NET (C#), Golang, and Google Sheets API.
 
 Adapters are runtime packages only. They do not import generated `an5Client` artifacts; generated clients or applications can pass model metadata explicitly when table-name mapping or field type coercion is needed.
 
@@ -11,7 +11,7 @@ Adapters are runtime packages only. They do not import generated `an5Client` art
 - **Full query support** — WHERE, ORDER BY, pagination, aggregates
 - **Vector search** — Cosine, euclidean, and dot product similarity
 - **Transactions** — Begin/commit/rollback with automatic cleanup
-- **Cross-language** — Same API in TypeScript, Python, and .NET
+- **Cross-language** — Same API in TypeScript, Python, .NET (C#), and Golang
 - **Google Sheets** — Use spreadsheets as a database with the same CRUD API
 
 ## Installation
@@ -33,6 +33,10 @@ pip install an5-adapters
 ```bash
 dotnet add package An5Adapters
 ```
+
+### Go
+
+The Go adapter sources are included in the npm package under `golang/` and can also be copied into Go projects that use the `an5adapters` module layout.
 
 ## Usage
 
@@ -130,6 +134,39 @@ db.Transaction(tx =>
 
 Note: `QueryRaw`/`FindMany` take parameters as a `Dictionary<string, object>`,
 not anonymous objects. See `dotnet/An5Adapter.cs` for the full API.
+
+### Go
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+
+    an5 "an5adapters"
+)
+
+func example(db *sql.DB) error {
+    ctx := context.Background()
+    adapter := an5.NewAn5Adapter(db, "postgres://localhost/mydb")
+    users := adapter.Table("users")
+
+    _, err := users.Create(ctx, map[string]interface{}{"name": "John", "active": true})
+    if err != nil {
+        return err
+    }
+
+    rows, err := users.FindMany(ctx, an5.QuoteIdentifier("active", adapter.Dialect)+" = $1", true)
+    if err != nil {
+        return err
+    }
+    _ = rows
+
+    _, err = users.UpdateMany(ctx, map[string]interface{}{"active": false}, an5.QuoteIdentifier("name", adapter.Dialect)+" = $1", "John")
+    return err
+}
+```
 
 ### Google Sheets
 
@@ -305,7 +342,8 @@ resetAdapter();
 
 - TypeScript source providers live under `typescript/src/{base,mssql,postgres,mysql,sqlite,googlesheets}`; `npm run build` compiles them into `dist/` (also exposed via `@an5/adapters/base`, `@an5/adapters/mssql`, … subpaths).
 - Python providers live under `python/{base,mssql,postgres}`, with `python/an5_adapter.py` kept as the public facade. `npm run build:python` (or `python -m build --outdir dist-py`) builds the package into `dist-py/`.
-- .NET providers live under `dotnet/{Base,Mssql,Postgres}`, with `dotnet/an5Adapter.cs` kept as the public facade.
+- .NET providers live under `dotnet/{Base,Mssql,Postgres}`, with `dotnet/An5Adapter.cs` kept as the public facade.
+- Go providers live under `golang/{base,mssql,postgres}`, with `golang/an5_adapter.go` and `golang/table_client.go` kept as the public facade.
 - Adapters do not depend on generated `an5-client` artifacts; generated clients may pass metadata in explicitly when they need model/table mapping.
 
 ## Testing
@@ -319,8 +357,13 @@ node test/package.test.js
 npm run test:package:smoke
 
 # Python
-python -m compileall python
-python test/smoke.py
+npm run test:python
+
+# .NET
+npm run test:dotnet
+
+# Go
+npm run test:go
 ```
 
 ## License

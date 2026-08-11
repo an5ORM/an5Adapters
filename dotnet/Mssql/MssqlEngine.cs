@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Reflection;
+using Microsoft.Data.SqlClient;
 
 namespace An5Orm
 {
@@ -13,8 +14,8 @@ namespace An5Orm
         private readonly string _connectionString;
         private readonly int _commandTimeout;
 
-        [ThreadStatic] private static System.Data.SqlClient.SqlConnection _txConn;
-        [ThreadStatic] private static System.Data.SqlClient.SqlTransaction _tx;
+        [ThreadStatic] private static SqlConnection _txConn;
+        [ThreadStatic] private static SqlTransaction _tx;
 
         public MssqlEngine(string connectionString, int commandTimeout)
         {
@@ -22,19 +23,19 @@ namespace An5Orm
             _commandTimeout = commandTimeout;
         }
 
-        private System.Data.SqlClient.SqlConnection OpenConnection(out bool isInTransaction)
+        private SqlConnection OpenConnection(out bool isInTransaction)
         {
             if (_txConn != null) { isInTransaction = true; return _txConn; }
             isInTransaction = false;
-            var conn = new System.Data.SqlClient.SqlConnection(_connectionString);
+            var conn = new SqlConnection(_connectionString);
             conn.Open();
             return conn;
         }
 
-        private System.Data.SqlClient.SqlCommand BuildCommand(
-            System.Data.SqlClient.SqlConnection conn, string sql, Dictionary<string, object> parameters)
+        private SqlCommand BuildCommand(
+            SqlConnection conn, string sql, Dictionary<string, object> parameters)
         {
-            var cmd = new System.Data.SqlClient.SqlCommand(sql, conn) { CommandTimeout = _commandTimeout };
+            var cmd = new SqlCommand(sql, conn) { CommandTimeout = _commandTimeout };
             if (_tx != null) cmd.Transaction = _tx;
             if (parameters != null)
             {
@@ -106,7 +107,7 @@ namespace An5Orm
             finally { if (!isTx) conn.Dispose(); }
         }
 
-        private static bool HasColumn(System.Data.SqlClient.SqlDataReader reader, string name)
+        private static bool HasColumn(SqlDataReader reader, string name)
         {
             for (int i = 0; i < reader.FieldCount; i++)
                 if (reader.GetName(i).Equals(name, StringComparison.OrdinalIgnoreCase)) return true;
@@ -115,7 +116,7 @@ namespace An5Orm
 
         public An5TransactionBase BeginTransaction()
         {
-            var conn = new System.Data.SqlClient.SqlConnection(_connectionString);
+            var conn = new SqlConnection(_connectionString);
             conn.Open();
             var tx = conn.BeginTransaction();
             _txConn = conn;
@@ -126,11 +127,11 @@ namespace An5Orm
 
     internal class MssqlTransaction : An5TransactionBase
     {
-        private readonly System.Data.SqlClient.SqlConnection _conn;
-        private readonly System.Data.SqlClient.SqlTransaction _tx;
+        private readonly SqlConnection _conn;
+        private readonly SqlTransaction _tx;
         private readonly Action _cleanup;
 
-        public MssqlTransaction(System.Data.SqlClient.SqlConnection conn, System.Data.SqlClient.SqlTransaction tx, Action cleanup)
+        public MssqlTransaction(SqlConnection conn, SqlTransaction tx, Action cleanup)
         {
             _conn = conn;
             _tx = tx;

@@ -1,7 +1,7 @@
 {
   "name": "@an5/adapters",
   "version": "0.2.5",
-  "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET query execution.",
+  "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET, Go, and Google Sheets query execution.",
   "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -20,7 +20,8 @@
     "./typescript": "./dist/index.js",
     "./typescript/*": "./dist/*",
     "./python": "./python/an5_adapter.py",
-    "./dotnet": "./dotnet/An5Adapter.cs"
+    "./dotnet": "./dotnet/An5Adapter.cs",
+    "./golang": "./golang/an5_adapter.go"
   },
   "author": "an5ORM",
   "homepage": "https://github.com/an5ORM/an5",
@@ -34,13 +35,16 @@
     "adapter",
     "typescript",
     "python",
-    "dotnet"
+    "dotnet",
+    "go",
+    "golang"
   ],
   "files": [
     "dist/**/*.{js,d.ts}",
     "typescript/src/**/*.ts",
     "python/**/*.py",
     "dotnet/**/*",
+    "golang/**/*",
     "README.md"
   ],
   "scripts": {
@@ -48,7 +52,10 @@
     "build:python": "python -m build --outdir dist-py",
     "test": "node test/unit.test.js && node test/package.test.js",
     "test:package:smoke": "node scripts/package-smoke.js",
-    "test:python": "python -m compileall python 2>&1"
+    "test:integration:live": "node test/live-db.integration.test.js",
+    "test:python": "python -m compileall python 2>&1",
+    "test:dotnet": "node scripts/dotnet-compile-check.js",
+    "test:go": "cd golang && go test ./..."
   },
   "dependencies": {
     "googleapis": "^134.0.0",

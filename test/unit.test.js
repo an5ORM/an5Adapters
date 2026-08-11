@@ -28,6 +28,12 @@ function assertIncludes(str, substr, msg) {
   }
 }
 
+function assertNotIncludes(str, substr, msg) {
+  if (str && str.includes(substr)) {
+    throw new Error(`${msg || 'Assert'}: content should not contain "${substr}"`);
+  }
+}
+
 function assertExists(filePath) {
   if (!fs.existsSync(filePath)) {
     throw new Error(`File not found: ${filePath}`);
@@ -126,20 +132,66 @@ test('AdapterTableClient has vectorSearch', () => {
   assertIncludes(content, 'async vectorSearch');
 });
 
+test('TypeScript adapter vectorSearch uses dialect-aware SQL', () => {
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
+  assertIncludes(content, 'VECTOR_DISTANCE');
+  assertIncludes(content, 'pgvector');
+  assertIncludes(content, 'query_vector');
+  assertIncludes(content, 'vectorElementType');
+  assertIncludes(content, 'type "vector"');
+});
+
 test('parseWhere handles OR/AND operators', () => {
   const content = fs.readFileSync(getTsFile(path.join('base', 'sql.ts')), 'utf8');
   assertIncludes(content, "key === 'OR'");
   assertIncludes(content, "key === 'AND'");
+  assertIncludes(content, "key === 'NOT'");
+  assertIncludes(content, 'const items = Array.isArray(value) ? value : [value]');
 });
 
 test('parseWhere handles comparison operators', () => {
   const content = fs.readFileSync(getTsFile(path.join('base', 'sql.ts')), 'utf8');
+  assertIncludes(content, 'OPERATOR_KEYS');
+  assertIncludes(content, 'isOperatorValue');
+  assertIncludes(content, 'equals');
   assertIncludes(content, 'contains');
   assertIncludes(content, 'startsWith');
   assertIncludes(content, 'endsWith');
   assertIncludes(content, 'gte');
   assertIncludes(content, 'lte');
   assertIncludes(content, 'not');
+  assertIncludes(content, 'notIn');
+  assertIncludes(content, 'IS NULL');
+  assertIncludes(content, 'IS NOT NULL');
+  assertIncludes(content, 'NOT (');
+});
+
+test('AdapterTableClient update supports field operations', () => {
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
+  assertIncludes(content, 'function appendUpdateSet');
+  assertIncludes(content, 'val.increment !== undefined');
+  assertIncludes(content, 'val.decrement !== undefined');
+  assertIncludes(content, 'val.multiply !== undefined');
+  assertIncludes(content, 'val.divide !== undefined');
+  assertIncludes(content, 'val.set !== undefined');
+  assertIncludes(content, 'if (sets.length === 0) return { count: 0 }');
+});
+
+test('AdapterTableClient aggregate and groupBy skip false aggregate fields', () => {
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
+  assertIncludes(content, 'function selectedAggregateFields');
+  assertIncludes(content, 'for (const f of selectedAggregateFields(args._sum))');
+  assertIncludes(content, 'for (const f of selectedAggregateFields(args._avg))');
+  assertIncludes(content, "throw new Error('Aggregate requires at least one aggregator field')");
+});
+
+test('AdapterTableClient groupBy supports string by and pagination', () => {
+  const content = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
+  assertIncludes(content, 'function normalizeByFields');
+  assertIncludes(content, 'const byFields = normalizeByFields(args?.by)');
+  assertIncludes(content, 'buildOrderBy(args?.orderBy, this.dialect)');
+  assertIncludes(content, 'FETCH NEXT');
+  assertIncludes(content, 'LIMIT');
 });
 
 test('TypeScript adapter supports PostgreSQL dialect', () => {
@@ -161,6 +213,11 @@ test('TypeScript adapter uses dialect-aware quoting', () => {
   const tableContent = fs.readFileSync(getTsFile('an5Adapter.ts'), 'utf8');
   assertIncludes(content, 'function quote(name: string, dialect: Dialect)');
   assertIncludes(content, 'dialect === \'postgres\'');
+  assertIncludes(content, 'replace(/"/g, \'""\')');
+  assertIncludes(content, 'replace(/`/g, \'``\')');
+  assertIncludes(content, 'replace(/\\]/g, \']]\')');
+  assertIncludes(content, 'function sanitizeParamName');
+  assertIncludes(content, 'function normalizeSortDirection');
   assertIncludes(tableContent, 'LIMIT');
   assertIncludes(tableContent, 'OFFSET');
 });
@@ -261,7 +318,29 @@ test('Python adapter has CRUD methods', () => {
 test('Python adapter has aggregate and vector_search', () => {
   const content = readSourceTree(path.join(__dirname, '..', 'python'), '.py');
   assertIncludes(content, 'def aggregate');
+  assertIncludes(content, 'def group_by');
   assertIncludes(content, 'def vector_search');
+});
+
+test('Python adapter supports ORM-style filters and update operations', () => {
+  const content = readSourceTree(path.join(__dirname, '..', 'python'), '.py');
+  assertIncludes(content, '_OPERATOR_KEYS');
+  assertIncludes(content, 'key == "NOT"');
+  assertIncludes(content, '"notIn" in value');
+  assertIncludes(content, 'value["equals"] is None');
+  assertIncludes(content, 'def _append_update_set');
+  assertIncludes(content, '"increment" in val');
+  assertIncludes(content, '"multiply" in val');
+  assertIncludes(content, 'return {"count": 0}');
+});
+
+test('Python adapter aggregate/group_by supports truthy fields and pagination', () => {
+  const content = readSourceTree(path.join(__dirname, '..', 'python'), '.py');
+  assertIncludes(content, 'def _selected_aggregate_fields');
+  assertIncludes(content, 'def _normalize_by_fields');
+  assertIncludes(content, 'raise ValueError("Aggregate requires at least one aggregator field")');
+  assertIncludes(content, 'FETCH NEXT');
+  assertIncludes(content, 'LIMIT');
 });
 
 test('Python adapter has transaction support', () => {
@@ -331,6 +410,14 @@ test('.NET adapter has transaction support', () => {
 test('.NET adapter has VectorSearch', () => {
   const content = fs.readFileSync(path.join(__dirname, '..', 'dotnet', 'An5Adapter.cs'), 'utf8');
   assertIncludes(content, 'VectorSearch');
+  assertIncludes(content, 'VECTOR_DISTANCE');
+  assertIncludes(content, 'pgvector');
+  assertIncludes(content, 'EuclideanDistance');
+  assertIncludes(content, '_adapter.QueryRaw<T>');
+  assertNotIncludes(content, 'An5Dialect');
+  assertNotIncludes(content, 'TableSql');
+  assertNotIncludes(content, 'NoLockSql');
+  assertNotIncludes(content, 'SqlQuote(vectorField)');
 });
 
 test('.NET adapter supports PostgreSQL dialect', () => {
@@ -349,12 +436,126 @@ test('.NET adapter has SqlQuote with dialect-aware quoting', () => {
   assertIncludes(content, 'static class SqlQuote');
   assertIncludes(content, 'QuoteTable');
   assertIncludes(content, 'QuoteName');
+  assertIncludes(content, 'StripWrapping');
+  assertIncludes(content, 'Replace("\\\"", "\\\"\\\"")');
+  assertIncludes(content, 'Replace("]", "]]")');
 });
 
 test('.NET providers are split by provider folder', () => {
   assertExists(path.join(__dirname, '..', 'dotnet', 'Base', 'Core.cs'));
   assertExists(path.join(__dirname, '..', 'dotnet', 'Mssql', 'MssqlEngine.cs'));
   assertExists(path.join(__dirname, '..', 'dotnet', 'Postgres', 'PostgresEngine.cs'));
+});
+
+test('.NET MSSQL provider uses Microsoft.Data.SqlClient', () => {
+  const content = fs.readFileSync(path.join(__dirname, '..', 'dotnet', 'Mssql', 'MssqlEngine.cs'), 'utf8');
+  const script = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'dotnet-compile-check.js'), 'utf8');
+  assertIncludes(content, 'using Microsoft.Data.SqlClient;');
+  assertNotIncludes(content, 'System.Data.SqlClient');
+  assertIncludes(script, 'Microsoft.Data.SqlClient');
+  assertNotIncludes(script, 'System.Data.SqlClient');
+});
+
+// ─── Golang Adapter ───────────────────────────────────────────────────────────
+
+console.log('\nGolang Adapter:');
+
+const goDir = path.join(__dirname, '..', 'golang');
+
+function readGoSource() {
+  return readSourceTree(goDir, '.go');
+}
+
+test('an5_adapter.go exists', () => {
+  assertExists(path.join(goDir, 'an5_adapter.go'));
+});
+
+test('Go adapter has An5Adapter struct', () => {
+  const content = fs.readFileSync(path.join(goDir, 'an5_adapter.go'), 'utf8');
+  assertIncludes(content, 'type An5Adapter struct');
+  assertIncludes(content, 'func NewAn5Adapter(');
+});
+
+test('Go adapter has QueryRaw and ExecuteRaw', () => {
+  const content = fs.readFileSync(path.join(goDir, 'an5_adapter.go'), 'utf8');
+  assertIncludes(content, 'func (a *An5Adapter) QueryRaw(');
+  assertIncludes(content, 'func (a *An5Adapter) ExecuteRaw(');
+});
+
+test('Go adapter has Connect and Disconnect', () => {
+  const content = fs.readFileSync(path.join(goDir, 'an5_adapter.go'), 'utf8');
+  assertIncludes(content, 'func (a *An5Adapter) Connect(');
+  assertIncludes(content, 'func (a *An5Adapter) Disconnect(');
+});
+
+test('Go adapter has Transaction support', () => {
+  const content = fs.readFileSync(path.join(goDir, 'an5_adapter.go'), 'utf8');
+  assertIncludes(content, 'func (a *An5Adapter) Transaction(');
+});
+
+test('Go adapter has VectorSearch with dialect-aware SQL', () => {
+  const content = readGoSource();
+  assertIncludes(content, 'func (a *An5Adapter) VectorSearch(');
+  assertIncludes(content, 'VectorSearchFallback(');
+  assertIncludes(content, 'VECTOR_DISTANCE');
+  assertIncludes(content, 'pgvector');
+});
+
+test('Go adapter has SetAdapterMetadata', () => {
+  const content = readGoSource();
+  assertIncludes(content, 'SetAdapterMetadata(');
+  assertIncludes(content, 'ModelToTable');
+  assertIncludes(content, 'GetModelToTable(');
+});
+
+test('Go TableClient has CRUD operations', () => {
+  const content = fs.readFileSync(path.join(goDir, 'table_client.go'), 'utf8');
+  assertIncludes(content, 'func (t *TableClient) FindMany(');
+  assertIncludes(content, 'func (t *TableClient) FindFirst(');
+  assertIncludes(content, 'func (t *TableClient) Count(');
+  assertIncludes(content, 'func (t *TableClient) Create(');
+  assertIncludes(content, 'func (t *TableClient) CreateMany(');
+  assertIncludes(content, 'func (t *TableClient) Update(');
+  assertIncludes(content, 'func (t *TableClient) UpdateMany(');
+  assertIncludes(content, 'func (t *TableClient) Delete(');
+  assertIncludes(content, 'func (t *TableClient) DeleteMany(');
+  assertIncludes(content, 'func (t *TableClient) VectorSearch(');
+});
+
+test('Go TableClient has Aggregate and GroupBy', () => {
+  const content = fs.readFileSync(path.join(goDir, 'table_client.go'), 'utf8');
+  assertIncludes(content, 'func (t *TableClient) Aggregate(');
+  assertIncludes(content, 'func (t *TableClient) GroupBy(');
+});
+
+test('Go adapter supports PostgreSQL dialect', () => {
+  const content = readGoSource();
+  assertIncludes(content, 'DialectPostgres');
+  assertIncludes(content, 'DialectMssql');
+  assertIncludes(content, 'DetectDialect(');
+});
+
+test('Go adapter has dialect-aware quoting', () => {
+  const content = readGoSource();
+  assertIncludes(content, 'QuoteIdentifier(');
+  assertIncludes(content, 'QuoteTable(');
+  assertIncludes(content, 'stripWrapping(');
+  assertIncludes(content, 'strings.ReplaceAll(raw, `"`, `""`)');
+  assertIncludes(content, 'strings.ReplaceAll(raw, "]", "]]")');
+});
+
+test('Go providers are split by provider folder', () => {
+  assertExists(path.join(goDir, 'base', 'base.go'));
+  assertExists(path.join(goDir, 'base', 'metadata.go'));
+  assertExists(path.join(goDir, 'mssql', 'mssql.go'));
+  assertExists(path.join(goDir, 'postgres', 'postgres.go'));
+  assertExists(path.join(goDir, 'table_client.go'));
+  assertExists(path.join(goDir, 'go.mod'));
+});
+
+test('package exposes Go compile test script', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  assert.strictEqual(pkg.scripts['test:go'], 'cd golang && go test ./...');
 });
 
 // ─── Google Sheets Adapter ────────────────────────────────────────────────────
@@ -589,6 +790,20 @@ test('package.json is valid', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
   assertIncludes(pkg.name, '@an5/adapters');
   assertIncludes(pkg.description, 'adapters');
+});
+
+test('package manifest includes cross-language adapter sources and gates', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  assert.strictEqual(pkg.exports['./python'], './python/an5_adapter.py');
+  assert.strictEqual(pkg.exports['./dotnet'], './dotnet/An5Adapter.cs');
+  assert.strictEqual(pkg.exports['./golang'], './golang/an5_adapter.go');
+  assert.ok(pkg.files.includes('python/**/*.py'), 'python sources must be packaged');
+  assert.ok(pkg.files.includes('dotnet/**/*'), 'dotnet sources must be packaged');
+  assert.ok(pkg.files.includes('golang/**/*'), 'golang sources must be packaged');
+  assert.strictEqual(pkg.scripts['test:python'], 'python -m compileall python 2>&1');
+  assert.strictEqual(pkg.scripts['test:dotnet'], 'node scripts/dotnet-compile-check.js');
+  assert.strictEqual(pkg.scripts['test:go'], 'cd golang && go test ./...');
+  assert.strictEqual(pkg.scripts['test:integration:live'], 'node test/live-db.integration.test.js');
 });
 
 test('adapters do not depend on generated an5-client artifacts', () => {

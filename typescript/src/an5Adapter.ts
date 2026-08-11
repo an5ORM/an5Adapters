@@ -19,6 +19,61 @@ function isSheetsConfig(config: AnyAdapterConfig): config is An5SheetsAdapterCon
   return (config as any).spreadsheetId !== undefined;
 }
 
+function sanitizeParamName(name: string): string {
+  const cleaned = String(name).replace(/[^A-Za-z0-9_]/g, '_');
+  return /^[A-Za-z]/.test(cleaned) ? cleaned : `p_${cleaned}`;
+}
+
+function appendUpdateSet(sets: string[], params: Record<string, any>, col: string, val: any, dialect: Dialect): void {
+  const quoted = quote(col, dialect);
+  const safeCol = sanitizeParamName(col);
+  if (val && typeof val === 'object' && !(val instanceof Date)) {
+    if (val.increment !== undefined) {
+      sets.push(`${quoted} = ${quoted} + @s_${safeCol}_inc`);
+      params[`s_${safeCol}_inc`] = val.increment;
+      return;
+    }
+    if (val.decrement !== undefined) {
+      sets.push(`${quoted} = ${quoted} - @s_${safeCol}_dec`);
+      params[`s_${safeCol}_dec`] = val.decrement;
+      return;
+    }
+    if (val.multiply !== undefined) {
+      sets.push(`${quoted} = ${quoted} * @s_${safeCol}_mul`);
+      params[`s_${safeCol}_mul`] = val.multiply;
+      return;
+    }
+    if (val.divide !== undefined) {
+      sets.push(`${quoted} = ${quoted} / @s_${safeCol}_div`);
+      params[`s_${safeCol}_div`] = val.divide;
+      return;
+    }
+    if (val.set !== undefined) {
+      sets.push(`${quoted} = @s_${safeCol}_set`);
+      params[`s_${safeCol}_set`] = val.set;
+      return;
+    }
+  }
+
+  sets.push(`${quoted} = @s_${safeCol}`);
+  params[`s_${safeCol}`] = val;
+}
+
+function selectedAggregateFields(fields: any): string[] {
+  if (!fields || typeof fields !== 'object') return [];
+  return Object.keys(fields).filter(key => fields[key]);
+}
+
+function normalizeByFields(by: any): string[] {
+  if (typeof by === 'string') return [by];
+  return Array.isArray(by) ? by.filter(field => typeof field === 'string' && field.length > 0) : [];
+}
+
+function toNonNegativeInt(value: unknown, fallback = 0): number {
+  const n = Number.parseInt(String(value), 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 // ─── An5Adapter ────────────────────────────────────────────────────────────────────
 
 export class An5Adapter {
@@ -380,9 +435,11 @@ export class AdapterTableClient<T = any> {
     const sets: string[] = [];
 
     for (const col of setCols) {
-      const p = `s_${col}`;
-      params[p] = (args.data as any)[col];
-      sets.push(`${quote(col, this.dialect)} = @${p}`);
+      appendUpdateSet(sets, params, col, (args.data as any)[col], this.dialect);
+    }
+
+    if (sets.length === 0) {
+      return (await this.findFirst({ where: args.where })) as T;
     }
 
     const query = `UPDATE ${this.tableName} SET ${sets.join(', ')}${whereSql ? ` WHERE ${whereSql}` : ''}`;
@@ -397,10 +454,10 @@ export class AdapterTableClient<T = any> {
     const sets: string[] = [];
 
     for (const col of setCols) {
-      const p = `s_${col}`;
-      params[p] = (args.data as any)[col];
-      sets.push(`${quote(col, this.dialect)} = @${p}`);
+      appendUpdateSet(sets, params, col, (args.data as any)[col], this.dialect);
     }
+
+    if (sets.length === 0) return { count: 0 };
 
     const query = `UPDATE ${this.tableName} SET ${sets.join(', ')}${whereSql ? ` WHERE ${whereSql}` : ''}`;
     const count = await this.doExecuteRaw(query, params);
@@ -436,10 +493,12 @@ export class AdapterTableClient<T = any> {
     const aggs: string[] = [];
 
     if (args._count) aggs.push('COUNT(*) AS _count');
-    if (args._sum) for (const f of Object.keys(args._sum)) aggs.push(`SUM(${quote(f, this.dialect)}) AS _sum_${f}`);
-    if (args._avg) for (const f of Object.keys(args._avg)) aggs.push(`AVG(${quote(f, this.dialect)}) AS _avg_${f}`);
-    if (args._min) for (const f of Object.keys(args._min)) aggs.push(`MIN(${quote(f, this.dialect)}) AS _min_${f}`);
-    if (args._max) for (const f of Object.keys(args._max)) aggs.push(`MAX(${quote(f, this.dialect)}) AS _max_${f}`);
+    if (args._sum) for (const f of selectedAggregateFields(args._sum)) aggs.push(`SUM(${quote(f, this.dialect)}) AS _sum_${f}`);
+    if (args._avg) for (const f of selectedAggregateFields(args._avg)) aggs.push(`AVG(${quote(f, this.dialect)}) AS _avg_${f}`);
+    if (args._min) for (const f of selectedAggregateFields(args._min)) aggs.push(`MIN(${quote(f, this.dialect)}) AS _min_${f}`);
+    if (args._max) for (const f of selectedAggregateFields(args._max)) aggs.push(`MAX(${quote(f, this.dialect)}) AS _max_${f}`);
+
+    if (aggs.length === 0) throw new Error('Aggregate requires at least one aggregator field');
 
     const query = `SELECT ${aggs.join(', ')} FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''}`;
     const rows = await this.doExec(query, params);
@@ -449,8 +508,31 @@ export class AdapterTableClient<T = any> {
   async groupBy(args: any): Promise<any[]> {
     const params: Record<string, any> = {};
     const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
-    const byCols = (args.by || []).map((b: string) => quote(b, this.dialect)).join(', ');
-    const query = `SELECT ${byCols}, COUNT(*) AS _count FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''} GROUP BY ${byCols}`;
+    const byFields = normalizeByFields(args?.by);
+    if (byFields.length === 0) throw new Error("groupBy requires 'by' fields");
+    const byCols = byFields.map((b: string) => quote(b, this.dialect)).join(', ');
+    const aggs: string[] = ['COUNT(*) AS _count'];
+    if (args?._sum) for (const f of selectedAggregateFields(args._sum)) aggs.push(`SUM(${quote(f, this.dialect)}) AS _sum_${f}`);
+    if (args?._avg) for (const f of selectedAggregateFields(args._avg)) aggs.push(`AVG(${quote(f, this.dialect)}) AS _avg_${f}`);
+    if (args?._min) for (const f of selectedAggregateFields(args._min)) aggs.push(`MIN(${quote(f, this.dialect)}) AS _min_${f}`);
+    if (args?._max) for (const f of selectedAggregateFields(args._max)) aggs.push(`MAX(${quote(f, this.dialect)}) AS _max_${f}`);
+    let query = `SELECT ${byCols}, ${aggs.join(', ')} FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''} GROUP BY ${byCols}`;
+    const orderSql = buildOrderBy(args?.orderBy, this.dialect);
+    const hasSkip = args?.skip !== undefined && args?.skip !== null;
+    const hasTake = args?.take !== undefined && args?.take !== null;
+    if (orderSql) query += ` ${orderSql}`;
+    else if (hasSkip || hasTake) query += ` ORDER BY ${byCols}`;
+    if (hasSkip || hasTake) {
+      const skip = toNonNegativeInt(args?.skip);
+      const take = toNonNegativeInt(args?.take, 1);
+      if (this.dialect === 'postgres' || this.dialect === 'mysql' || this.dialect === 'sqlite') {
+        if (hasTake) query += ` LIMIT ${take}`;
+        query += ` OFFSET ${skip}`;
+      } else {
+        query += ` OFFSET ${skip} ROWS`;
+        if (hasTake) query += ` FETCH NEXT ${take} ROWS ONLY`;
+      }
+    }
     return this.doExec(query, params);
   }
 
@@ -460,10 +542,58 @@ export class AdapterTableClient<T = any> {
     where?: any;
     vectorField?: string;
     distanceMetric?: 'cosine' | 'euclidean' | 'dot';
+    vectorElementType?: 'float32' | 'float16' | 'uint8';
   }): Promise<(T & { distance: number })[]> {
-    const rows = await this.findMany({ where: args.where });
     const vectorField = args.vectorField || 'embedding';
-    const metric = args.distanceMetric || 'cosine';
+    const METRICS = ['cosine', 'euclidean', 'dot'];
+    const ELEMENT_TYPES = ['float32', 'float16', 'uint8'];
+    const metric = METRICS.includes(args.distanceMetric as string) ? args.distanceMetric! : 'cosine';
+    const elementType = ELEMENT_TYPES.includes(args.vectorElementType as string) ? args.vectorElementType! : 'float32';
+    const take = args.take ?? 10;
+    const dim = Array.isArray(args.vector) ? args.vector.length : 0;
+    const vectorJson = JSON.stringify(args.vector);
+    const col = quote(vectorField, this.dialect);
+    const params: Record<string, any> = { query_vector: vectorJson };
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
+
+    // 1. Primary path: Native database SQL vector query execution per provider
+    //    (Postgres pgvector operators / SQL Server VECTOR_DISTANCE)
+    if (this.dialect === 'postgres' || this.dialect === 'mssql') {
+      try {
+        let query: string;
+        if (this.dialect === 'postgres') {
+          const op = metric === 'euclidean' ? '<->' : metric === 'dot' ? '<#>' : '<=>';
+          query = `SELECT *, (${col} ${op} @query_vector::vector) AS distance FROM ${this.tableName}`;
+          query += whereSql ? ` WHERE ${col} IS NOT NULL AND (${whereSql})` : ` WHERE ${col} IS NOT NULL`;
+          query += ` ORDER BY distance ASC LIMIT ${take}`;
+        } else {
+          if (dim > 1998) {
+            throw new Error('Vector dimension exceeds SQL Server limit of 1998');
+          }
+          query = `SELECT TOP (${take}) *, VECTOR_DISTANCE('${metric}', CAST(${col} AS VECTOR(${dim}, ${elementType})), CAST(@query_vector AS VECTOR(${dim}, ${elementType}))) AS distance FROM ${this.tableName}${this.nolock}`;
+          query += whereSql ? ` WHERE ${col} IS NOT NULL AND (${whereSql})` : ` WHERE ${col} IS NOT NULL`;
+          query += ` ORDER BY distance ASC`;
+        }
+        const rows = await this.doExec(query, params);
+        return rows as (T & { distance: number })[];
+      } catch (err: any) {
+        const msg = String(err?.message || '').toLowerCase();
+        const isUnsupported = msg.includes('vector_distance') ||
+          msg.includes('type vector') ||
+          msg.includes('type "vector"') ||
+          msg.includes('data type vector') ||
+          msg.includes('not a recognized built-in function') ||
+          msg.includes('not a defined system type') ||
+          msg.includes('pgvector') ||
+          msg.includes('operator does not exist') ||
+          msg.includes('limit of 1998') ||
+          err?.number === 195;
+        if (!isUnsupported) throw err;
+      }
+    }
+
+    // 2. Fallback: in-memory similarity computation when native vector support is unavailable
+    const rows = await this.findMany({ where: args.where });
 
     const scored: { row: T; dist: number }[] = [];
     for (const row of rows) {
@@ -488,7 +618,7 @@ export class AdapterTableClient<T = any> {
       scored.push({ row, dist });
     }
     scored.sort((a, b) => a.dist - b.dist);
-    return scored.slice(0, args.take ?? 10).map(s => ({ ...s.row as any, distance: s.dist }));
+    return scored.slice(0, take).map(s => ({ ...s.row as any, distance: s.dist }));
   }
 }
 

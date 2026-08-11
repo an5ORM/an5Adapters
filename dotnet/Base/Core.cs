@@ -56,15 +56,23 @@ public enum Dialect
 
     internal static class SqlQuote
     {
+        private static string StripWrapping(string name, string left, string right)
+        {
+            return name.StartsWith(left) && name.EndsWith(right)
+                ? name.Substring(left.Length, name.Length - left.Length - right.Length)
+                : name;
+        }
+
         public static string QuoteName(string name, Dialect dialect)
         {
+            var raw = name ?? "";
             if (dialect == Dialect.Postgres)
             {
-                if (name.StartsWith("[") && name.EndsWith("]"))
-                    return "\"" + name.Substring(1, name.Length - 2) + "\"";
-                return "\"" + name + "\"";
+                var unwrapped = StripWrapping(StripWrapping(raw, "[", "]"), "\"", "\"");
+                return "\"" + unwrapped.Replace("\"", "\"\"") + "\"";
             }
-            return name.StartsWith("[") ? name : "[" + name + "]";
+            var bracketless = StripWrapping(raw, "[", "]");
+            return "[" + bracketless.Replace("]", "]]") + "]";
         }
 
         public static string QuoteTable(string tableName, Dialect dialect)

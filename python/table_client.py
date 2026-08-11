@@ -1,12 +1,69 @@
 import json
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 try:
     from .base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table
 except ImportError:
     from base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table
 
 # ─── Table Client ───────────────────────────────────────────────────────────────────
+
+def _selected_aggregate_fields(fields: Any) -> List[str]:
+    if not fields:
+        return []
+    if isinstance(fields, str):
+        return [fields]
+    if isinstance(fields, list):
+        return [f for f in fields if isinstance(f, str) and f]
+    if isinstance(fields, dict):
+        return [str(f) for f, enabled in fields.items() if enabled]
+    return []
+
+
+def _normalize_by_fields(by: Any) -> List[str]:
+    if isinstance(by, str):
+        return [by]
+    if isinstance(by, list):
+        return [f for f in by if isinstance(f, str) and f]
+    return []
+
+
+def _to_non_negative_int(value: Any, fallback: int = 0) -> int:
+    try:
+        n = int(value)
+        return n if n >= 0 else fallback
+    except Exception:
+        return fallback
+
+
+def _append_update_set(set_parts: List[str], values: List[Any], col: str, val: Any, dialect: str) -> None:
+    quoted = _quote(col, dialect)
+    placeholder = "?" if dialect == DIALECT_MSSQL else "%s"
+    if isinstance(val, dict):
+        if "increment" in val:
+            set_parts.append(f"{quoted} = {quoted} + {placeholder}")
+            values.append(val["increment"])
+            return
+        if "decrement" in val:
+            set_parts.append(f"{quoted} = {quoted} - {placeholder}")
+            values.append(val["decrement"])
+            return
+        if "multiply" in val:
+            set_parts.append(f"{quoted} = {quoted} * {placeholder}")
+            values.append(val["multiply"])
+            return
+        if "divide" in val:
+            set_parts.append(f"{quoted} = {quoted} / {placeholder}")
+            values.append(val["divide"])
+            return
+        if "set" in val:
+            set_parts.append(f"{quoted} = {placeholder}")
+            values.append(val["set"])
+            return
+
+    set_parts.append(f"{quoted} = {placeholder}")
+    values.append(val)
+
 
 class AdapterTableClient:
     def __init__(self, adapter: An5Adapter, model_name: str):
@@ -105,11 +162,12 @@ class AdapterTableClient:
         where_sql = _parse_where(self._model, where, params, self._dialect, "w_")
         set_parts: List[str] = []
         set_values: List = []
-        placeholder = "?" if self._dialect == DIALECT_MSSQL else "%s"
         for col, val in data.items():
             if val is not None:
-                set_parts.append(f"{_quote(col, self._dialect)} = {placeholder}")
-                set_values.append(val)
+                _append_update_set(set_parts, set_values, col, val, self._dialect)
+
+        if not set_parts:
+            return self.find_first(where=where)
 
         all_values = set_values + list(params.values())
         query = f"UPDATE {self._table_sql} SET {', '.join(set_parts)}"
@@ -123,10 +181,13 @@ class AdapterTableClient:
         where_sql = _parse_where(self._model, where, params, self._dialect, "w_")
         set_parts: List[str] = []
         set_values: List = []
-        placeholder = "?" if self._dialect == DIALECT_MSSQL else "%s"
         for col, val in data.items():
-            set_parts.append(f"{_quote(col, self._dialect)} = {placeholder}")
-            set_values.append(val)
+            if val is not None:
+                _append_update_set(set_parts, set_values, col, val, self._dialect)
+
+        if not set_parts:
+            return {"count": 0}
+
         all_values = set_values + list(params.values())
         query = f"UPDATE {self._table_sql} SET {', '.join(set_parts)}"
         if where_sql:
@@ -164,19 +225,19 @@ class AdapterTableClient:
         if _count:
             aggs.append("COUNT(*) AS _count")
         if _sum:
-            for f in (_sum if isinstance(_sum, list) else [_sum]):
+            for f in _selected_aggregate_fields(_sum):
                 aggs.append(f"SUM({_quote(f, self._dialect)}) AS _sum_{f}")
         if _avg:
-            for f in (_avg if isinstance(_avg, list) else [_avg]):
+            for f in _selected_aggregate_fields(_avg):
                 aggs.append(f"AVG({_quote(f, self._dialect)}) AS _avg_{f}")
         if _min:
-            for f in (_min if isinstance(_min, list) else [_min]):
+            for f in _selected_aggregate_fields(_min):
                 aggs.append(f"MIN({_quote(f, self._dialect)}) AS _min_{f}")
         if _max:
-            for f in (_max if isinstance(_max, list) else [_max]):
+            for f in _selected_aggregate_fields(_max):
                 aggs.append(f"MAX({_quote(f, self._dialect)}) AS _max_{f}")
         if not aggs:
-            aggs = ["COUNT(*) AS _count"]
+            raise ValueError("Aggregate requires at least one aggregator field")
 
         query = f"SELECT {', '.join(aggs)} FROM {self._table_sql}"
         if where_sql:
@@ -184,7 +245,84 @@ class AdapterTableClient:
         rows = self._adapter.exec(query, list(params.values()))
         return rows[0] if rows else {}
 
+    def group_by(self, by, where=None, order_by=None, skip: int = 0, take: Optional[int] = None,
+                 _sum=None, _avg=None, _min=None, _max=None) -> List[Dict]:
+        params: Dict = {}
+        where_sql = _parse_where(self._model, where, params, self._dialect)
+        by_fields = _normalize_by_fields(by)
+        if not by_fields:
+            raise ValueError("group_by requires 'by' fields")
+
+        by_cols = ", ".join(_quote(f, self._dialect) for f in by_fields)
+        aggs = ["COUNT(*) AS _count"]
+        for f in _selected_aggregate_fields(_sum):
+            aggs.append(f"SUM({_quote(f, self._dialect)}) AS _sum_{f}")
+        for f in _selected_aggregate_fields(_avg):
+            aggs.append(f"AVG({_quote(f, self._dialect)}) AS _avg_{f}")
+        for f in _selected_aggregate_fields(_min):
+            aggs.append(f"MIN({_quote(f, self._dialect)}) AS _min_{f}")
+        for f in _selected_aggregate_fields(_max):
+            aggs.append(f"MAX({_quote(f, self._dialect)}) AS _max_{f}")
+
+        query = f"SELECT {by_cols}, {', '.join(aggs)} FROM {self._table_sql}"
+        if where_sql:
+            query += f" WHERE {where_sql}"
+        query += f" GROUP BY {by_cols}"
+        order_sql = _build_order_by(order_by, self._dialect)
+        has_take = take is not None
+        has_skip = skip is not None and skip > 0
+        if order_sql:
+            query += f" {order_sql}"
+        elif has_take or has_skip:
+            query += f" ORDER BY {by_cols}"
+        if has_take or has_skip:
+            final_skip = _to_non_negative_int(skip)
+            if self._dialect == DIALECT_POSTGRES:
+                if has_take:
+                    query += f" LIMIT {_to_non_negative_int(take, 1)}"
+                query += f" OFFSET {final_skip}"
+            else:
+                query += f" OFFSET {final_skip} ROWS"
+                if has_take:
+                    query += f" FETCH NEXT {_to_non_negative_int(take, 1)} ROWS ONLY"
+
+        return self._adapter.exec(query, list(params.values()))
+
     def vector_search(self, vector: List[float], take: int = 10, where=None, vector_field: str = "embedding", distance_metric: str = "cosine") -> List[Dict]:
+        dim = len(vector)
+        vec_json = json.dumps(vector)
+        params: Dict = {}
+        where_sql = _parse_where(self._model, where, params, self._dialect)
+
+        # 1. Primary path: Native database SQL vector query execution (MSSQL VECTOR_DISTANCE / Postgres pgvector)
+        try:
+            field_sql = _quote(vector_field, self._dialect)
+            if self._dialect == DIALECT_POSTGRES:
+                op = "<=>" if distance_metric == "cosine" else ("<->" if distance_metric == "euclidean" else "<#>")
+                query = f"SELECT *, ({field_sql} {op} %s::vector) AS distance FROM {self._table_sql}"
+                query_params = [vec_json] + list(params.values())
+                if where_sql:
+                    query += f" WHERE {field_sql} IS NOT NULL AND ({where_sql})"
+                else:
+                    query += f" WHERE {field_sql} IS NOT NULL"
+                query += f" ORDER BY distance ASC LIMIT {take}"
+            else:
+                placeholder = "?"
+                query = f"SELECT TOP ({take}) *, VECTOR_DISTANCE('{distance_metric}', CAST({field_sql} AS VECTOR({dim}, float32)), CAST({placeholder} AS VECTOR({dim}, float32))) AS distance FROM {self._table_sql}{self._nolock}"
+                query_params = [vec_json] + list(params.values())
+                if where_sql:
+                    query += f" WHERE {field_sql} IS NOT NULL AND ({where_sql})"
+                else:
+                    query += f" WHERE {field_sql} IS NOT NULL"
+                query += " ORDER BY distance ASC"
+
+            native_rows = self._adapter.exec(query, query_params)
+            if native_rows is not None:
+                return native_rows
+        except Exception:
+            pass
+
+        # 2. Secondary fallback: In-memory similarity computation if DB engine lacks native vector extension
         rows = self.find_many(where=where)
         scored = []
         for row in rows:

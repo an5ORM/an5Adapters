@@ -238,6 +238,60 @@ namespace An5Orm
             string whereClause = null, Dictionary<string, object> parameters = null,
             string vectorField = "Embedding", string distanceMetric = "cosine")
         {
+            // 1. Primary path: Native database SQL vector query execution (MSSQL VECTOR_DISTANCE / Postgres pgvector)
+            try
+            {
+                var dim = vector.Count;
+                var vecJson = JsonSerializer.Serialize(vector);
+                var p = parameters != null ? new Dictionary<string, object>(parameters) : new Dictionary<string, object>();
+                p["query_vector"] = vecJson;
+                var quotedVectorField = SqlQuote.QuoteName(vectorField, _dialect);
+
+                string sql;
+                if (_dialect == Dialect.Postgres)
+                {
+                    string op = distanceMetric.Equals("cosine", StringComparison.OrdinalIgnoreCase) ? "<=>" :
+                               (distanceMetric.Equals("euclidean", StringComparison.OrdinalIgnoreCase) ? "<->" : "<#>");
+                    sql = $"SELECT *, ({quotedVectorField} {op} @query_vector::vector) AS distance FROM {_tableName}";
+                    if (!string.IsNullOrWhiteSpace(whereClause))
+                        sql += $" WHERE {quotedVectorField} IS NOT NULL AND ({whereClause})";
+                    else
+                        sql += $" WHERE {quotedVectorField} IS NOT NULL";
+                    sql += $" ORDER BY distance ASC LIMIT {take}";
+                }
+                else
+                {
+                    sql = $"SELECT TOP ({take}) *, VECTOR_DISTANCE('{distanceMetric}', CAST({quotedVectorField} AS VECTOR({dim}, float32)), CAST(@query_vector AS VECTOR({dim}, float32))) AS distance FROM {_tableName}{Nolock}";
+                    if (!string.IsNullOrWhiteSpace(whereClause))
+                        sql += $" WHERE {quotedVectorField} IS NOT NULL AND ({whereClause})";
+                    else
+                        sql += $" WHERE {quotedVectorField} IS NOT NULL";
+                    sql += " ORDER BY distance ASC";
+                }
+
+                var nativeRows = _adapter.QueryRaw<T>(sql, p);
+                if (nativeRows != null && nativeRows.Count > 0)
+                {
+                    var nativeResults = new List<(T, double)>();
+                    foreach (var row in nativeRows)
+                    {
+                        var distanceProp = typeof(T).GetProperty("Distance", BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+                        double dist = 0;
+                        if (distanceProp != null && distanceProp.GetValue(row) is double dVal)
+                        {
+                            dist = dVal;
+                        }
+                        nativeResults.Add((row, dist));
+                    }
+                    return nativeResults;
+                }
+            }
+            catch
+            {
+                // Secondary fallback: In-memory similarity computation if DB instance lacks native vector extension
+            }
+
+            // 2. Secondary fallback: In-memory similarity computation
             var rows = FindMany(whereClause, parameters);
             var results = new List<(T, double)>();
             var vectorProp = typeof(T).GetProperty(vectorField, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
@@ -263,13 +317,24 @@ namespace An5Orm
                     m2 += vec[i] * vec[i];
                 }
                 double cosine = (m1 > 0 && m2 > 0) ? dot / (Math.Sqrt(m1) * Math.Sqrt(m2)) : 0;
-                double dist = distanceMetric == "cosine" ? 1.0 - cosine :
-                              distanceMetric == "dot" ? -dot : Math.Sqrt(vector.Count);
+                double dist = distanceMetric.Equals("cosine", StringComparison.OrdinalIgnoreCase) ? 1.0 - cosine :
+                              distanceMetric.Equals("dot", StringComparison.OrdinalIgnoreCase) ? -dot : EuclideanDistance(vector, vec);
                 results.Add((row, dist));
             }
 
             results.Sort((a, b) => a.Item2.CompareTo(b.Item2));
             return results.GetRange(0, Math.Min(take, results.Count));
+        }
+
+        private static double EuclideanDistance(List<double> left, List<double> right)
+        {
+            double sum = 0;
+            for (int i = 0; i < left.Count; i++)
+            {
+                var diff = left[i] - right[i];
+                sum += diff * diff;
+            }
+            return Math.Sqrt(sum);
         }
     }
 }
