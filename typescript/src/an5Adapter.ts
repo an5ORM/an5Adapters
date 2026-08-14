@@ -8,7 +8,15 @@ import {
 import { parseSheetsConnectionString } from './googlesheets/parseConnectionString';
 import type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
 import { buildOrderBy, parseWhere, quote } from './base/sql';
-import { getFieldsForModel, getModelToTable, setAdapterMetadata, type AdapterMetadata } from './base/metadata';
+import {
+  getFieldsForModel,
+  getModelToTable,
+  getRelationMap,
+  getRelationsForModel,
+  setAdapterMetadata,
+  type AdapterMetadata,
+  type RelationDef,
+} from './base/metadata';
 export type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
 export { setAdapterMetadata, type AdapterMetadata } from './base/metadata';
 
@@ -74,9 +82,160 @@ function toNonNegativeInt(value: unknown, fallback = 0): number {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
+function projectFields(row: any, select: any): any {
+  if (!row || !select || typeof select !== 'object') return row;
+  const projected: any = {};
+  for (const [key, val] of Object.entries(select)) {
+    if (val) {
+      projected[key] = row[key];
+    }
+  }
+  if (row._count) {
+    projected._count = row._count;
+  }
+  return projected;
+}
+
+async function resolveIncludes(
+  modelName: string,
+  rows: any[],
+  include: any,
+  adapter: An5Adapter | An5AdapterTx
+): Promise<void> {
+  if (!rows || rows.length === 0 || !include || typeof include !== 'object') return;
+  const modelRelations = getRelationsForModel(modelName);
+
+  for (const [key, value] of Object.entries(include)) {
+    if (!value) continue;
+
+    if (key === '_count') {
+      for (const row of rows) {
+        if (!row._count) row._count = {};
+      }
+      for (const [relKey, relation] of Object.entries(modelRelations)) {
+        if (relation.relationType === 'many') {
+          const uniqueKeys = Array.from(new Set(rows.map(r => r[relation.localKey]).filter(k => k !== undefined && k !== null)));
+          if (uniqueKeys.length > 0) {
+            const relClient = adapter.table(relation.modelName);
+            const relatedRows = await relClient.findMany({
+              where: { [relation.foreignKey]: { in: uniqueKeys } },
+            });
+            const countMap = new Map<any, number>();
+            relatedRows.forEach((r: any) => {
+              const k = r[relation.foreignKey];
+              countMap.set(k, (countMap.get(k) || 0) + 1);
+            });
+            rows.forEach(r => {
+              const k = r[relation.localKey];
+              r._count[relKey] = countMap.get(k) || 0;
+            });
+          } else {
+            rows.forEach(r => { r._count[relKey] = 0; });
+          }
+        }
+      }
+      continue;
+    }
+
+    const relation = modelRelations[key];
+    if (!relation) continue;
+
+    const isMany = relation.relationType === 'many';
+    const localKey = relation.localKey;
+    const foreignKey = relation.foreignKey;
+    const uniqueKeys = Array.from(new Set(rows.map(r => r[localKey]).filter(k => k !== undefined && k !== null)));
+
+    if (uniqueKeys.length === 0) {
+      rows.forEach(r => { r[key] = isMany ? [] : null; });
+      continue;
+    }
+
+    const subArgs: any = typeof value === 'object' ? { ...value } : {};
+    const nestedInclude = subArgs.include;
+    const nestedSelect = subArgs.select;
+
+    const subWhere: any = {
+      [foreignKey]: { in: uniqueKeys },
+      ...(subArgs.where || {}),
+    };
+
+    const relClient = adapter.table(relation.modelName);
+    const relatedRows = await relClient.findMany({
+      where: subWhere,
+      orderBy: subArgs.orderBy,
+      take: subArgs.take,
+      skip: subArgs.skip,
+    });
+
+    if (nestedInclude) {
+      await resolveIncludes(relation.modelName, relatedRows, nestedInclude, adapter);
+    }
+
+    const outputRows = nestedSelect && typeof nestedSelect === 'object'
+      ? relatedRows.map((r: any) => projectFields(r, nestedSelect))
+      : relatedRows;
+
+    const groupMap = new Map<any, any[]>();
+    relatedRows.forEach((r: any, idx: number) => {
+      const k = r[foreignKey];
+      if (!groupMap.has(k)) groupMap.set(k, []);
+      groupMap.get(k)!.push(outputRows[idx]);
+    });
+
+    rows.forEach(r => {
+      const k = r[localKey];
+      const matches = groupMap.get(k) || [];
+      if (isMany) {
+        r[key] = matches;
+      } else {
+        r[key] = matches[0] || null;
+      }
+    });
+  }
+}
+
+function createAdapterProxy<T extends object>(
+  targetObj: T,
+  tableGetter: (modelName: string) => any
+): T {
+  return new Proxy(targetObj, {
+    get(target: any, prop: string | symbol, receiver) {
+      if (typeof prop === 'string') {
+        if (prop in target || prop.startsWith('_') || prop.startsWith('$') || typeof target[prop] === 'function') {
+          const val = target[prop];
+          return typeof val === 'function' ? val.bind(target) : val;
+        }
+        let modelName = prop;
+        const modelToTable = getModelToTable();
+        if (!modelToTable[prop]) {
+          const lowerProp = prop.toLowerCase();
+          for (const [mName, tName] of Object.entries(modelToTable)) {
+            const lowerM = mName.toLowerCase();
+            const lowerT = (tName as string).toLowerCase();
+            if (
+              lowerM === lowerProp ||
+              lowerT === lowerProp ||
+              lowerM + 's' === lowerProp ||
+              lowerM + 'es' === lowerProp ||
+              lowerT + 's' === lowerProp ||
+              lowerT + 'es' === lowerProp
+            ) {
+              modelName = mName;
+              break;
+            }
+          }
+        }
+        return tableGetter(modelName);
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+}
+
 // ─── An5Adapter ────────────────────────────────────────────────────────────────────
 
 export class An5Adapter {
+  [key: string]: any;
   private _engine: QueryEngine | null = null;
   private _engineType: 'postgres' | 'mysql' | 'sqlite' | 'mssql' | null = null;
   private _engineConfig: An5AdapterConfig | null = null;
@@ -94,26 +253,26 @@ export class An5Adapter {
   constructor(adapterConfig: An5AdapterConfig | An5SheetsAdapterConfig) {
     if (isSheetsConfig(adapterConfig)) {
       this.sheetsAdapter = new An5SheetsAdapter(adapterConfig);
-      return;
+      return createAdapterProxy(this, (name) => this.table(name));
     }
 
     if ((adapterConfig as any).engine) {
       this._engine = (adapterConfig as any).engine;
       this._engineType = (this._engine?.dialect as any) || 'sqlite';
-      return;
+      return createAdapterProxy(this, (name) => this.table(name));
     }
 
     if ((adapterConfig as any).db || (adapterConfig as any).driver) {
       const { SqliteBrowserEngine } = require('./sqlite/browserEngine.js');
       this._engine = new SqliteBrowserEngine(adapterConfig);
       this._engineType = 'sqlite';
-      return;
+      return createAdapterProxy(this, (name) => this.table(name));
     }
 
     const cs = (adapterConfig.connectionString || '').trim();
     if (cs.startsWith('googlesheets://')) {
       this.sheetsAdapter = new An5SheetsAdapter(parseSheetsConnectionString(cs));
-      return;
+      return createAdapterProxy(this, (name) => this.table(name));
     }
 
     this._engineConfig = adapterConfig;
@@ -126,6 +285,8 @@ export class An5Adapter {
     } else {
       this._engineType = 'mssql';
     }
+
+    return createAdapterProxy(this, (name) => this.table(name));
   }
 
   private async requireEngine(): Promise<QueryEngine> {
@@ -275,12 +436,15 @@ export class An5Adapter {
 // ─── Transaction-scoped adapter ────────────────────────────────────────────────────
 
 export class An5AdapterTx {
+  [key: string]: any;
   private closed = false;
 
   constructor(
     private readonly handle: TransactionHandle,
     public readonly dialect: Dialect,
-  ) { }
+  ) {
+    return createAdapterProxy(this, (name) => this.table(name));
+  }
 
   async exec<T = any>(query: string, params?: Record<string, any>): Promise<T[]> {
     this.ensureOpen();
@@ -353,61 +517,110 @@ export class AdapterTableClient<T = any> {
     return this.adapter._executeRaw(query, params);
   }
 
-  async findMany(args?: { where?: any; orderBy?: any; skip?: number; take?: number; select?: any }): Promise<T[]> {
+  async findMany(args?: { where?: any; orderBy?: any; skip?: number; take?: number; select?: any; include?: any }): Promise<T[]> {
     const params: Record<string, any> = {};
     const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
     const orderSql = buildOrderBy(args?.orderBy, this.dialect);
     const take = args?.take;
-    const skip = args?.skip ?? 0;
+    const skip = args?.skip;
+    const hasSkip = skip !== undefined && skip !== null;
+
+    let cols = "*";
+    if (args?.select && typeof args.select === "object") {
+      const fields = getFieldsForModel(this.modelName);
+      const selectedKeys = Object.keys(args.select).filter(k => args.select[k] === true && (Object.keys(fields).length === 0 || fields[k]));
+      if (selectedKeys.length > 0) {
+        cols = selectedKeys.map(k => quote(k, this.dialect)).join(", ");
+      }
+    }
 
     let query: string;
-    if (take !== undefined) {
+    if (take !== undefined && !hasSkip) {
       if (this.dialect === 'postgres' || this.dialect === 'mysql' || this.dialect === 'sqlite') {
-        query = `SELECT * FROM ${this.tableName}`;
+        query = `SELECT ${cols} FROM ${this.tableName}`;
         if (whereSql) query += ` WHERE ${whereSql}`;
         if (orderSql) query += ` ${orderSql}`;
-        query += ` LIMIT ${take} OFFSET ${skip}`;
+        query += ` LIMIT ${take}`;
+      } else {
+        query = `SELECT TOP (${take}) ${cols} FROM ${this.tableName}${this.nolock}`;
+        if (whereSql) query += ` WHERE ${whereSql}`;
+        if (orderSql) query += ` ${orderSql}`;
+      }
+    } else if (hasSkip) {
+      if (this.dialect === 'postgres' || this.dialect === 'mysql' || this.dialect === 'sqlite') {
+        query = `SELECT ${cols} FROM ${this.tableName}`;
+        if (whereSql) query += ` WHERE ${whereSql}`;
+        if (orderSql) query += ` ${orderSql}`;
+        query += ` LIMIT ${take ?? 'ALL'} OFFSET ${skip}`;
       } else {
         // mssql requires ORDER BY before OFFSET/FETCH
-        query = `SELECT * FROM ${this.tableName}${this.nolock}`;
+        query = `SELECT ${cols} FROM ${this.tableName}${this.nolock}`;
         if (whereSql) query += ` WHERE ${whereSql}`;
         query += ` ${orderSql || 'ORDER BY (SELECT NULL)'}`;
-        query += ` OFFSET ${skip} ROWS FETCH NEXT ${take} ROWS ONLY`;
+        query += ` OFFSET ${skip} ROWS`;
+        if (take !== undefined) {
+          query += ` FETCH NEXT ${take} ROWS ONLY`;
+        }
       }
     } else {
-      query = `SELECT * FROM ${this.tableName}${this.nolock}`;
+      query = `SELECT ${cols} FROM ${this.tableName}${this.nolock}`;
       if (whereSql) query += ` WHERE ${whereSql}`;
       if (orderSql) query += ` ${orderSql}`;
     }
-    return this.doExec<T>(query, params);
+
+    const rows = await this.doExec<T>(query, params);
+
+    if (args?.include) {
+      await resolveIncludes(this.modelName, rows, args.include, this.adapter);
+    }
+    if (args?.select && typeof args.select === 'object') {
+      const relationKeys = getRelationsForModel(this.modelName);
+      const hasRelationSelect = Object.keys(args.select).some(k => k === '_count' || relationKeys[k]);
+      if (hasRelationSelect) {
+        await resolveIncludes(this.modelName, rows, args.select, this.adapter);
+      }
+      return rows.map((r: any) => projectFields(r, args.select));
+    }
+
+    return rows;
   }
 
-  async findFirst(args?: { where?: any; orderBy?: any; select?: any }): Promise<T | null> {
+  async findFirst(args?: { where?: any; orderBy?: any; select?: any; include?: any }): Promise<T | null> {
     const rows = await this.findMany({ ...args, take: 1 });
     return rows[0] ?? null;
   }
 
-  async findUnique(args: { where: any }): Promise<T | null> {
-    return this.findFirst({ where: args.where });
+  async findUnique(args: { where: any; select?: any; include?: any }): Promise<T | null> {
+    return this.findFirst({ where: args.where, select: args.select, include: args.include });
   }
 
   async count(args?: { where?: any }): Promise<number> {
     const params: Record<string, any> = {};
     const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
-    // Add NOLOCK for mssql count too
     let query = `SELECT COUNT(*) AS cnt FROM ${this.tableName}${this.nolock}`;
     if (whereSql) query += ` WHERE ${whereSql}`;
     const rows = await this.doExec<any>(query, params);
     return Number(rows[0]?.cnt ?? rows[0]?.CNT ?? 0);
   }
 
-  async create(args: { data: Partial<T> }): Promise<T> {
+  async create(args: { data: Partial<T> | any; include?: any; select?: any }): Promise<T> {
+    const modelRelations = getRelationsForModel(this.modelName);
+    const rawData = { ...args.data };
+    const relationWrites: Record<string, any> = {};
+
+    for (const key of Object.keys(rawData)) {
+      if (modelRelations[key] && typeof rawData[key] === 'object' && rawData[key] !== null && !(rawData[key] instanceof Date)) {
+        relationWrites[key] = rawData[key];
+        delete rawData[key];
+      }
+    }
+
     const fields = getFieldsForModel(this.modelName);
     const idFieldName = Object.prototype.hasOwnProperty.call(fields, 'id')
       ? 'id'
       : Object.keys(fields).find((name) => name.endsWith('_id') || name.endsWith('Id') || name.toLowerCase() === 'id');
 
-    const data: any = { ...args.data };
+    const data: any = { ...rawData };
     if (idFieldName) {
       const fieldDef: any = fields[idFieldName];
       const rawType = typeof fieldDef === 'string' ? fieldDef : (fieldDef?.ts || fieldDef?.sql || fieldDef?.type || '');
@@ -428,7 +641,36 @@ export class AdapterTableClient<T = any> {
 
     const query = `INSERT INTO ${this.tableName} (${cols.map(c => quote(c, this.dialect)).join(', ')}) VALUES (${vals.join(', ')})`;
     await this.doExec(query, params);
-    return (await this.findFirst({ where: idFieldName ? { [idFieldName]: data[idFieldName] } : data })) as T;
+
+    const createdRecord = (await this.findFirst({ where: idFieldName ? { [idFieldName]: data[idFieldName] } : data })) as any;
+
+    // Handle nested relation writes
+    for (const [relKey, relWrite] of Object.entries(relationWrites)) {
+      const relation = modelRelations[relKey];
+      if (!relation) continue;
+      const childClient = this.adapter.table(relation.modelName);
+      if (relWrite.create) {
+        const createItems = Array.isArray(relWrite.create) ? relWrite.create : [relWrite.create];
+        for (const item of createItems) {
+          await childClient.create({
+            data: {
+              ...item,
+              [relation.foreignKey]: createdRecord[relation.localKey],
+            },
+          });
+        }
+      }
+    }
+
+    if (args.include) {
+      await resolveIncludes(this.modelName, [createdRecord], args.include, this.adapter);
+    }
+    if (args.select) {
+      await resolveIncludes(this.modelName, [createdRecord], args.select, this.adapter);
+      return projectFields(createdRecord, args.select);
+    }
+
+    return createdRecord as T;
   }
 
   async createMany(args: { data: Partial<T>[]; skipDuplicates?: boolean }): Promise<{ count: number }> {
@@ -469,23 +711,75 @@ export class AdapterTableClient<T = any> {
     return { count };
   }
 
-  async update(args: { where: any; data: Partial<T> }): Promise<T> {
-    const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, 'w_');
-    const setCols = Object.keys(args.data).filter(k => (args.data as any)[k] !== undefined);
-    const sets: string[] = [];
+  async update(args: { where: any; data: Partial<T> | any; include?: any; select?: any }): Promise<T> {
+    const modelRelations = getRelationsForModel(this.modelName);
+    const rawData = { ...args.data };
+    const relationWrites: Record<string, any> = {};
 
-    for (const col of setCols) {
-      appendUpdateSet(sets, params, col, (args.data as any)[col], this.dialect);
+    for (const key of Object.keys(rawData)) {
+      if (modelRelations[key] && typeof rawData[key] === 'object' && rawData[key] !== null && !(rawData[key] instanceof Date)) {
+        relationWrites[key] = rawData[key];
+        delete rawData[key];
+      }
     }
 
-    if (sets.length === 0) {
-      return (await this.findFirst({ where: args.where })) as T;
+    const setCols = Object.keys(rawData).filter(k => rawData[k] !== undefined);
+    if (setCols.length > 0) {
+      const params: Record<string, any> = {};
+      const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, 'w_');
+      const sets: string[] = [];
+      for (const col of setCols) {
+        appendUpdateSet(sets, params, col, rawData[col], this.dialect);
+      }
+      if (sets.length > 0) {
+        const query = `UPDATE ${this.tableName} SET ${sets.join(', ')}${whereSql ? ` WHERE ${whereSql}` : ''}`;
+        await this.doExecuteRaw(query, params);
+      }
     }
 
-    const query = `UPDATE ${this.tableName} SET ${sets.join(', ')}${whereSql ? ` WHERE ${whereSql}` : ''}`;
-    await this.doExecuteRaw(query, params);
-    return (await this.findFirst({ where: args.where })) as T;
+    const updatedRecord = (await this.findFirst({ where: args.where })) as any;
+
+    // Handle nested writes
+    for (const [relKey, relWrite] of Object.entries(relationWrites)) {
+      const relation = modelRelations[relKey];
+      if (!relation) continue;
+      const childClient = this.adapter.table(relation.modelName);
+      if (relWrite.create) {
+        const createItems = Array.isArray(relWrite.create) ? relWrite.create : [relWrite.create];
+        for (const item of createItems) {
+          await childClient.create({
+            data: {
+              ...item,
+              [relation.foreignKey]: updatedRecord[relation.localKey],
+            },
+          });
+        }
+      }
+      if (relWrite.update) {
+        const updateObj = relWrite.update;
+        await childClient.update({
+          where: updateObj.where,
+          data: updateObj.data,
+        });
+      }
+      if (relWrite.disconnect) {
+        const disc = relWrite.disconnect;
+        await childClient.updateMany({
+          where: disc,
+          data: { [relation.foreignKey]: null },
+        });
+      }
+    }
+
+    if (args.include) {
+      await resolveIncludes(this.modelName, [updatedRecord], args.include, this.adapter);
+    }
+    if (args.select) {
+      await resolveIncludes(this.modelName, [updatedRecord], args.select, this.adapter);
+      return projectFields(updatedRecord, args.select);
+    }
+
+    return updatedRecord as T;
   }
 
   async updateMany(args: { where?: any; data: Partial<T> }): Promise<{ count: number }> {
@@ -533,17 +827,67 @@ export class AdapterTableClient<T = any> {
     const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
     const aggs: string[] = [];
 
-    if (args._count) aggs.push('COUNT(*) AS _count');
-    if (args._sum) for (const f of selectedAggregateFields(args._sum)) aggs.push(`SUM(${quote(f, this.dialect)}) AS _sum_${f}`);
-    if (args._avg) for (const f of selectedAggregateFields(args._avg)) aggs.push(`AVG(${quote(f, this.dialect)}) AS _avg_${f}`);
-    if (args._min) for (const f of selectedAggregateFields(args._min)) aggs.push(`MIN(${quote(f, this.dialect)}) AS _min_${f}`);
-    if (args._max) for (const f of selectedAggregateFields(args._max)) aggs.push(`MAX(${quote(f, this.dialect)}) AS _max_${f}`);
+    if (args._count) {
+      aggs.push('COUNT(*) AS cnt_all');
+      if (typeof args._count === 'object') {
+        for (const f of selectedAggregateFields(args._count)) {
+          if (f !== '_all') aggs.push(`COUNT(${quote(f, this.dialect)}) AS cnt_${sanitizeParamName(f)}`);
+        }
+      }
+    }
+    if (args._sum) for (const f of selectedAggregateFields(args._sum)) aggs.push(`SUM(${quote(f, this.dialect)}) AS sum_${sanitizeParamName(f)}`);
+    if (args._avg) for (const f of selectedAggregateFields(args._avg)) aggs.push(`AVG(${quote(f, this.dialect)}) AS avg_${sanitizeParamName(f)}`);
+    if (args._min) for (const f of selectedAggregateFields(args._min)) aggs.push(`MIN(${quote(f, this.dialect)}) AS min_${sanitizeParamName(f)}`);
+    if (args._max) for (const f of selectedAggregateFields(args._max)) aggs.push(`MAX(${quote(f, this.dialect)}) AS max_${sanitizeParamName(f)}`);
 
     if (aggs.length === 0) throw new Error('Aggregate requires at least one aggregator field');
 
-    const query = `SELECT ${aggs.join(', ')} FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''}`;
-    const rows = await this.doExec(query, params);
-    return rows[0] ?? {};
+    const query = `SELECT ${aggs.join(', ')} FROM ${this.tableName}${this.nolock}${whereSql ? ` WHERE ${whereSql}` : ''}`;
+    const rows = await this.doExec<any>(query, params);
+    const row = rows[0] || {};
+
+    const result: any = {};
+    if (args._count) {
+      const allCount = Number(row.cnt_all ?? row._count ?? 0);
+      result._count = { _all: allCount };
+      if (typeof args._count === 'object') {
+        for (const f of selectedAggregateFields(args._count)) {
+          if (f === '_all') continue;
+          const k = `cnt_${sanitizeParamName(f)}`;
+          result._count[f] = row[k] !== undefined ? Number(row[k]) : allCount;
+        }
+      }
+    }
+    if (args._sum) {
+      result._sum = {};
+      for (const f of selectedAggregateFields(args._sum)) {
+        const k = `sum_${sanitizeParamName(f)}`;
+        result._sum[f] = row[k] !== null && row[k] !== undefined ? Number(row[k]) : null;
+      }
+    }
+    if (args._avg) {
+      result._avg = {};
+      for (const f of selectedAggregateFields(args._avg)) {
+        const k = `avg_${sanitizeParamName(f)}`;
+        result._avg[f] = row[k] !== null && row[k] !== undefined ? Number(row[k]) : null;
+      }
+    }
+    if (args._min) {
+      result._min = {};
+      for (const f of selectedAggregateFields(args._min)) {
+        const k = `min_${sanitizeParamName(f)}`;
+        result._min[f] = row[k] ?? null;
+      }
+    }
+    if (args._max) {
+      result._max = {};
+      for (const f of selectedAggregateFields(args._max)) {
+        const k = `max_${sanitizeParamName(f)}`;
+        result._max[f] = row[k] ?? null;
+      }
+    }
+
+    return result;
   }
 
   async groupBy(args: any): Promise<any[]> {
@@ -595,38 +939,32 @@ export class AdapterTableClient<T = any> {
     const vectorJson = JSON.stringify(args.vector);
     const col = quote(vectorField, this.dialect);
     const params: Record<string, any> = { query_vector: vectorJson };
-    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
 
-    // 1. Primary path: Native database SQL vector query execution per provider
-    //    (Postgres pgvector operators / SQL Server VECTOR_DISTANCE)
-    if (this.dialect === 'postgres' || this.dialect === 'mssql') {
+    // 1. Try native dialect execution
+    if (this.dialect === 'postgres') {
+      const op = metric === 'cosine' ? '<=>' : metric === 'dot' ? '<#>' : '<->';
+      const whereSql = parseWhere(this.modelName, args.where, params, this.dialect);
+      const query = `SELECT *, (${col} ${op} @query_vector::vector) AS distance FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''} ORDER BY distance ASC LIMIT ${take}`;
       try {
-        let query: string;
-        if (this.dialect === 'postgres') {
-          const op = metric === 'euclidean' ? '<->' : metric === 'dot' ? '<#>' : '<=>';
-          query = `SELECT *, (${col} ${op} @query_vector::vector) AS distance FROM ${this.tableName}`;
-          query += whereSql ? ` WHERE ${col} IS NOT NULL AND (${whereSql})` : ` WHERE ${col} IS NOT NULL`;
-          query += ` ORDER BY distance ASC LIMIT ${take}`;
-        } else {
-          if (dim > 1998) {
-            throw new Error('Vector dimension exceeds SQL Server limit of 1998');
-          }
-          query = `SELECT TOP (${take}) *, VECTOR_DISTANCE('${metric}', CAST(${col} AS VECTOR(${dim}, ${elementType})), CAST(@query_vector AS VECTOR(${dim}, ${elementType}))) AS distance FROM ${this.tableName}${this.nolock}`;
-          query += whereSql ? ` WHERE ${col} IS NOT NULL AND (${whereSql})` : ` WHERE ${col} IS NOT NULL`;
-          query += ` ORDER BY distance ASC`;
-        }
-        const rows = await this.doExec(query, params);
-        return rows as (T & { distance: number })[];
+        return await this.doExec<(T & { distance: number })>(query, params);
       } catch (err: any) {
-        const msg = (String(err?.message || '') + ' ' + String(err?.originalError?.message || '')).toLowerCase();
-        const isUnsupported = msg.includes('vector_distance') ||
-          msg.includes('type vector') ||
-          msg.includes('type "vector"') ||
-          msg.includes('data type vector') ||
-          msg.includes('incorrect syntax') ||
+        const msg = String(err?.message || '').toLowerCase();
+        if (!msg.includes('vector') && !msg.includes('operator does not exist')) throw err;
+      }
+    } else if (this.dialect === 'mssql') {
+      const distFn = metric === 'cosine' ? 'cosine' : metric === 'euclidean' ? 'euclidean' : 'dot';
+      const whereSql = parseWhere(this.modelName, args.where, params, this.dialect);
+      const query = `SELECT TOP (${take}) *, VECTOR_DISTANCE('${distFn}', ${col}, CAST(@query_vector AS VECTOR(${dim}, ${elementType}))) AS distance FROM ${this.tableName}${this.nolock}${whereSql ? ` WHERE ${whereSql}` : ''} ORDER BY distance ASC`;
+      try {
+        return await this.doExec<(T & { distance: number })>(query, params);
+      } catch (err: any) {
+        const msg = String(err?.message || '').toLowerCase();
+        const isUnsupported =
+          msg.includes('vector_distance') ||
           msg.includes('syntax near') ||
           msg.includes('not a recognized built-in function') ||
           msg.includes('not a defined system type') ||
+          msg.includes('type "vector"') ||
           msg.includes('pgvector') ||
           msg.includes('operator does not exist') ||
           msg.includes('limit of 1998') ||
@@ -736,4 +1074,3 @@ export function executorFromAdapter(adapterLike: any): any {
     }
   );
 }
-
