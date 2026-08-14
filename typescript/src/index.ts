@@ -5,6 +5,7 @@ export {
   executorFromAdapter,
   setAdapterMetadata,
 } from './an5Adapter';
+export { parseWhere, buildOrderBy, quote } from './base/sql';
 export type {
   An5AdapterConfig,
   AdapterMetadata,
