@@ -317,13 +317,13 @@ export class An5AdapterTx {
 
 export class AdapterTableClient<T = any> {
   constructor(
-    private readonly adapter: An5Adapter | An5AdapterTx,
-    private readonly modelName: string,
+    public readonly adapter: An5Adapter | An5AdapterTx,
+    public readonly modelName: string,
   ) { }
 
-  private get dialect(): Dialect { return this.adapter.dialect; }
+  public get dialect(): Dialect { return this.adapter.dialect; }
 
-  private get tableName(): string {
+  public get tableName(): string {
     const name = this.modelName;
     let t = name;
     const modelToTable = getModelToTable();
