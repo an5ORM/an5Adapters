@@ -49,6 +49,8 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "pretest": "npm run build",
+    "prepack": "npm run build",
     "build:python": "python -m build --outdir dist-py",
     "test": "node test/unit.test.js && node test/package.test.js",
     "test:package:smoke": "node scripts/package-smoke.js",
