@@ -12,13 +12,17 @@ type Dialect string
 const (
 	DialectMssql    Dialect = "mssql"
 	DialectPostgres Dialect = "postgres"
+	DialectSqlite   Dialect = "sqlite"
 )
 
 // DetectDialect parses connection string to determine database dialect.
 func DetectDialect(connStr string) Dialect {
-	lower := strings.ToLower(connStr)
+	lower := strings.ToLower(strings.TrimSpace(connStr))
 	if strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://") || strings.Contains(lower, "port=5432") {
 		return DialectPostgres
+	}
+	if strings.HasPrefix(lower, "sqlite://") || strings.HasPrefix(lower, "sqlite:") || strings.HasPrefix(lower, "file:") || strings.HasSuffix(lower, ".db") || strings.HasSuffix(lower, ".sqlite") || strings.HasSuffix(lower, ".sqlite3") || lower == ":memory:" {
+		return DialectSqlite
 	}
 	return DialectMssql
 }
@@ -26,7 +30,7 @@ func DetectDialect(connStr string) Dialect {
 // QuoteIdentifier quotes column or identifier names according to dialect.
 func QuoteIdentifier(name string, dialect Dialect) string {
 	raw := stripWrapping(name, "[", "]")
-	if dialect == DialectPostgres {
+	if dialect == DialectPostgres || dialect == DialectSqlite {
 		raw = stripWrapping(raw, `"`, `"`)
 		return `"` + strings.ReplaceAll(raw, `"`, `""`) + `"`
 	}

@@ -97,7 +97,20 @@ export class An5Adapter {
       return;
     }
 
-    const cs = adapterConfig.connectionString.trim();
+    if ((adapterConfig as any).engine) {
+      this._engine = (adapterConfig as any).engine;
+      this._engineType = (this._engine?.dialect as any) || 'sqlite';
+      return;
+    }
+
+    if ((adapterConfig as any).db || (adapterConfig as any).driver) {
+      const { SqliteBrowserEngine } = require('./sqlite/browserEngine.js');
+      this._engine = new SqliteBrowserEngine(adapterConfig);
+      this._engineType = 'sqlite';
+      return;
+    }
+
+    const cs = (adapterConfig.connectionString || '').trim();
     if (cs.startsWith('googlesheets://')) {
       this.sheetsAdapter = new An5SheetsAdapter(parseSheetsConnectionString(cs));
       return;
@@ -659,10 +672,16 @@ export class AdapterTableClient<T = any> {
 
 export function createAn5Adapter(config: AnyAdapterConfig): AnyAdapter {
   if (isSheetsConfig(config)) return new An5SheetsAdapter(config);
-  if (config.connectionString.trim().startsWith('googlesheets://')) {
+  if (config.connectionString && config.connectionString.trim().startsWith('googlesheets://')) {
     return new An5SheetsAdapter(parseSheetsConnectionString(config.connectionString));
   }
   return new An5Adapter(config);
 }
 
 export const createAdapter = createAn5Adapter;
+
+export function createBrowserSqliteAdapter(config: any): An5Adapter {
+  const { SqliteBrowserEngine } = require('./sqlite/browserEngine.js');
+  return new An5Adapter({ engine: new SqliteBrowserEngine(config) });
+}
+

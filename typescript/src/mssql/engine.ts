@@ -64,7 +64,7 @@ export class MssqlEngine implements QueryEngine {
   private config: sql.config;
 
   constructor(adapterConfig: An5AdapterConfig) {
-    this.config = parseMssqlConnectionString(adapterConfig.connectionString);
+    this.config = parseMssqlConnectionString(adapterConfig.connectionString ?? '');
     if (adapterConfig.poolMax) this.config.pool = { ...this.config.pool, max: adapterConfig.poolMax };
     if (adapterConfig.requestTimeout) this.config.requestTimeout = adapterConfig.requestTimeout;
     if (adapterConfig.connectionTimeout) this.config.connectionTimeout = adapterConfig.connectionTimeout;

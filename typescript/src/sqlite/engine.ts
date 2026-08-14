@@ -12,7 +12,7 @@ export class SqliteEngine implements QueryEngine {
 
   constructor(adapterConfig: An5AdapterConfig) {
     if (!BetterSqlite3) throw new Error('better-sqlite3 package is required for SQLite support. Run: npm install better-sqlite3');
-    this.filePath = adapterConfig.connectionString
+    this.filePath = (adapterConfig.connectionString ?? '')
       .replace(/^sqlite:\/\/\//i, '/')
       .replace(/^sqlite:\/\//i, '');
   }

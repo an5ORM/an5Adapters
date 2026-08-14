@@ -12,7 +12,7 @@ export class PostgresEngine implements QueryEngine {
   constructor(adapterConfig: An5AdapterConfig) {
     if (!PgPool) throw new Error('pg package is required for PostgreSQL support. Run: npm install pg');
     this.pool = new PgPool({
-      connectionString: adapterConfig.connectionString,
+      connectionString: adapterConfig.connectionString ?? '',
       max: adapterConfig.poolMax ?? 10,
     });
   }

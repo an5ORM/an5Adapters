@@ -1,7 +1,10 @@
 export type Dialect = 'mssql' | 'postgres' | 'mysql' | 'sqlite' | 'googlesheets';
 
 export interface An5AdapterConfig {
-  connectionString: string;
+  connectionString?: string;
+  engine?: QueryEngine;
+  db?: any;
+  driver?: any;
   poolMax?: number;
   requestTimeout?: number;
   connectionTimeout?: number;

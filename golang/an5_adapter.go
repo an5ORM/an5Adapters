@@ -11,6 +11,7 @@ import (
 	"an5adapters/base"
 	"an5adapters/mssql"
 	"an5adapters/postgres"
+	"an5adapters/sqlite"
 )
 
 // Re-export core base types and functions for package root convenience.
@@ -20,6 +21,7 @@ type AdapterMetadata = base.AdapterMetadata
 const (
 	DialectMssql    = base.DialectMssql
 	DialectPostgres = base.DialectPostgres
+	DialectSqlite   = base.DialectSqlite
 )
 
 func DetectDialect(connStr string) Dialect {
@@ -151,18 +153,22 @@ func (a *An5Adapter) VectorSearch(ctx context.Context, tableName string, targetV
 	vecBytes, _ := json.Marshal(targetVector)
 	vecStr := string(vecBytes)
 
-	// 1. Primary path: Native database SQL vector query execution via dialect provider (mssql / postgres)
+	// 1. Primary path: Native database SQL vector query execution via dialect provider (mssql / postgres / sqlite)
 	var sqlQuery string
 	if a.Dialect == base.DialectPostgres {
 		sqlQuery = postgres.BuildVectorSearchQuery(tableName, vectorField, distanceMetric, dim, take, whereClause)
-	} else {
+	} else if a.Dialect == base.DialectMssql {
 		sqlQuery = mssql.BuildVectorSearchQuery(tableName, vectorField, distanceMetric, dim, take, whereClause)
+	} else if a.Dialect == base.DialectSqlite {
+		sqlQuery = sqlite.BuildVectorSearchQuery(tableName, vectorField, distanceMetric, dim, take, whereClause)
 	}
 
-	queryArgs := append([]interface{}{vecStr}, args...)
-	nativeRows, err := a.QueryRaw(ctx, sqlQuery, queryArgs...)
-	if err == nil {
-		return nativeRows, nil
+	if sqlQuery != "" {
+		queryArgs := append([]interface{}{vecStr}, args...)
+		nativeRows, err := a.QueryRaw(ctx, sqlQuery, queryArgs...)
+		if err == nil {
+			return nativeRows, nil
+		}
 	}
 
 	// 2. Secondary fallback: Fetch rows and compute vector distance in-memory if DB lacks native vector extensions

@@ -1,5 +1,5 @@
 from typing import Any, Dict, List, Optional
-from .dialects import DIALECT_MSSQL, DIALECT_POSTGRES
+from .dialects import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE
 from .metadata import model_to_table, model_fields
 
 # ─── Quoting ───────────────────────────────────────────────────────────────────────
@@ -10,7 +10,7 @@ def _strip_wrapping(name: str, left: str, right: str) -> str:
 
 def _quote(name: str, dialect: str) -> str:
     raw = str(name)
-    if dialect == DIALECT_POSTGRES:
+    if dialect in (DIALECT_POSTGRES, DIALECT_SQLITE):
         unwrapped = _strip_wrapping(_strip_wrapping(raw, "[", "]"), '"', '"')
         return f'"{unwrapped.replace(chr(34), chr(34) * 2)}"'
     unwrapped = _strip_wrapping(raw, "[", "]")

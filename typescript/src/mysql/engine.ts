@@ -12,7 +12,7 @@ export class MysqlEngine implements QueryEngine {
   constructor(adapterConfig: An5AdapterConfig) {
     if (!Mysql2) throw new Error('mysql2 package is required for MySQL support. Run: npm install mysql2');
     this.pool = Mysql2.createPool({
-      uri: adapterConfig.connectionString,
+      uri: adapterConfig.connectionString ?? '',
       connectionLimit: adapterConfig.poolMax ?? 10,
       connectTimeout: adapterConfig.connectionTimeout ?? 15000,
     });

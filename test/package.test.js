@@ -105,6 +105,13 @@ test('browser entry exposes Sheets API', () => {
   assertFn(browser, 'parseSheetsConnectionString');
 });
 
+test('browser entry exposes SQLite browser API', () => {
+  assertFn(browser, 'SqliteBrowserEngine');
+  assertFn(browser, 'createBrowserSqliteAdapter');
+  assertFn(browser, 'An5Adapter');
+  assertFn(browser, 'createAn5Adapter');
+});
+
 test('browser entry exposes metadata helpers', () => {
   assertFn(browser, 'setAdapterMetadata');
   assertFn(browser, 'getFieldsForModel');
@@ -160,6 +167,21 @@ test('createAn5SheetsAdapter returns a Sheets adapter', () => {
   const adapter = pkg.createAn5SheetsAdapter({ spreadsheetId: 'abc123', apiKey: 'k' });
   assert.ok(adapter, 'createAn5SheetsAdapter() should return an adapter');
   assert.strictEqual(adapter.config.spreadsheetId, 'abc123', 'adapter carries spreadsheetId');
+});
+
+test('createBrowserSqliteAdapter executes queries via custom driver', async () => {
+  const store = [{ id: 1, name: 'Alice' }, { id: 2, name: 'Bob' }];
+  const adapter = browser.createBrowserSqliteAdapter({
+    exec: async (query, params) => {
+      if (query.includes('COUNT')) return [{ count: store.length }];
+      return store;
+    },
+    executeRaw: async () => 1,
+  });
+  assert.strictEqual(adapter.dialect, 'sqlite');
+  const rows = await adapter.table('users').findMany();
+  assert.strictEqual(rows.length, 2);
+  assert.strictEqual(rows[0].name, 'Alice');
 });
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
