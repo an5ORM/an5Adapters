@@ -685,3 +685,55 @@ export function createBrowserSqliteAdapter(config: any): An5Adapter {
   return new An5Adapter({ engine: new SqliteBrowserEngine(config) });
 }
 
+function normalizeAffectedCount(result: any): number {
+  if (typeof result === 'number') return result;
+  if (!result) return 0;
+  if (Array.isArray(result.rowsAffected)) return Number(result.rowsAffected[0] ?? 0);
+  if (typeof result.rowsAffected === 'number') return result.rowsAffected;
+  if (typeof result.count === 'number') return result.count;
+  return 0;
+}
+
+export function executorFromAdapter(adapterLike: any): any {
+  if (!adapterLike) return adapterLike;
+  if (typeof adapterLike === 'function' && adapterLike.executeRaw) {
+    return adapterLike;
+  }
+  return Object.assign(
+    async (queryText: string, params?: Record<string, any>) => {
+      return typeof adapterLike === 'function'
+        ? adapterLike(queryText, params)
+        : adapterLike.exec(queryText, params);
+    },
+    {
+      executeRaw: async (queryText: string, params?: Record<string, any>) => {
+        if (typeof adapterLike._executeRaw === 'function') {
+          return adapterLike._executeRaw(queryText, params);
+        }
+        if (typeof adapterLike.executeRaw === 'function') {
+          return adapterLike.executeRaw(queryText, params);
+        }
+        const res = typeof adapterLike === 'function'
+          ? await adapterLike(queryText, params)
+          : await adapterLike.exec(queryText, params);
+        return normalizeAffectedCount(res);
+      },
+      transaction: adapterLike.$transaction
+        ? async (fn: (txExecutor: any) => Promise<any>, options?: { timeout?: number }) => {
+            return adapterLike.$transaction(async (tx: any) => fn(executorFromAdapter(tx)), options);
+          }
+        : undefined,
+      beginTransaction: adapterLike.$begin
+        ? async () => {
+            const tx = await adapterLike.$begin();
+            return {
+              executor: executorFromAdapter(tx),
+              commit: () => tx.$commit(),
+              rollback: () => tx.$rollback(),
+            };
+          }
+        : undefined,
+    }
+  );
+}
+

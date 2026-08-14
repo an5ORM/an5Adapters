@@ -2,6 +2,7 @@ export {
   An5Adapter,
   AdapterTableClient,
   createAn5Adapter,
+  executorFromAdapter,
   setAdapterMetadata,
 } from './an5Adapter';
 export type {
