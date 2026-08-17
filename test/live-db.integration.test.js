@@ -125,9 +125,9 @@ async function runDialect(target) {
       _sum: { score: true },
       _avg: { score: true },
     });
-    assert.strictEqual(Number(aggregate._count), 3, `${dialect}: aggregate count`);
-    assert.strictEqual(Number(aggregate._sum_score), 55, `${dialect}: aggregate sum`);
-    assert.ok(Math.abs(Number(aggregate._avg_score) - 18.3333) < 0.5, `${dialect}: aggregate avg`);
+    assert.strictEqual(Number(aggregate._count._all), 3, `${dialect}: aggregate count`);
+    assert.strictEqual(Number(aggregate._sum.score), 55, `${dialect}: aggregate sum`);
+    assert.ok(Math.abs(Number(aggregate._avg.score) - 18.3333) < 0.5, `${dialect}: aggregate avg`);
 
     const grouped = await table.groupBy({
       by: 'category',
