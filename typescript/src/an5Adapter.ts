@@ -527,9 +527,11 @@ export class AdapterTableClient<T = any> {
 
     let cols = "*";
     if (args?.select && typeof args.select === "object") {
+      const relationKeys = getRelationsForModel(this.modelName);
+      const hasRelationSelect = Object.keys(args.select).some(k => k === '_count' || relationKeys[k]);
       const fields = getFieldsForModel(this.modelName);
       const selectedKeys = Object.keys(args.select).filter(k => args.select[k] === true && (Object.keys(fields).length === 0 || fields[k]));
-      if (selectedKeys.length > 0) {
+      if (selectedKeys.length > 0 && !hasRelationSelect) {
         cols = selectedKeys.map(k => quote(k, this.dialect)).join(", ");
       }
     }
