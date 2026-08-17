@@ -317,6 +317,8 @@ class AdapterTableClient:
                 query += " ORDER BY distance ASC"
 
             native_rows = self._adapter.exec(query, query_params)
+
+
             if native_rows is not None:
                 return native_rows
         except Exception:
@@ -352,3 +354,53 @@ class AdapterTableClient:
 
         scored.sort(key=lambda x: x[1])
         return [{**row, "distance": dist} for row, dist in scored[:take]]
+
+
+class ViewClient:
+    """Read-only view client for querying database views without permitting mutations."""
+
+    def __init__(self, adapter: Any, view_name: str):
+        self._client = AdapterTableClient(adapter, view_name)
+        self.view_name = view_name
+
+    def find_many(self, *args, **kwargs):
+        return self._client.find_many(*args, **kwargs)
+
+    def find_first(self, *args, **kwargs):
+        return self._client.find_first(*args, **kwargs)
+
+    def find_unique(self, *args, **kwargs):
+        return self._client.find_unique(*args, **kwargs)
+
+    def count(self, *args, **kwargs):
+        return self._client.count(*args, **kwargs)
+
+    def aggregate(self, *args, **kwargs):
+        return self._client.aggregate(*args, **kwargs)
+
+    def group_by(self, *args, **kwargs):
+        return self._client.group_by(*args, **kwargs)
+
+    def vector_search(self, *args, **kwargs):
+        return self._client.vector_search(*args, **kwargs)
+
+    def create(self, *args, **kwargs):
+        raise PermissionError(f"View '{self.view_name}' is read-only. Mutation operations (create) are not allowed.")
+
+    def create_many(self, *args, **kwargs):
+        raise PermissionError(f"View '{self.view_name}' is read-only. Mutation operations (create_many) are not allowed.")
+
+    def update(self, *args, **kwargs):
+        raise PermissionError(f"View '{self.view_name}' is read-only. Mutation operations (update) are not allowed.")
+
+    def update_many(self, *args, **kwargs):
+        raise PermissionError(f"View '{self.view_name}' is read-only. Mutation operations (update_many) are not allowed.")
+
+    def delete(self, *args, **kwargs):
+        raise PermissionError(f"View '{self.view_name}' is read-only. Mutation operations (delete) are not allowed.")
+
+    def delete_many(self, *args, **kwargs):
+        raise PermissionError(f"View '{self.view_name}' is read-only. Mutation operations (delete_many) are not allowed.")
+
+    def upsert(self, *args, **kwargs):
+        raise PermissionError(f"View '{self.view_name}' is read-only. Mutation operations (upsert) are not allowed.")

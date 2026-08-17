@@ -23,6 +23,43 @@ func (a *An5Adapter) Table(tableName string) *TableClient {
 	}
 }
 
+// ViewClient provides read-only view operations.
+type ViewClient struct {
+	table *TableClient
+}
+
+// View returns a ViewClient for the specified view name.
+func (a *An5Adapter) View(viewName string) *ViewClient {
+	return &ViewClient{
+		table: a.Table(viewName),
+	}
+}
+
+func (v *ViewClient) FindMany(ctx context.Context, whereClause string, args ...interface{}) ([]map[string]interface{}, error) {
+	return v.table.FindMany(ctx, whereClause, args...)
+}
+
+func (v *ViewClient) FindFirst(ctx context.Context, whereClause string, args ...interface{}) (map[string]interface{}, error) {
+	return v.table.FindFirst(ctx, whereClause, args...)
+}
+
+func (v *ViewClient) Count(ctx context.Context, whereClause string, args ...interface{}) (int64, error) {
+	return v.table.Count(ctx, whereClause, args...)
+}
+
+func (v *ViewClient) Aggregate(ctx context.Context, aggregations AggregateOptions, whereClause string, args ...interface{}) (map[string]interface{}, error) {
+	return v.table.Aggregate(ctx, aggregations, whereClause, args...)
+}
+
+func (v *ViewClient) GroupBy(ctx context.Context, groupFields []string, aggregations AggregateOptions, whereClause string, args ...interface{}) ([]map[string]interface{}, error) {
+	return v.table.GroupBy(ctx, groupFields, aggregations, whereClause, args...)
+}
+
+func (v *ViewClient) VectorSearch(ctx context.Context, vector []float64, take int, whereClause string, vectorField string, distanceMetric string, args ...interface{}) ([]map[string]interface{}, error) {
+	return v.table.VectorSearch(ctx, vector, take, whereClause, vectorField, distanceMetric, args...)
+}
+
+
 // FindMany fetches rows matching where clause.
 func (t *TableClient) FindMany(ctx context.Context, whereClause string, args ...interface{}) ([]map[string]interface{}, error) {
 	query := fmt.Sprintf("SELECT * FROM %s", base.QuoteTable(t.TableName, t.Adapter.Dialect))

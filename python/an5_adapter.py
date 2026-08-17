@@ -1,17 +1,17 @@
 """Standalone Python runtime adapter for AN5 ORM."""
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 try:
     from .base import DIALECT_MSSQL, DIALECT_POSTGRES, detect_dialect, set_adapter_metadata
     from .mssql import connect as connect_mssql
     from .postgres import connect as connect_postgres
-    from .table_client import AdapterTableClient
+    from .table_client import AdapterTableClient, ViewClient
 except ImportError:
     from base import DIALECT_MSSQL, DIALECT_POSTGRES, detect_dialect, set_adapter_metadata
     from mssql import connect as connect_mssql
     from postgres import connect as connect_postgres
-    from table_client import AdapterTableClient
+    from table_client import AdapterTableClient, ViewClient
 
 # Backward-compatible aliases used by tests and older imports.
 _detect_dialect = detect_dialect
@@ -64,6 +64,27 @@ class An5Adapter:
     def table(self, model_name: str) -> AdapterTableClient:
         return AdapterTableClient(self, model_name)
 
+    def view(self, view_name: str) -> ViewClient:
+        return ViewClient(self, view_name)
+
+    def query_proc(self, proc_name: str, params: Optional[List] = None) -> List[Dict]:
+        if self._dialect == DIALECT_POSTGRES:
+            placeholders = ", ".join(["%s"] * len(params or []))
+            sql = f"CALL {proc_name}({placeholders})" if placeholders else f"CALL {proc_name}()"
+        else:
+            placeholders = ", ".join(["?"] * len(params or []))
+            sql = f"EXEC {proc_name} {placeholders}" if placeholders else f"EXEC {proc_name}"
+        return self.exec(sql, params or [])
+
+    def execute_proc(self, proc_name: str, params: Optional[List] = None) -> int:
+        if self._dialect == DIALECT_POSTGRES:
+            placeholders = ", ".join(["%s"] * len(params or []))
+            sql = f"CALL {proc_name}({placeholders})" if placeholders else f"CALL {proc_name}()"
+        else:
+            placeholders = ", ".join(["?"] * len(params or []))
+            sql = f"EXEC {proc_name} {placeholders}" if placeholders else f"EXEC {proc_name}"
+        return self.execute(sql, params or [])
+
     def __getattr__(self, model_name: str) -> AdapterTableClient:
         return self.table(model_name)
 
@@ -88,6 +109,7 @@ def create_an5_adapter(connection_string: str) -> An5Adapter:
 __all__ = [
     "An5Adapter",
     "AdapterTableClient",
+    "ViewClient",
     "create_an5_adapter",
     "DIALECT_MSSQL",
     "DIALECT_POSTGRES",

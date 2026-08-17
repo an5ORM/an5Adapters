@@ -42,6 +42,40 @@ namespace An5Orm
         public int ExecuteRaw(string sql, Dictionary<string, object> parameters = null)
             => _engine.ExecuteRaw(sql, parameters);
 
+        // ── Stored Procedure Execution ────────────────────────────────────────
+
+        public List<T> QueryProc<T>(string procName, Dictionary<string, object> parameters = null) where T : new()
+        {
+            var paramList = new List<string>();
+            if (parameters != null)
+            {
+                foreach (var k in parameters.Keys)
+                {
+                    paramList.Add(Dialect == Dialect.Postgres ? "@" + k : "@" + k + " = @" + k);
+                }
+            }
+            var sql = Dialect == Dialect.Postgres
+                ? $"CALL {procName}({string.Join(", ", paramList)})"
+                : (paramList.Count > 0 ? $"EXEC {procName} {string.Join(", ", paramList)}" : $"EXEC {procName}");
+            return QueryRaw<T>(sql, parameters);
+        }
+
+        public int ExecuteProc(string procName, Dictionary<string, object> parameters = null)
+        {
+            var paramList = new List<string>();
+            if (parameters != null)
+            {
+                foreach (var k in parameters.Keys)
+                {
+                    paramList.Add(Dialect == Dialect.Postgres ? "@" + k : "@" + k + " = @" + k);
+                }
+            }
+            var sql = Dialect == Dialect.Postgres
+                ? $"CALL {procName}({string.Join(", ", paramList)})"
+                : (paramList.Count > 0 ? $"EXEC {procName} {string.Join(", ", paramList)}" : $"EXEC {procName}");
+            return ExecuteRaw(sql, parameters);
+        }
+
         // ── Transaction ────────────────────────────────────────────────────────
 
         public An5Transaction BeginTransaction()
@@ -65,10 +99,13 @@ namespace An5Orm
             }
         }
 
-        // ── Table client factory ───────────────────────────────────────────────
+        // ── Table & View client factory ────────────────────────────────────────
 
         public AdapterTableClient<T> Table<T>(string tableName) where T : new()
             => new AdapterTableClient<T>(this, tableName, _engine.Dialect);
+
+        public ViewClient<T> View<T>(string viewName) where T : new()
+            => new ViewClient<T>(this, viewName, _engine.Dialect);
 
         public void Dispose() { }
     }
@@ -84,6 +121,41 @@ namespace An5Orm
         public void Commit() => _inner.Commit();
         public void Rollback() => _inner.Rollback();
         public void Dispose() => _inner.Dispose();
+    }
+
+// ─── Read-Only View Client ──────────────────────────────────────────────────
+
+    public class ViewClient<T> where T : new()
+    {
+        private readonly AdapterTableClient<T> _tableClient;
+        public string ViewName { get; }
+
+        public ViewClient(An5Adapter adapter, string viewName, Dialect dialect)
+        {
+            ViewName = viewName;
+            _tableClient = new AdapterTableClient<T>(adapter, viewName, dialect);
+        }
+
+        public List<T> FindMany(string whereClause = null, Dictionary<string, object> parameters = null, string orderBy = null, int? skip = null, int? take = null)
+            => _tableClient.FindMany(whereClause, parameters, orderBy, skip, take);
+
+        public T FindFirst(string whereClause = null, Dictionary<string, object> parameters = null, string orderBy = null)
+            => _tableClient.FindFirst(whereClause, parameters, orderBy);
+
+        public T FindUnique(object id, string idColumnName = "Id")
+            => _tableClient.FindUnique(id, idColumnName);
+
+        public int Count(string whereClause = null, Dictionary<string, object> parameters = null)
+            => _tableClient.Count(whereClause, parameters);
+
+        public List<(T Item, double Distance)> VectorSearch(List<double> vector, int take = 10, string whereClause = null, Dictionary<string, object> parameters = null, string vectorField = "Embedding", string distanceMetric = "cosine")
+            => _tableClient.VectorSearch(vector, take, whereClause, parameters, vectorField, distanceMetric);
+
+        public T Create(T entity) => throw new NotSupportedException($"View '{ViewName}' is read-only. Create is not allowed.");
+        public T Update(T entity, string idColumnName = "Id") => throw new NotSupportedException($"View '{ViewName}' is read-only. Update is not allowed.");
+        public bool Delete(object id, string idColumnName = "Id") => throw new NotSupportedException($"View '{ViewName}' is read-only. Delete is not allowed.");
+        public int DeleteMany(string whereClause = null, Dictionary<string, object> parameters = null) => throw new NotSupportedException($"View '{ViewName}' is read-only. DeleteMany is not allowed.");
+        public T Upsert(T entity, string idColumnName = "Id") => throw new NotSupportedException($"View '{ViewName}' is read-only. Upsert is not allowed.");
     }
 
 // ─── Typed Table Client ────────────────────────────────────────────────────

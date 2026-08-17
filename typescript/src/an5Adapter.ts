@@ -412,6 +412,94 @@ export class An5Adapter {
     return new AdapterTableClient<T>(this, modelName);
   }
 
+  private _listeners: Record<string, ((...args: any[]) => void)[]> = {};
+  private _middlewares: ((params: any) => Promise<any>)[] = [];
+
+  $on(event: 'query' | 'error' | 'warn' | 'info' | string, callback: (...args: any[]) => void): this {
+    if (!this._listeners[event]) this._listeners[event] = [];
+    this._listeners[event].push(callback);
+    return this;
+  }
+
+  $off(event: string, callback: (...args: any[]) => void): this {
+    if (!this._listeners[event]) return this;
+    this._listeners[event] = this._listeners[event].filter(cb => cb !== callback);
+    return this;
+  }
+
+  $emit(event: string, ...args: any[]): void {
+    if (this._listeners[event]) {
+      for (const cb of this._listeners[event]) {
+        try { cb(...args); } catch {}
+      }
+    }
+  }
+
+  $use(middleware: (params: { model?: string; action: string; args: any; run: (args: any) => Promise<any> }) => Promise<any>): this {
+    this._middlewares.push(middleware);
+    return this;
+  }
+
+  view<T = any>(viewName: string): ViewClient<T> {
+    return new ViewClient<T>(this, viewName);
+  }
+
+  async $queryProc<T = any>(procName: string, params?: Record<string, any> | any[]): Promise<T[]> {
+    if (this.sheetsAdapter) throw new Error('Stored procedures are not supported by the Google Sheets adapter');
+    const paramObj: Record<string, any> = {};
+    let sql = '';
+    if (Array.isArray(params)) {
+      const placeholders = params.map((v, i) => {
+        paramObj[`p_${i}`] = v;
+        return `@p_${i}`;
+      });
+      sql = this.dialect === 'postgres' || this.dialect === 'mysql'
+        ? `CALL ${procName}(${placeholders.join(', ')})`
+        : `EXEC ${procName} ${placeholders.join(', ')}`;
+    } else if (params && typeof params === 'object') {
+      const pairs = Object.entries(params).map(([k, v]) => {
+        paramObj[`p_${k}`] = v;
+        return `@${k} = @p_${k}`;
+      });
+      sql = this.dialect === 'postgres' || this.dialect === 'mysql'
+        ? `CALL ${procName}(${Object.keys(params).map(k => `@p_${k}`).join(', ')})`
+        : `EXEC ${procName} ${pairs.join(', ')}`;
+    } else {
+      sql = this.dialect === 'postgres' || this.dialect === 'mysql'
+        ? `CALL ${procName}()`
+        : `EXEC ${procName}`;
+    }
+    return this.exec<T>(sql, paramObj);
+  }
+
+  async $executeProc(procName: string, params?: Record<string, any> | any[]): Promise<number> {
+    if (this.sheetsAdapter) throw new Error('Stored procedures are not supported by the Google Sheets adapter');
+    const paramObj: Record<string, any> = {};
+    let sql = '';
+    if (Array.isArray(params)) {
+      const placeholders = params.map((v, i) => {
+        paramObj[`p_${i}`] = v;
+        return `@p_${i}`;
+      });
+      sql = this.dialect === 'postgres' || this.dialect === 'mysql'
+        ? `CALL ${procName}(${placeholders.join(', ')})`
+        : `EXEC ${procName} ${placeholders.join(', ')}`;
+    } else if (params && typeof params === 'object') {
+      const pairs = Object.entries(params).map(([k, v]) => {
+        paramObj[`p_${k}`] = v;
+        return `@${k} = @p_${k}`;
+      });
+      sql = this.dialect === 'postgres' || this.dialect === 'mysql'
+        ? `CALL ${procName}(${Object.keys(params).map(k => `@p_${k}`).join(', ')})`
+        : `EXEC ${procName} ${pairs.join(', ')}`;
+    } else {
+      sql = this.dialect === 'postgres' || this.dialect === 'mysql'
+        ? `CALL ${procName}()`
+        : `EXEC ${procName}`;
+    }
+    return this._executeRaw(sql, paramObj);
+  }
+
   async readRange<T = any>(range: string): Promise<T[][]> {
     return this.requireSheetsAdapter().readRange<T>(range);
   }
@@ -430,6 +518,78 @@ export class An5Adapter {
 
   async deleteSheet(name: string): Promise<void> {
     await this.requireSheetsAdapter().deleteSheet(name);
+  }
+}
+
+// ─── View Client (Read-Only) ────────────────────────────────────────────────────────
+
+export class ViewClient<T = any> {
+  private readonly tableClient: AdapterTableClient<T>;
+
+  constructor(
+    public readonly adapter: An5Adapter | An5AdapterTx,
+    public readonly viewName: string,
+  ) {
+    this.tableClient = new AdapterTableClient<T>(adapter, viewName);
+  }
+
+  public get dialect(): Dialect { return this.tableClient.dialect; }
+  public get tableName(): string { return this.tableClient.tableName; }
+
+  async findMany(args?: { where?: any; orderBy?: any; skip?: number; take?: number; select?: any; include?: any }): Promise<T[]> {
+    return this.tableClient.findMany(args);
+  }
+
+  async findFirst(args?: { where?: any; orderBy?: any; select?: any; include?: any }): Promise<T | null> {
+    return this.tableClient.findFirst(args);
+  }
+
+  async findUnique(args: { where: any; select?: any; include?: any }): Promise<T | null> {
+    return this.tableClient.findUnique(args);
+  }
+
+  async count(args?: { where?: any }): Promise<number> {
+    return this.tableClient.count(args);
+  }
+
+  async aggregate(args: any): Promise<any> {
+    return this.tableClient.aggregate(args);
+  }
+
+  async groupBy(args: any): Promise<any[]> {
+    return this.tableClient.groupBy(args);
+  }
+
+  async vectorSearch(args: any): Promise<(T & { distance: number })[]> {
+    return this.tableClient.vectorSearch(args);
+  }
+
+  async create(): Promise<never> {
+    throw new Error(`View '${this.viewName}' is read-only. Mutation operations (create) are not allowed.`);
+  }
+
+  async createMany(): Promise<never> {
+    throw new Error(`View '${this.viewName}' is read-only. Mutation operations (createMany) are not allowed.`);
+  }
+
+  async update(): Promise<never> {
+    throw new Error(`View '${this.viewName}' is read-only. Mutation operations (update) are not allowed.`);
+  }
+
+  async updateMany(): Promise<never> {
+    throw new Error(`View '${this.viewName}' is read-only. Mutation operations (updateMany) are not allowed.`);
+  }
+
+  async delete(): Promise<never> {
+    throw new Error(`View '${this.viewName}' is read-only. Mutation operations (delete) are not allowed.`);
+  }
+
+  async deleteMany(): Promise<never> {
+    throw new Error(`View '${this.viewName}' is read-only. Mutation operations (deleteMany) are not allowed.`);
+  }
+
+  async upsert(): Promise<never> {
+    throw new Error(`View '${this.viewName}' is read-only. Mutation operations (upsert) are not allowed.`);
   }
 }
 

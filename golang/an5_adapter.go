@@ -251,3 +251,50 @@ func VectorSearchFallback(rows []map[string]interface{}, targetVector []float64,
 	}
 	return result
 }
+
+// QueryProc executes a stored procedure and returns the result rows.
+func (a *An5Adapter) QueryProc(ctx context.Context, procName string, args ...interface{}) ([]map[string]interface{}, error) {
+	var sql string
+	if a.Dialect == base.DialectPostgres {
+		placeholders := make([]string, len(args))
+		for i := range args {
+			placeholders[i] = placeholder(a.Dialect, i+1)
+		}
+		sql = "CALL " + procName + "(" + strings.Join(placeholders, ", ") + ")"
+	} else {
+		placeholders := make([]string, len(args))
+		for i := range args {
+			placeholders[i] = "?"
+		}
+		if len(placeholders) > 0 {
+			sql = "EXEC " + procName + " " + strings.Join(placeholders, ", ")
+		} else {
+			sql = "EXEC " + procName
+		}
+	}
+	return a.QueryRaw(ctx, sql, args...)
+}
+
+// ExecuteProc executes a stored procedure and returns affected rows.
+func (a *An5Adapter) ExecuteProc(ctx context.Context, procName string, args ...interface{}) (int64, error) {
+	var sql string
+	if a.Dialect == base.DialectPostgres {
+		placeholders := make([]string, len(args))
+		for i := range args {
+			placeholders[i] = placeholder(a.Dialect, i+1)
+		}
+		sql = "CALL " + procName + "(" + strings.Join(placeholders, ", ") + ")"
+	} else {
+		placeholders := make([]string, len(args))
+		for i := range args {
+			placeholders[i] = "?"
+		}
+		if len(placeholders) > 0 {
+			sql = "EXEC " + procName + " " + strings.Join(placeholders, ", ")
+		} else {
+			sql = "EXEC " + procName
+		}
+	}
+	return a.ExecuteRaw(ctx, sql, args...)
+}
+
