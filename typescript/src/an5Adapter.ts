@@ -143,7 +143,9 @@ async function resolveIncludes(
     const isMany = relation.relationType === 'many';
     const localKey = relation.localKey;
     const foreignKey = relation.foreignKey;
-    const uniqueKeys = Array.from(new Set(rows.map(r => r[localKey]).filter(k => k !== undefined && k !== null)));
+    const joinKey = isMany ? localKey : foreignKey;
+    const matchKey = isMany ? foreignKey : localKey;
+    const uniqueKeys = Array.from(new Set(rows.map(r => r[joinKey]).filter(k => k !== undefined && k !== null)));
 
     if (uniqueKeys.length === 0) {
       rows.forEach(r => { r[key] = isMany ? [] : null; });
@@ -155,7 +157,7 @@ async function resolveIncludes(
     const nestedSelect = subArgs.select;
 
     const subWhere: any = {
-      [foreignKey]: { in: uniqueKeys },
+      [matchKey]: { in: uniqueKeys },
       ...(subArgs.where || {}),
     };
 
@@ -177,13 +179,13 @@ async function resolveIncludes(
 
     const groupMap = new Map<any, any[]>();
     relatedRows.forEach((r: any, idx: number) => {
-      const k = r[foreignKey];
+      const k = r[isMany ? foreignKey : localKey];
       if (!groupMap.has(k)) groupMap.set(k, []);
       groupMap.get(k)!.push(outputRows[idx]);
     });
 
     rows.forEach(r => {
-      const k = r[localKey];
+      const k = r[isMany ? localKey : foreignKey];
       const matches = groupMap.get(k) || [];
       if (isMany) {
         r[key] = matches;
