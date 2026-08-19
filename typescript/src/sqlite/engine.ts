@@ -24,7 +24,12 @@ export class SqliteEngine implements QueryEngine {
 
   // better-sqlite3 natively supports @name parameters
   async exec<T = any>(query: string, params?: Record<string, any>): Promise<T[]> {
-    return this.getDb().prepare(query).all(params ?? {}) as T[];
+    const stmt = this.getDb().prepare(query);
+    if (stmt.reader) {
+      return stmt.all(params ?? {}) as T[];
+    }
+    stmt.run(params ?? {});
+    return [] as T[];
   }
 
   async executeRaw(query: string, params?: Record<string, any>): Promise<number> {
@@ -44,8 +49,14 @@ export class SqliteEngine implements QueryEngine {
     let done = false;
 
     return {
-      exec: async <T>(q: string, p?: Record<string, any>) =>
-        db.prepare(q).all(p ?? {}) as T[],
+      exec: async <T>(q: string, p?: Record<string, any>) => {
+        const stmt = db.prepare(q);
+        if (stmt.reader) {
+          return stmt.all(p ?? {}) as T[];
+        }
+        stmt.run(p ?? {});
+        return [] as T[];
+      },
       executeRaw: async (q: string, p?: Record<string, any>) =>
         (db.prepare(q).run(p ?? {}).changes ?? 0),
       commit: async () => { if (!done) { db.prepare('COMMIT').run(); done = true; } },

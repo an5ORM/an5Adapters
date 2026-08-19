@@ -17,6 +17,7 @@ import (
 // Re-export core base types and functions for package root convenience.
 type Dialect = base.Dialect
 type AdapterMetadata = base.AdapterMetadata
+type RelationDef = base.RelationDef
 
 const (
 	DialectMssql    = base.DialectMssql
@@ -51,6 +52,16 @@ func DotProduct(v1, v2 []float64) float64 {
 // SetAdapterMetadata injects model-to-table metadata from the generated client.
 func SetAdapterMetadata(meta AdapterMetadata) {
 	base.SetAdapterMetadata(meta)
+}
+
+// GetModelToTable returns the current model-to-table mapping.
+func GetModelToTable() map[string]string {
+	return base.GetModelToTable()
+}
+
+// GetRelationsForModel returns the relation definitions for the given model name.
+func GetRelationsForModel(modelName string) map[string]RelationDef {
+	return base.GetRelationsForModel(modelName)
 }
 
 // An5Adapter manages runtime database execution for Go applications.

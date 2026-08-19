@@ -2,9 +2,148 @@ import json
 import uuid
 from typing import Any, Dict, List, Optional
 try:
-    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table
+    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
 except ImportError:
-    from base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table
+    from base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
+
+# ─── Select / Include helpers ────────────────────────────────────────────────────────
+
+def _selected_fields(select: Any) -> List[str]:
+    """Extract scalar column names from a select object (list or dict with truthy values)."""
+    if not select:
+        return []
+    if isinstance(select, str):
+        return [select] if select else []
+    if isinstance(select, list):
+        return [f for f in select if isinstance(f, str) and f]
+    if isinstance(select, dict):
+        return [str(k) for k, v in select.items() if v]
+    return []
+
+
+def _has_relation_select(select: Any, relations: Dict) -> bool:
+    for key in _selected_fields(select):
+        if key == "_count" or key in relations:
+            return True
+    return False
+
+
+def _project_fields(row: Dict, select: Any) -> Dict:
+    """Keep only selected fields on a row (mirrors TypeScript projectFields)."""
+    if not row or not select:
+        return row
+    projected = {}
+    for key in _selected_fields(select):
+        if key in row:
+            projected[key] = row[key]
+    if "_count" in row:
+        projected["_count"] = row["_count"]
+    return projected
+
+
+def _to_list(value: Any) -> List:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _resolve_includes(model_name: str, rows: List[Dict], include: Any, adapter: Any) -> None:
+    """Eager-load relation rows and attach them onto each row (mirrors TypeScript resolveIncludes)."""
+    if not rows or not include:
+        return
+    if not isinstance(include, dict):
+        return
+    model_relations = get_relations_for_model(model_name)
+
+    for key, value in include.items():
+        if not value:
+            continue
+
+        if key == "_count":
+            for row in rows:
+                if "_count" not in row or row["_count"] is None:
+                    row["_count"] = {}
+            for rel_key, relation in model_relations.items():
+                if relation.get("relationType") != "many":
+                    continue
+                unique_keys = list({row.get(relation["localKey"]) for row in rows if row.get(relation["localKey"]) is not None})
+                if unique_keys:
+                    rel_client = adapter.table(relation["modelName"])
+                    related = rel_client.find_many(where={relation["foreignKey"]: {"in": unique_keys}})
+                    count_map = {}
+                    for r in related:
+                        k = r.get(relation["foreignKey"])
+                        count_map[k] = count_map.get(k, 0) + 1
+                    for row in rows:
+                        k = row.get(relation["localKey"])
+                        row["_count"][rel_key] = count_map.get(k, 0)
+                else:
+                    for row in rows:
+                        row["_count"][rel_key] = 0
+            continue
+
+        relation = model_relations.get(key)
+        if not relation:
+            continue
+
+        is_many = relation.get("relationType") == "many"
+        local_key = relation["localKey"]
+        foreign_key = relation["foreignKey"]
+        join_key = local_key if is_many else foreign_key
+        match_key = foreign_key if is_many else local_key
+        unique_keys = list({row.get(join_key) for row in rows if row.get(join_key) is not None})
+
+        if not unique_keys:
+            for row in rows:
+                row[key] = [] if is_many else None
+            continue
+
+        sub_args = value if isinstance(value, dict) else {}
+        sub_where = {match_key: {"in": unique_keys}}
+        if sub_args.get("where"):
+            sub_where.update(sub_args["where"])
+
+        rel_client = adapter.table(relation["modelName"])
+        related = rel_client.find_many(
+            where=sub_where,
+            order_by=sub_args.get("orderBy"),
+            take=sub_args.get("take"),
+            skip=sub_args.get("skip"),
+        )
+
+        if sub_args.get("include"):
+            _resolve_includes(relation["modelName"], related, sub_args["include"], adapter)
+
+        output_rows = related
+        if sub_args.get("select"):
+            output_rows = [_project_fields(r, sub_args["select"]) for r in related]
+
+        group_map = {}
+        for i, r in enumerate(related):
+            k = r.get(foreign_key if is_many else local_key)
+            group_map.setdefault(k, []).append(output_rows[i])
+
+        for row in rows:
+            k = row.get(local_key if is_many else foreign_key)
+            matches = group_map.get(k) or []
+            row[key] = matches if is_many else (matches[0] if matches else None)
+
+
+def _split_relation_writes(model_name: str, data: Dict) -> (Dict, Dict):
+    """Separate relation-write objects from scalar data using model metadata."""
+    relations = get_relations_for_model(model_name)
+    scalars = {}
+    rel_writes = {}
+    for k, v in data.items():
+        if k in relations and isinstance(v, dict) and v is not None:
+            rel_writes[k] = v
+        else:
+            scalars[k] = v
+    return scalars, rel_writes
 
 # ─── Table Client ───────────────────────────────────────────────────────────────────
 
@@ -101,25 +240,39 @@ class AdapterTableClient:
         order_prefix = "" if order_sql else " ORDER BY (SELECT NULL)"
         return f"{order_prefix} OFFSET {skip} ROWS FETCH NEXT {take} ROWS ONLY"
 
-    def find_many(self, where=None, order_by=None, skip: int = 0, take: Optional[int] = None, select=None) -> List[Dict]:
+    def find_many(self, where=None, order_by=None, skip: int = 0, take: Optional[int] = None, select=None, include=None) -> List[Dict]:
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect)
         order_sql = _build_order_by(order_by, self._dialect)
 
-        query = f"SELECT * FROM {self._table_sql}{self._nolock}"
+        relations = get_relations_for_model(self._model)
+        cols = "SELECT *"
+        if select and len(_selected_fields(select)) > 0 and not _has_relation_select(select, relations):
+            cols = "SELECT " + ", ".join(_quote(c, self._dialect) for c in _selected_fields(select))
+
+        query = f"{cols} FROM {self._table_sql}{self._nolock}"
         if where_sql:
             query += f" WHERE {where_sql}"
         if order_sql:
             query += f" {order_sql}"
         query += self._pagination(take, skip, order_sql)
-        return self._adapter.exec(query, list(params.values()))
 
-    def find_first(self, where=None, order_by=None, select=None) -> Optional[Dict]:
-        rows = self.find_many(where=where, order_by=order_by, take=1, select=select)
+        rows = self._adapter.exec(query, list(params.values()))
+
+        if include:
+            _resolve_includes(self._model, rows, include, self._adapter)
+        if select:
+            if _has_relation_select(select, relations):
+                _resolve_includes(self._model, rows, select, self._adapter)
+            rows = [_project_fields(r, select) for r in rows]
+        return rows
+
+    def find_first(self, where=None, order_by=None, select=None, include=None) -> Optional[Dict]:
+        rows = self.find_many(where=where, order_by=order_by, take=1, select=select, include=include)
         return rows[0] if rows else None
 
-    def find_unique(self, where: Dict) -> Optional[Dict]:
-        return self.find_first(where=where)
+    def find_unique(self, where: Dict, select=None, include=None) -> Optional[Dict]:
+        return self.find_first(where=where, select=select, include=include)
 
     def count(self, where=None) -> int:
         params: Dict = {}
@@ -130,10 +283,12 @@ class AdapterTableClient:
         rows = self._adapter.exec(query, list(params.values()))
         return int(rows[0]["cnt"]) if rows else 0
 
-    def create(self, data: Dict) -> Dict:
+    def create(self, data: Dict, include=None, select=None) -> Dict:
         id_field = next((f for f in self._fields if f.get("isId")), None)
         if id_field and id_field["name"] not in data:
             data = {**data, id_field["name"]: str(uuid.uuid4())}
+
+        data, relation_writes = _split_relation_writes(self._model, data)
 
         cols = [k for k, v in data.items() if v is not None]
         values = [data[c] for c in cols]
@@ -143,8 +298,29 @@ class AdapterTableClient:
         self._adapter.execute(query, values)
 
         if id_field:
-            return self.find_first(where={id_field["name"]: data[id_field["name"]]}) or data
-        return data
+            created = self.find_first(where={id_field["name"]: data[id_field["name"]]}) or data
+        else:
+            created = data
+
+        # Handle nested relation writes
+        relations = get_relations_for_model(self._model)
+        for rel_key, rel_write in relation_writes.items():
+            relation = relations.get(rel_key)
+            if not relation:
+                continue
+            child_client = self._adapter.table(relation["modelName"])
+            if "create" in rel_write:
+                create_items = _to_list(rel_write["create"])
+                for item in create_items:
+                    merged = {**item, relation["foreignKey"]: created.get(relation["localKey"])}
+                    child_client.create(data=merged)
+
+        if include:
+            _resolve_includes(self._model, [created], include, self._adapter)
+        if select:
+            _resolve_includes(self._model, [created], select, self._adapter)
+            return _project_fields(created, select)
+        return created
 
     def create_many(self, data: List[Dict], skip_duplicates: bool = False) -> Dict:
         count = 0
@@ -157,24 +333,49 @@ class AdapterTableClient:
                     raise
         return {"count": count}
 
-    def update(self, where: Dict, data: Dict) -> Optional[Dict]:
+    def update(self, where: Dict, data: Dict, include=None, select=None) -> Optional[Dict]:
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect, "w_")
+        data, relation_writes = _split_relation_writes(self._model, data)
         set_parts: List[str] = []
         set_values: List = []
         for col, val in data.items():
             if val is not None:
                 _append_update_set(set_parts, set_values, col, val, self._dialect)
 
-        if not set_parts:
-            return self.find_first(where=where)
+        if set_parts:
+            all_values = set_values + list(params.values())
+            query = f"UPDATE {self._table_sql} SET {', '.join(set_parts)}"
+            if where_sql:
+                query += f" WHERE {where_sql}"
+            self._adapter.execute(query, all_values)
 
-        all_values = set_values + list(params.values())
-        query = f"UPDATE {self._table_sql} SET {', '.join(set_parts)}"
-        if where_sql:
-            query += f" WHERE {where_sql}"
-        self._adapter.execute(query, all_values)
-        return self.find_first(where=where)
+        updated = self.find_first(where=where)
+
+        # Handle nested relation writes
+        relations = get_relations_for_model(self._model)
+        for rel_key, rel_write in relation_writes.items():
+            relation = relations.get(rel_key)
+            if not relation:
+                continue
+            child_client = self._adapter.table(relation["modelName"])
+            if "create" in rel_write:
+                create_items = _to_list(rel_write["create"])
+                for item in create_items:
+                    merged = {**item, relation["foreignKey"]: (updated or {}).get(relation["localKey"])}
+                    child_client.create(data=merged)
+            if "update" in rel_write:
+                update_obj = rel_write["update"]
+                child_client.update(where=update_obj.get("where"), data=update_obj.get("data") or {})
+            if "disconnect" in rel_write:
+                child_client.update_many(where=rel_write["disconnect"], data={relation["foreignKey"]: None})
+
+        if include and updated:
+            _resolve_includes(self._model, [updated], include, self._adapter)
+        if select and updated:
+            _resolve_includes(self._model, [updated], select, self._adapter)
+            return _project_fields(updated, select)
+        return updated
 
     def update_many(self, where: Optional[Dict], data: Dict) -> Dict:
         params: Dict = {}

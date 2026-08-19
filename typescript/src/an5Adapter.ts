@@ -671,6 +671,15 @@ export class AdapterTableClient<T = any> {
     return this.dialect === 'mssql' ? ' WITH (NOLOCK)' : '';
   }
 
+  /** Build the shared context used by parseWhere to resolve relations and self references. */
+  private whereContext(): { relationMap: Record<string, Record<string, RelationDef>>; modelToTable: Record<string, string>; selfRef: string } {
+    return {
+      relationMap: getRelationMap(),
+      modelToTable: getModelToTable(),
+      selfRef: this.tableName,
+    };
+  }
+
   private async doExec<U = any>(query: string, params?: Record<string, any>): Promise<U[]> {
     return this.adapter.exec<U>(query, params);
   }
@@ -681,7 +690,8 @@ export class AdapterTableClient<T = any> {
 
   async findMany(args?: { where?: any; orderBy?: any; skip?: number; take?: number; select?: any; include?: any }): Promise<T[]> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
+    const whereCtx = this.whereContext();
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect, '', whereCtx);
     const orderSql = buildOrderBy(args?.orderBy, this.dialect);
     const take = args?.take;
     const skip = args?.skip;
@@ -760,7 +770,7 @@ export class AdapterTableClient<T = any> {
 
   async count(args?: { where?: any }): Promise<number> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect, '', this.whereContext());
     let query = `SELECT COUNT(*) AS cnt FROM ${this.tableName}${this.nolock}`;
     if (whereSql) query += ` WHERE ${whereSql}`;
     const rows = await this.doExec<any>(query, params);
@@ -890,7 +900,7 @@ export class AdapterTableClient<T = any> {
     const setCols = Object.keys(rawData).filter(k => rawData[k] !== undefined);
     if (setCols.length > 0) {
       const params: Record<string, any> = {};
-      const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, 'w_');
+      const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, 'w_', this.whereContext());
       const sets: string[] = [];
       for (const col of setCols) {
         appendUpdateSet(sets, params, col, rawData[col], this.dialect);
@@ -948,7 +958,7 @@ export class AdapterTableClient<T = any> {
 
   async updateMany(args: { where?: any; data: Partial<T> }): Promise<{ count: number }> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, 'w_');
+    const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, 'w_', this.whereContext());
     const setCols = Object.keys(args.data).filter(k => (args.data as any)[k] !== undefined);
     const sets: string[] = [];
 
@@ -966,14 +976,14 @@ export class AdapterTableClient<T = any> {
   async delete(args: { where: any }): Promise<T> {
     const existing = await this.findFirst({ where: args.where });
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args.where, params, this.dialect);
+    const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, '', this.whereContext());
     await this.doExecuteRaw(`DELETE FROM ${this.tableName} WHERE ${whereSql}`, params);
     return existing as T;
   }
 
   async deleteMany(args?: { where?: any }): Promise<{ count: number }> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect, '', this.whereContext());
     const query = `DELETE FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''}`;
     const count = await this.doExecuteRaw(query, params);
     return { count };
@@ -988,7 +998,7 @@ export class AdapterTableClient<T = any> {
 
   async aggregate(args: any): Promise<any> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect, '', this.whereContext());
     const aggs: string[] = [];
 
     if (args._count) {
@@ -1107,7 +1117,7 @@ export class AdapterTableClient<T = any> {
     // 1. Try native dialect execution
     if (this.dialect === 'postgres') {
       const op = metric === 'cosine' ? '<=>' : metric === 'dot' ? '<#>' : '<->';
-      const whereSql = parseWhere(this.modelName, args.where, params, this.dialect);
+      const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, '', this.whereContext());
       const query = `SELECT *, (${col} ${op} @query_vector::vector) AS distance FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''} ORDER BY distance ASC LIMIT ${take}`;
       try {
         return await this.doExec<(T & { distance: number })>(query, params);
@@ -1117,7 +1127,7 @@ export class AdapterTableClient<T = any> {
       }
     } else if (this.dialect === 'mssql') {
       const distFn = metric === 'cosine' ? 'cosine' : metric === 'euclidean' ? 'euclidean' : 'dot';
-      const whereSql = parseWhere(this.modelName, args.where, params, this.dialect);
+      const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, '', this.whereContext());
       const query = `SELECT TOP (${take}) *, VECTOR_DISTANCE('${distFn}', ${col}, CAST(@query_vector AS VECTOR(${dim}, ${elementType}))) AS distance FROM ${this.tableName}${this.nolock}${whereSql ? ` WHERE ${whereSql}` : ''} ORDER BY distance ASC`;
       try {
         return await this.doExec<(T & { distance: number })>(query, params);

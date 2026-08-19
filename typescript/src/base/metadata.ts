@@ -1,6 +1,3 @@
-import path from 'path';
-import fs from 'fs';
-
 export interface RelationDef {
   modelName: string;
   relationType: "many" | "one";
@@ -28,6 +25,11 @@ let relationMap: Record<string, Record<string, RelationDef>> = {};
 let autoLoaded = false;
 
 function loadMetadataFromConfig(): any {
+  // Auto-loading scans the filesystem at runtime, so it only applies in Node.
+  // Lazy requires keep Node builtins out of browser builds.
+  if (typeof process === 'undefined' || !process.cwd) return null;
+  const path = require('path');
+  const fs = require('fs');
   const rootDir = process.cwd();
   const configNames = ['an5Orm.config.js', 'an5Orm.config.cjs', 'an5Orm.config.json'];
   const candidatesDirs = [rootDir, path.resolve(rootDir, '..'), path.resolve(rootDir, '../..')];
