@@ -51,11 +51,11 @@
     "build": "tsc -p tsconfig.json",
     "pretest": "npm run build",
     "prepack": "npm run build",
-    "build:python": "python -m build --outdir dist-py",
+    "build:python": "(python -m build --outdir dist-py || python3 -m build --outdir dist-py)",
     "test": "node test/unit.test.js && node test/package.test.js",
     "test:package:smoke": "node scripts/package-smoke.js",
     "test:integration:live": "node test/live-db.integration.test.js",
-    "test:python": "python -m compileall python 2>&1",
+    "test:python": "(python -m compileall python 2>&1 || python3 -m compileall python 2>&1)",
     "test:dotnet": "node scripts/dotnet-compile-check.js",
     "test:go": "cd golang && go test ./..."
   },
