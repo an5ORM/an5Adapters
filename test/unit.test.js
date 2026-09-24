@@ -804,7 +804,7 @@ test('package manifest includes cross-language adapter sources and gates', () =>
   assert.ok(pkg.files.includes('python/**/*.py'), 'python sources must be packaged');
   assert.ok(pkg.files.includes('dotnet/**/*'), 'dotnet sources must be packaged');
   assert.ok(pkg.files.includes('golang/**/*'), 'golang sources must be packaged');
-  assert.strictEqual(pkg.scripts['test:python'], 'python -m compileall python 2>&1');
+  assert.strictEqual(pkg.scripts['test:python'], '(python -m compileall python 2>&1 || python3 -m compileall python 2>&1)');
   assert.strictEqual(pkg.scripts['test:dotnet'], 'node scripts/dotnet-compile-check.js');
   assert.strictEqual(pkg.scripts['test:go'], 'cd golang && go test ./...');
   assert.strictEqual(pkg.scripts['test:integration:live'], 'node test/live-db.integration.test.js');
