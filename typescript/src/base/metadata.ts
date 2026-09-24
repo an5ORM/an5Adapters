@@ -103,3 +103,46 @@ export function getRelationsForModel(modelName: string): Record<string, Relation
   tryAutoLoadMetadata();
   return relationMap[modelName] || {};
 }
+
+// ─── Dynamic model proxy ─────────────────────────────────────────────────────
+// Shared by An5Adapter and An5SheetsAdapter: `db.user` / `db.User` /
+// `db.users` resolve case-insensitively through the registered metadata and
+// delegate to `table(modelName)`. Real members (`$`-prefixed helpers and
+// methods) always win over model names.
+export function createAdapterProxy<T extends object>(
+  targetObj: T,
+  tableGetter: (modelName: string) => any
+): T {
+  return new Proxy(targetObj, {
+    get(target: any, prop: string | symbol, receiver) {
+      if (typeof prop === 'string') {
+        if (prop in target || prop.startsWith('_') || prop.startsWith('$') || typeof target[prop] === 'function') {
+          const val = target[prop];
+          return typeof val === 'function' ? val.bind(target) : val;
+        }
+        let modelName = prop;
+        const modelToTable = getModelToTable();
+        if (!modelToTable[prop]) {
+          const lowerProp = prop.toLowerCase();
+          for (const [mName, tName] of Object.entries(modelToTable)) {
+            const lowerM = mName.toLowerCase();
+            const lowerT = (tName as string).toLowerCase();
+            if (
+              lowerM === lowerProp ||
+              lowerT === lowerProp ||
+              lowerM + 's' === lowerProp ||
+              lowerM + 'es' === lowerProp ||
+              lowerT + 's' === lowerProp ||
+              lowerT + 'es' === lowerProp
+            ) {
+              modelName = mName;
+              break;
+            }
+          }
+        }
+        return tableGetter(modelName);
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+}

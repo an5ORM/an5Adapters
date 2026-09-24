@@ -4,7 +4,8 @@ Standalone runtime database adapter and query engine for AN5 ORM. Provides conne
 
 ## Features
 
-- **Dynamic Model Access** — Access models directly via `db.user.findMany()`, `db.order.create()`, or `db.table('User')`
+- **Dynamic Model Access** — Access models directly via `db.user.findMany()` or `db.User.create()` (proxy resolves casing/plurals via metadata); `db.table('User')` is the escape hatch for runtime-known model names
+- **Typed Model Access** — Bind generated delegates for full type-safety: `createAn5Adapter<{ user: UserTableClient }>({...})`, plus the `TypedAn5Adapter` / `AdapterAPI` helper types
 - **Relations & Eager Loading** — Query nested relations with `include`, relation-level `select`, `where`, `orderBy`, pagination, and `_count`
 - **Nested Writes** — Create and update records with nested relation writes (`create`, `update`, `disconnect`)
 - **Query Builder & Dialects** — Dialect-aware SQL formatting for MSSQL, PostgreSQL, MySQL, and SQLite

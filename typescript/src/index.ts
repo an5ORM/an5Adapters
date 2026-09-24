@@ -2,6 +2,7 @@ export {
   An5Adapter,
   AdapterTableClient,
   createAn5Adapter,
+  createAdapterProxy,
   executorFromAdapter,
   setAdapterMetadata,
 } from './an5Adapter';
@@ -11,6 +12,7 @@ export type {
   AdapterMetadata,
   Dialect,
 } from './an5Adapter';
+export type { TypedAn5Adapter, AdapterAPI } from './typed';
 export {
   getLlmConfig, setLlmConfig,
   getEmbeddingConfig, setEmbeddingConfig,

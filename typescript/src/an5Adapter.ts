@@ -9,6 +9,7 @@ import { parseSheetsConnectionString } from './googlesheets/parseConnectionStrin
 import type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
 import { buildOrderBy, parseWhere, quote } from './base/sql';
 import {
+  createAdapterProxy,
   getFieldsForModel,
   getModelToTable,
   getRelationMap,
@@ -18,7 +19,8 @@ import {
   type RelationDef,
 } from './base/metadata';
 export type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
-export { setAdapterMetadata, type AdapterMetadata } from './base/metadata';
+export { setAdapterMetadata, createAdapterProxy, type AdapterMetadata } from './base/metadata';
+export type { TypedAn5Adapter, AdapterAPI } from './typed';
 
 export type AnyAdapter = An5Adapter | An5SheetsAdapter;
 export type AnyAdapterConfig = An5AdapterConfig | An5SheetsAdapterConfig | { connectionString: string };
@@ -194,44 +196,6 @@ async function resolveIncludes(
       }
     });
   }
-}
-
-function createAdapterProxy<T extends object>(
-  targetObj: T,
-  tableGetter: (modelName: string) => any
-): T {
-  return new Proxy(targetObj, {
-    get(target: any, prop: string | symbol, receiver) {
-      if (typeof prop === 'string') {
-        if (prop in target || prop.startsWith('_') || prop.startsWith('$') || typeof target[prop] === 'function') {
-          const val = target[prop];
-          return typeof val === 'function' ? val.bind(target) : val;
-        }
-        let modelName = prop;
-        const modelToTable = getModelToTable();
-        if (!modelToTable[prop]) {
-          const lowerProp = prop.toLowerCase();
-          for (const [mName, tName] of Object.entries(modelToTable)) {
-            const lowerM = mName.toLowerCase();
-            const lowerT = (tName as string).toLowerCase();
-            if (
-              lowerM === lowerProp ||
-              lowerT === lowerProp ||
-              lowerM + 's' === lowerProp ||
-              lowerM + 'es' === lowerProp ||
-              lowerT + 's' === lowerProp ||
-              lowerT + 'es' === lowerProp
-            ) {
-              modelName = mName;
-              break;
-            }
-          }
-        }
-        return tableGetter(modelName);
-      }
-      return Reflect.get(target, prop, receiver);
-    },
-  });
 }
 
 // ─── An5Adapter ────────────────────────────────────────────────────────────────────
@@ -1182,6 +1146,10 @@ export class AdapterTableClient<T = any> {
 
 // ─── Factory ──────────────────────────────────────────────────────────────────────
 
+export function createAn5Adapter(config: AnyAdapterConfig): AnyAdapter;
+export function createAn5Adapter<TModels extends object>(
+  config: AnyAdapterConfig
+): import('./typed').TypedAn5Adapter<TModels>;
 export function createAn5Adapter(config: AnyAdapterConfig): AnyAdapter {
   if (isSheetsConfig(config)) return new An5SheetsAdapter(config);
   if (config.connectionString && config.connectionString.trim().startsWith('googlesheets://')) {

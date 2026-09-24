@@ -4,6 +4,7 @@ import { execQuery } from './sqlExecutor';
 import { SheetsTableClient } from './tableClient';
 import { SheetMeta } from './types';
 import { withRetry } from './retry';
+import { createAdapterProxy } from '../base/metadata';
 
 // ─── Fetch-based API proxy for OAuth Access Token / API Key (browser-compatible) ──
 
@@ -77,6 +78,7 @@ function createFetchApi(spreadsheetId: string, accessToken?: string, apiKey?: st
 // ─── Adapter ──────────────────────────────────────────────────────────────────
 
 export class An5SheetsAdapter {
+  [key: string]: any;
   private sheets: sheets_v4.Sheets | null = null;
   private fetchApi: ReturnType<typeof createFetchApi> | null = null;
   config: ReturnType<typeof resolveConfig>;
@@ -84,6 +86,8 @@ export class An5SheetsAdapter {
 
   constructor(config: An5SheetsAdapterConfig) {
     this.config = resolveConfig(config);
+    // Dynamic model access (`db.user` / `db.User`), same as An5Adapter.
+    return createAdapterProxy(this, (name) => this.table(name));
   }
 
   private get isFetchMode(): boolean {
