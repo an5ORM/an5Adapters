@@ -9,7 +9,7 @@ export function parseMssqlConnectionString(url: string): sql.config {
   cleanUrl = cleanUrl.replace(/^(?:sqlserver|mssql):\/\//i, '');
 
   const parts = cleanUrl.split(';');
-  const firstPart = parts[0].trim();
+  const firstPart = (parts[0] ?? '').trim();
 
   // host:port or host,port (SQL Server native style)
   let server = firstPart;
@@ -34,7 +34,9 @@ export function parseMssqlConnectionString(url: string): sql.config {
   };
 
   for (let i = 1; i < parts.length; i++) {
-    const part = parts[i].trim();
+    const rawPart = parts[i];
+    if (rawPart === undefined) continue;
+    const part = rawPart.trim();
     if (!part) continue;
     const eqIdx = part.indexOf('=');
     if (eqIdx === -1) continue;
@@ -46,7 +48,7 @@ export function parseMssqlConnectionString(url: string): sql.config {
     else if (key === 'server' || key === 'data source') {
       // SERVER=host,port style (key-value form)
       const [s, p] = value.split(',');
-      config.server = s.trim();
+      if (s !== undefined) config.server = s.trim();
       if (p) config.port = parseInt(p.trim(), 10) || 1433;
     }
     else if (key === 'encrypt') config.options.encrypt = value.toLowerCase() === 'true';

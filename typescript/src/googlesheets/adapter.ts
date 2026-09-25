@@ -113,9 +113,15 @@ export class An5SheetsAdapter {
     }
     if (!this.sheets) {
       const { google } = await import('googleapis');
+      const { clientEmail, privateKey } = this.config;
+      if (!clientEmail || !privateKey) {
+        throw new Error(
+          'Google Sheets JWT auth requires clientEmail and privateKey (or use accessToken/apiKey fetch mode).'
+        );
+      }
       const auth = new google.auth.JWT({
-        email: this.config.clientEmail,
-        key: this.config.privateKey,
+        email: clientEmail,
+        key: privateKey,
         scopes: ['https://www.googleapis.com/auth/spreadsheets'],
       });
       this.sheets = google.sheets({ version: 'v4', auth });

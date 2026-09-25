@@ -106,6 +106,7 @@ export function sortRows(rows: Record<string, any>[], orderBy: string): Record<s
   return [...rows].sort((a, b) => {
     for (const clause of clauses) {
       const [field, dir] = clause.split(/\s+/);
+      if (field === undefined) continue;
       const direction = dir?.toUpperCase() === 'DESC' ? -1 : 1;
       const aVal = a[field];
       const bVal = b[field];

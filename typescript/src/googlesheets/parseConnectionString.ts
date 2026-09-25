@@ -13,11 +13,13 @@ export function parseSheetsConnectionString(url: string): An5SheetsAdapterConfig
   const clean = url.replace(/^googlesheets:\/\//, '');
   const parts = clean.split(';');
 
-  const spreadsheetId = parts[0].trim();
+  const spreadsheetId = (parts[0] ?? '').trim();
   const config: Record<string, string> = {};
 
   for (let i = 1; i < parts.length; i++) {
-    const part = parts[i].trim();
+    const rawPart = parts[i];
+    if (rawPart === undefined) continue;
+    const part = rawPart.trim();
     if (!part) continue;
     const eqIdx = part.indexOf('=');
     if (eqIdx === -1) continue;

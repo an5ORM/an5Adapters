@@ -14,8 +14,6 @@ import {
   getModelToTable,
   getRelationMap,
   getRelationsForModel,
-  setAdapterMetadata,
-  type AdapterMetadata,
   type RelationDef,
 } from './base/metadata';
 export type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
@@ -814,7 +812,9 @@ export class AdapterTableClient<T = any> {
   async createMany(args: { data: Partial<T>[]; skipDuplicates?: boolean }): Promise<{ count: number }> {
     if (args.data.length === 0) return { count: 0 };
 
-    const firstCols = Object.keys(args.data[0]).filter(k => (args.data[0] as any)[k] !== undefined);
+    const firstRow = args.data[0];
+    if (firstRow === undefined) return { count: 0 };
+    const firstCols = Object.keys(firstRow).filter(k => (firstRow as any)[k] !== undefined);
 
     // Bulk INSERT for the common case (same columns, no skipDuplicates)
     if (firstCols.length > 0 && !args.skipDuplicates) {
@@ -1127,16 +1127,18 @@ export class AdapterTableClient<T = any> {
 
       let dot = 0, m1 = 0, m2 = 0;
       for (let i = 0; i < args.vector.length; i++) {
-        dot += args.vector[i] * vec[i];
-        m1 += args.vector[i] ** 2;
-        m2 += vec[i] ** 2;
+        const av = args.vector[i] ?? 0;
+        const bv = vec[i] ?? 0;
+        dot += av * bv;
+        m1 += av ** 2;
+        m2 += bv ** 2;
       }
       const cosine = m1 && m2 ? dot / (Math.sqrt(m1) * Math.sqrt(m2)) : 0;
       const dist = metric === 'cosine'
         ? 1 - cosine
         : metric === 'dot'
           ? -dot
-          : Math.sqrt(args.vector.reduce((s, v, i) => s + (v - vec[i]) ** 2, 0));
+          : Math.sqrt(args.vector.reduce((s, v, i) => s + (v - (vec[i] ?? 0)) ** 2, 0));
       scored.push({ row, dist });
     }
     scored.sort((a, b) => a.dist - b.dist);

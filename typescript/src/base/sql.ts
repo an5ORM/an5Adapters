@@ -241,8 +241,8 @@ function buildInnerWhere(
   childAlias?: string,
 ): string {
   const subCtx: WhereContext = {
-    relationMap: ctx?.relationMap,
-    modelToTable: ctx?.modelToTable,
+    ...(ctx?.relationMap !== undefined ? { relationMap: ctx.relationMap } : {}),
+    ...(ctx?.modelToTable !== undefined ? { modelToTable: ctx.modelToTable } : {}),
     selfRef: childAlias || quoteTable(resolveTable(relModel, ctx), dialect),
     colPrefix: childAlias ? `${childAlias}.` : '',
   };

@@ -44,9 +44,9 @@ export function matchRowSQL(row: Record<string, any>, whereText: string, values:
   for (const part of parts) {
     const m = part.match(/^(.+?)\s*(=|!=|<>|>|<|>=|<=|LIKE|CONTAINS)\s*(.+)$/i);
     if (!m) continue;
-    const field = m[1].trim().replace(/[[\]]/g, '');
-    const op = m[2].toUpperCase();
-    const valRef = m[3].trim();
+    const field = (m[1] ?? '').trim().replace(/[[\]]/g, '');
+    const op = (m[2] ?? '').toUpperCase();
+    const valRef = (m[3] ?? '').trim();
 
     const val = valRef.startsWith('?') ? values[parseInt(valRef.slice(1))] : valRef.replace(/^['"]|['"]$/g, '');
     const cell = row[field];
@@ -71,18 +71,22 @@ export function extractColsAndVals(sql: string, params?: Record<string, any>): {
 
   const colMatch = sql.match(/\(([^)]+)\)\s*VALUES/i);
   if (colMatch) {
-    const rawCols = colMatch[1].split(',').map(c => c.trim().replace(/[[\]]/g, ''));
+    const rawCols = (colMatch[1] ?? '').split(',').map(c => c.trim().replace(/[[\]]/g, ''));
     // Find actual values
-    const valMatch = sql.substring(colMatch.index! + colMatch[0].length).match(/\(([^)]+)\)/);
+    const valMatch = sql.substring((colMatch.index ?? 0) + colMatch[0].length).match(/\(([^)]+)\)/);
     if (valMatch) {
-      const rawVals = valMatch[1].split(',').map(v => v.trim());
+      const rawVals = (valMatch[1] ?? '').split(',').map(v => v.trim());
       for (let i = 0; i < rawCols.length; i++) {
-        cols.push(rawCols[i]);
+        const col = rawCols[i];
+        if (col === undefined) continue;
+        cols.push(col);
         const rv = rawVals[i];
-        if (rv.startsWith('@') && params && params[rv.slice(1)] !== undefined) {
+        if (rv !== undefined && rv.startsWith('@') && params && params[rv.slice(1)] !== undefined) {
           vals.push(params[rv.slice(1)]);
-        } else {
+        } else if (rv !== undefined) {
           vals.push(rv.replace(/^['"]|['"]$/g, ''));
+        } else {
+          vals.push(null);
         }
       }
     }
@@ -103,14 +107,14 @@ async function execSelect(adapter: An5SheetsAdapter, query: string, params?: Rec
     });
   }
 
-  const sheetName = m[2] || m[3] || m[4];
+  const sheetName = m[2] ?? m[3] ?? m[4] ?? '';
   const whereClause = m[5];
 
   const raw = await adapter.readRange(esc(sheetName) + '!A:ZZ');
   if (raw.length < 1) return [];
 
   const headers = raw[0] as string[];
-  const fieldList = m[1].trim();
+  const fieldList = (m[1] ?? '*').trim();
   const selectAll = fieldList === '*';
 
   const rows = raw.slice(1).map(row => {
@@ -119,18 +123,17 @@ async function execSelect(adapter: An5SheetsAdapter, query: string, params?: Rec
     return obj;
   });
 
-  if (!whereClause) return selectAll ? rows : rows.map(r => pickFields(r, fieldList, headers));
-  const { text, values } = substParams(query, params);
+  if (!whereClause) return selectAll ? rows : rows.map(r => pickFields(r, fieldList));
   // Extract just the WHERE part
   const whereParts = query.match(/WHERE\s+(.+)$/i);
-  const whereText = whereParts ? whereParts[1] : '';
+  const whereText = whereParts?.[1] ?? '';
   const { text: whereSubst, values: whereVals } = substParams(whereText, params);
 
   const result = rows.filter(r => matchRowSQL(r, whereSubst, whereVals));
-  return selectAll ? result : result.map(r => pickFields(r, fieldList, headers));
+  return selectAll ? result : result.map(r => pickFields(r, fieldList));
 }
 
-function pickFields(row: any, fieldList: string, headers: string[]): any {
+function pickFields(row: any, fieldList: string): any {
   const fields = fieldList.split(',').map(f => f.trim().replace(/[[\]]/g, ''));
   const obj: any = {};
   fields.forEach(f => { obj[f] = row[f]; });
@@ -141,7 +144,7 @@ async function execInsert(adapter: An5SheetsAdapter, query: string, params?: Rec
   const m = query.match(/INSERT\s+INTO\s+(?:'([^']+)'|"([^"]+)"|(\S+))\s*(.*)/i);
   if (!m) throw new Error('Invalid INSERT syntax');
 
-  const sheetName = m[1] || m[2] || m[3];
+  const sheetName = m[1] ?? m[2] ?? m[3] ?? '';
   const { cols, vals } = extractColsAndVals(query, params);
   if (cols.length === 0) throw new Error('Cannot extract columns from INSERT');
 
@@ -183,8 +186,8 @@ async function execUpdate(adapter: An5SheetsAdapter, query: string, params?: Rec
   const m = query.match(/UPDATE\s+(?:'([^']+)'|"([^"]+)"|(\S+))\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?$/i);
   if (!m) throw new Error('Invalid UPDATE syntax');
 
-  const sheetName = m[1] || m[2] || m[3];
-  const setClause = m[4];
+  const sheetName = m[1] ?? m[2] ?? m[3] ?? '';
+  const setClause = m[4] ?? '';
   const whereClause = m[5];
 
   // Parse SET clause
@@ -194,8 +197,8 @@ async function execUpdate(adapter: An5SheetsAdapter, query: string, params?: Rec
   for (const pair of setPairs) {
     const sm = pair.match(/^(\w+)\s*=\s*(.+)$/i);
     if (!sm) continue;
-    setFields.push(sm[1].replace(/[[\]]/g, ''));
-    const rv = sm[2].trim();
+    setFields.push((sm[1] ?? '').replace(/[[\]]/g, ''));
+    const rv = (sm[2] ?? '').trim();
     if (rv.startsWith('@') && params && params[rv.slice(1)] !== undefined) {
       setVals.push(params[rv.slice(1)]);
     } else {
@@ -216,7 +219,7 @@ async function execUpdate(adapter: An5SheetsAdapter, query: string, params?: Rec
   let count = 0;
   for (let i = 0; i < rows.length; i++) {
     const row: any = {};
-    headers.forEach((h, j) => { row[h] = rows[i][j] ?? null; });
+    headers.forEach((h, j) => { row[h] = rows[i]?.[j] ?? null; });
     row.__row = i + 2;
 
     if (whereClause && !matchRowSQL(row, whereSubst, whereVals)) continue;
@@ -240,7 +243,7 @@ async function execDelete(adapter: An5SheetsAdapter, query: string, params?: Rec
   const m = query.match(/DELETE\s+FROM\s+(?:'([^']+)'|"([^"]+)"|(\S+))\s*(?:WHERE\s+(.+))?$/i);
   if (!m) throw new Error('Invalid DELETE syntax');
 
-  const sheetName = m[1] || m[2] || m[3];
+  const sheetName = m[1] ?? m[2] ?? m[3] ?? '';
   const whereClause = m[4];
 
   const meta = await adapter.getSheetMeta(sheetName);
@@ -274,7 +277,7 @@ async function execDelete(adapter: An5SheetsAdapter, query: string, params?: Rec
   const toDelete: number[] = [];
   for (let i = 1; i < raw.length; i++) {
     const row: any = {};
-    headers.forEach((h, j) => { row[h] = raw[i][j] ?? null; });
+    headers.forEach((h, j) => { row[h] = raw[i]?.[j] ?? null; });
     if (matchRowSQL(row, whereSubst, whereVals)) {
       toDelete.push(i + 1);
     }

@@ -66,7 +66,9 @@ export class SheetsTableClient<T = any> {
     for (let i = 1; i < values.length; i++) {
       const row: Record<string, any> = { __row: i + 1 };
       for (let j = 0; j < headers.length; j++) {
-        row[headers[j]] = coerceCell(values[i][j], this.fields[headers[j]]);
+        const h = headers[j];
+        if (h === undefined) continue;
+        row[h] = coerceCell(values[i]?.[j], this.fields[h]);
       }
       rows.push(row);
     }
@@ -244,6 +246,7 @@ export class SheetsTableClient<T = any> {
     if (matching.length === 0) throw new Error('No record found matching where clause');
 
     const target = matching[0];
+    if (target === undefined) throw new Error('No record found matching where clause');
     const updated = { ...target, ...args.data as any, __row: target.__row };
     await this.adapter.writeRange(`${this.escSheetName}!A${target.__row}`, [
       this.rowToValues(updated, headers),
@@ -284,6 +287,7 @@ export class SheetsTableClient<T = any> {
     if (matching.length === 0) throw new Error('No record found matching where clause');
 
     const target = matching[0];
+    if (target === undefined) throw new Error('No record found matching where clause');
     const meta = await this.adapter.getSheetMeta(this.sheetName);
     if (!meta) throw new Error(`Sheet "${this.sheetName}" not found`);
     await this.deleteRowByIndex(target.__row, meta.sheetId);
@@ -438,14 +442,16 @@ export class SheetsTableClient<T = any> {
 
       let dot = 0, m1 = 0, m2 = 0;
       for (let i = 0; i < args.vector.length; i++) {
-        dot += args.vector[i] * vec[i];
-        m1 += args.vector[i] ** 2;
-        m2 += vec[i] ** 2;
+        const av = args.vector[i] ?? 0;
+        const bv = vec[i] ?? 0;
+        dot += av * bv;
+        m1 += av ** 2;
+        m2 += bv ** 2;
       }
       const cosine = m1 && m2 ? dot / (Math.sqrt(m1) * Math.sqrt(m2)) : 0;
       const dist = metric === 'cosine' ? 1 - cosine
         : metric === 'dot' ? -dot
-        : Math.sqrt(args.vector.reduce((s, v, i) => s + (v - vec[i]) ** 2, 0));
+        : Math.sqrt(args.vector.reduce((s, v, i) => s + (v - (vec[i] ?? 0)) ** 2, 0));
       scored.push({ row, dist });
     }
 
