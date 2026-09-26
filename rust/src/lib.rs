@@ -1,147 +1,48 @@
 //! AN5 adapters runtime for Rust.
-//! Dialect detection, identifier quoting, vector math and SQL helpers.
-//! Mirrors the Go / TypeScript adapter packages (`an5adapters/base`).
+//!
+//! Provides [`An5Adapter`] (connection + dialect) and [`TableClient`] (ORM CRUD)
+//! on top of `sqlx`, plus a `base` module with dialect-aware SQL building blocks.
+//! Mirrors the Go / TypeScript / Python adapter packages.
+//!
+//! ```no_run
+//! use an5_adapters::{An5Adapter, FindManyArgs};
+//! use serde_json::json;
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! // Register the drivers this binary needs (swap in `sqlx::postgres::any::DRIVER`
+//! // or `sqlx::mysql::any::DRIVER` and enable the matching cargo feature), then
+//! // hand the connection string to the adapter.
+//! sqlx::any::install_drivers(&[sqlx::sqlite::any::DRIVER])?;
+//! let db = An5Adapter::connect("sqlite:file:app.sqlite?mode=rwc").await?;
+//!
+//! // Dynamic access, the Rust equivalent of `db.user` in TypeScript.
+//! let users = db
+//!     .table("User")
+//!     .find_many(&FindManyArgs {
+//!         r#where: Some(json!({ "email": { "contains": "@example.com" } })),
+//!         take: 10,
+//!         ..Default::default()
+//!     })
+//!     .await?;
+//! # Ok(()) }
+//! ```
 
-use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+pub mod adapter;
+pub mod base;
 
-/// Supported database engines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dialect {
-    Mssql,
-    Postgres,
-    Sqlite,
-}
+pub use adapter::{
+    AggregateArgs, An5Adapter, CountArgs, CreateArgs, CreateManyArgs, DeleteManyArgs, FindManyArgs,
+    GroupByArgs, Result, RowMap, TableClient, UpdateArgs, UpdateManyArgs, UpsertArgs,
+    VectorSearchArgs, ViewClient,
+};
+pub use base::{
+    add_table_override, build_order_by, build_where, cosine_similarity, dot_product,
+    euclidean_distance, get_fields_for_model, get_model_to_table, get_relations_for_model,
+    resolve_table, set_adapter_metadata, vector_distance, AdapterMetadata, Dialect, RelationDef,
+    Where,
+};
 
-impl Dialect {
-    /// Detect dialect from a connection string.
-    pub fn detect(conn_str: &str) -> Self {
-        let l = conn_str.trim().to_lowercase();
-        if l.starts_with("postgres://")
-            || l.starts_with("postgresql://")
-            || l.contains("port=5432")
-        {
-            return Dialect::Postgres;
-        }
-        if l.starts_with("sqlite://")
-            || l.starts_with("sqlite:")
-            || l.starts_with("file:")
-            || l.ends_with(".db")
-            || l.ends_with(".sqlite")
-            || l.ends_with(".sqlite3")
-            || l == ":memory:"
-        {
-            return Dialect::Sqlite;
-        }
-        Dialect::Mssql
-    }
-
-    /// Quote a single identifier (column / table part).
-    pub fn quote_identifier(&self, name: &str) -> String {
-        let raw = strip_wrapping(strip_wrapping(name, "[", "]"), "\"", "\"");
-        match self {
-            Dialect::Postgres | Dialect::Sqlite => {
-                format!("\"{}\"", raw.replace('"', "\"\""))
-            }
-            Dialect::Mssql => format!("[{}]", raw.replace(']', "]]")),
-        }
-    }
-
-    /// Quote a possibly schema-qualified table name (`dbo.users`).
-    pub fn quote_table(&self, table: &str) -> String {
-        let t = table.trim();
-        if t.starts_with('[') || t.starts_with('"') {
-            return t.to_string();
-        }
-        t.split('.')
-            .map(|p| self.quote_identifier(p))
-            .collect::<Vec<_>>()
-            .join(".")
-    }
-
-    /// Positional placeholder: `$N` for Postgres, `?` otherwise.
-    pub fn placeholder(&self, n: usize) -> String {
-        match self {
-            Dialect::Postgres => format!("${}", n),
-            _ => "?".to_string(),
-        }
-    }
-}
-
-fn strip_wrapping<'a>(name: &'a str, left: &str, right: &str) -> &'a str {
-    if name.starts_with(left) && name.ends_with(right) && name.len() >= left.len() + right.len() {
-        &name[left.len()..name.len() - right.len()]
-    } else {
-        name
-    }
-}
-
-/// Cosine similarity between two vectors (1.0 = identical direction).
-pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0;
-    let mut m1 = 0.0;
-    let mut m2 = 0.0;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        m1 += a[i] * a[i];
-        m2 += b[i] * b[i];
-    }
-    if m1 == 0.0 || m2 == 0.0 {
-        return 0.0;
-    }
-    dot / (m1.sqrt() * m2.sqrt())
-}
-
-/// Euclidean distance between two vectors.
-pub fn euclidean_distance(a: &[f64], b: &[f64]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum::<f64>()
-        .sqrt()
-}
-
-/// Dot product between two vectors.
-pub fn dot_product(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-}
-
-/// Distance wrapper honouring AN5 metric names (`cosine` / `euclidean` / `dot`).
-pub fn vector_distance(a: &[f64], b: &[f64], metric: &str) -> f64 {
-    match metric.to_lowercase().as_str() {
-        "euclidean" => euclidean_distance(a, b),
-        "dot" => -dot_product(a, b),
-        _ => 1.0 - cosine_similarity(a, b),
-    }
-}
-
-// ─── Adapter metadata (injected by generated client) ─────────────────────────
-
-static MODEL_TO_TABLE: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
-
-fn metadata_store() -> &'static RwLock<HashMap<String, String>> {
-    MODEL_TO_TABLE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Inject model → table mapping from the generated client.
-pub fn set_adapter_metadata(map: HashMap<String, String>) {
-    if let Ok(mut store) = metadata_store().write() {
-        *store = map;
-    }
-}
-
-/// Look up a table name for a model alias.
-pub fn get_table_for_model(model: &str) -> Option<String> {
-    metadata_store()
-        .read()
-        .ok()
-        .and_then(|s| s.get(model).cloned())
-}
-
-/// Default connection string (DATABASE_URL or local MSSQL fallback).
+/// Default connection string: `DATABASE_URL` or a local MSSQL fallback.
 pub fn get_default_connection_string() -> String {
     std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         "Server=localhost;Database=master;Trusted_Connection=True;TrustServerCertificate=True;"
@@ -149,29 +50,26 @@ pub fn get_default_connection_string() -> String {
     })
 }
 
+/// Build an adapter using [`get_default_connection_string`].
+pub async fn create_an5_adapter(connection_string: Option<&str>) -> Result<An5Adapter> {
+    An5Adapter::connect(connection_string.unwrap_or(&get_default_connection_string())).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn detects_postgres() {
-        assert_eq!(
-            Dialect::detect("postgres://localhost/db"),
-            Dialect::Postgres
-        );
+    fn default_connection_string_falls_back_to_mssql() {
+        // DATABASE_URL may be set in CI; only assert the shape when it is not.
+        if std::env::var("DATABASE_URL").is_err() {
+            assert!(get_default_connection_string().starts_with("Server=localhost"));
+        }
     }
 
     #[test]
-    fn quotes_mssql_table() {
-        assert_eq!(
-            Dialect::Mssql.quote_table("dbo.users"),
-            "[dbo].[users]"
-        );
-    }
-
-    #[test]
-    fn cosine_identical_is_one() {
-        let v = vec![1.0, 0.0];
-        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-9);
+    fn exports_are_reachable() {
+        assert_eq!(Dialect::detect("sqlite::memory:"), Dialect::Sqlite);
+        assert!(!resolve_table("Whatever").is_empty());
     }
 }
