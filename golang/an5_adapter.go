@@ -120,6 +120,9 @@ func (a *An5Adapter) QueryRaw(ctx context.Context, query string, args ...interfa
 		}
 		results = append(results, m)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return results, nil
 }
 
