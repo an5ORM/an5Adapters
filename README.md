@@ -13,7 +13,7 @@ Standalone runtime database adapter and query engine for AN5 ORM. Provides conne
 - **Field Math Operators** — Atomic updates with `increment`, `decrement`, `multiply`, `divide`, `set`
 - **Vector Search** — Similarity search using pgvector (PostgreSQL), `VECTOR_DISTANCE` (MSSQL), or in-memory cosine/euclidean/dot similarity
 - **Real Transactions** — Interactive and callback transactions (`$transaction(async tx => ...)` and `$begin()/$commit()/$rollback()`)
-- **Cross-Language** — Unified API in TypeScript, Python, .NET (C#), and Golang
+- **Cross-Language** — Unified API in TypeScript, Python, .NET (C#), Golang, and Rust
 - **Google Sheets Database** — Use spreadsheets as a live database with full CRUD and SQL syntax support
 
 ---

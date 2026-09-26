@@ -1,7 +1,7 @@
 {
   "name": "@an5/adapters",
   "version": "0.2.6",
-  "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET, Go, and Google Sheets query execution.",
+  "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET, Go, Rust, and Google Sheets query execution.",
   "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -21,7 +21,8 @@
     "./typescript/*": "./dist/*",
     "./python": "./python/an5_adapter.py",
     "./dotnet": "./dotnet/An5Adapter.cs",
-    "./golang": "./golang/an5_adapter.go"
+    "./golang": "./golang/an5_adapter.go",
+    "./rust": "./rust/Cargo.toml"
   },
   "author": "an5ORM",
   "homepage": "https://github.com/an5ORM/an5",
@@ -37,7 +38,8 @@
     "python",
     "dotnet",
     "go",
-    "golang"
+    "golang",
+    "rust"
   ],
   "files": [
     "dist/**/*.{js,d.ts}",
@@ -45,6 +47,7 @@
     "python/**/*.py",
     "dotnet/**/*",
     "golang/**/*",
+    "rust/**/*",
     "README.md"
   ],
   "scripts": {
@@ -57,7 +60,8 @@
     "test:integration:live": "node test/live-db.integration.test.js",
     "test:python": "(python -m compileall python 2>&1 || python3 -m compileall python 2>&1)",
     "test:dotnet": "node scripts/dotnet-compile-check.js",
-    "test:go": "cd golang && go test ./..."
+    "test:go": "cd golang && go test ./...",
+    "test:rust": "node scripts/rust-compile-check.js"
   },
   "dependencies": {
     "googleapis": "^134.0.0",
