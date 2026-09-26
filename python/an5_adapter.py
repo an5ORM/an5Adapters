@@ -61,7 +61,7 @@ class An5Adapter:
     def execute_raw(self, query: str, *values) -> int:
         return self.execute(query, list(values))
 
-    def table(self, model_name: str) -> AdapterTableClient:
+    def table(self, model_name: str) -> AdapterTableClient[Any]:
         return AdapterTableClient(self, model_name)
 
     def view(self, view_name: str) -> ViewClient:

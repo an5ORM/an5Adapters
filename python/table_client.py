@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generic, List, Optional, TypeVar
 try:
     from .base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
 except ImportError:
@@ -206,7 +206,17 @@ def _append_update_set(set_parts: List[str], values: List[Any], col: str, val: A
     values.append(val)
 
 
-class AdapterTableClient:
+T = TypeVar("T")
+
+
+class AdapterTableClient(Generic[T]):
+    """Typed table client.
+
+    Bind a row type for ORM-standard autocomplete, e.g.
+    ``AdapterTableClient[UserRow]`` where ``UserRow`` is the generated
+    ``TypedDict`` describing the model's row shape (the runtime returns
+    plain dicts). Unparameterized ``AdapterTableClient`` behaves as before.
+    """
     def __init__(self, adapter: An5Adapter, model_name: str):
         self._adapter = adapter
         self._model = model_name
@@ -242,7 +252,7 @@ class AdapterTableClient:
         order_prefix = "" if order_sql else " ORDER BY (SELECT NULL)"
         return f"{order_prefix} OFFSET {skip} ROWS FETCH NEXT {take} ROWS ONLY"
 
-    def find_many(self, where=None, order_by=None, skip: int = 0, take: Optional[int] = None, select=None, include=None) -> List[Dict]:
+    def find_many(self, where=None, order_by=None, skip: int = 0, take: Optional[int] = None, select=None, include=None) -> List[T]:
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect)
         order_sql = _build_order_by(order_by, self._dialect)
@@ -269,11 +279,11 @@ class AdapterTableClient:
             rows = [_project_fields(r, select) for r in rows]
         return rows
 
-    def find_first(self, where=None, order_by=None, select=None, include=None) -> Optional[Dict]:
+    def find_first(self, where=None, order_by=None, select=None, include=None) -> Optional[T]:
         rows = self.find_many(where=where, order_by=order_by, take=1, select=select, include=include)
         return rows[0] if rows else None
 
-    def find_unique(self, where: Dict, select=None, include=None) -> Optional[Dict]:
+    def find_unique(self, where: Dict, select=None, include=None) -> Optional[T]:
         return self.find_first(where=where, select=select, include=include)
 
     def count(self, where=None) -> int:
@@ -285,7 +295,7 @@ class AdapterTableClient:
         rows = self._adapter.exec(query, list(params.values()))
         return int(rows[0]["cnt"]) if rows else 0
 
-    def create(self, data: Dict, include=None, select=None) -> Dict:
+    def create(self, data: Dict, include=None, select=None) -> T:
         id_field = next((f for f in self._fields if f.get("isId")), None)
         if id_field and id_field["name"] not in data:
             data = {**data, id_field["name"]: str(uuid.uuid4())}
@@ -335,7 +345,7 @@ class AdapterTableClient:
                     raise
         return {"count": count}
 
-    def update(self, where: Dict, data: Dict, include=None, select=None) -> Optional[Dict]:
+    def update(self, where: Dict, data: Dict, include=None, select=None) -> Optional[T]:
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect, "w_")
         data, relation_writes = _split_relation_writes(self._model, data)
@@ -398,7 +408,7 @@ class AdapterTableClient:
         count = self._adapter.execute(query, all_values)
         return {"count": count}
 
-    def delete(self, where: Dict) -> Optional[Dict]:
+    def delete(self, where: Dict) -> Optional[T]:
         existing = self.find_first(where=where)
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect)
@@ -415,7 +425,7 @@ class AdapterTableClient:
         count = self._adapter.execute(query, list(params.values()))
         return {"count": count}
 
-    def upsert(self, where: Dict, create: Dict, update: Dict) -> Dict:
+    def upsert(self, where: Dict, create: Dict, update: Dict) -> T:
         existing = self.find_first(where=where)
         if existing:
             return self.update(where=where, data=update) or existing
