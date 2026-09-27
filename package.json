@@ -47,7 +47,8 @@
     "python/**/*.py",
     "dotnet/**/*",
     "golang/**/*",
-    "rust/**/*",
+    "rust/Cargo.toml",
+    "rust/src/**/*",
     "README.md"
   ],
   "scripts": {

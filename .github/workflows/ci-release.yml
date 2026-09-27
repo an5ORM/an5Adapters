@@ -22,12 +22,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
       - name: Install Node dependencies
         run: npm install
       - name: Build TypeScript
         run: npm run build
       - name: Run Node tests
         run: npm test
+      - name: Compile-check Rust runtime
+        run: npm run test:rust
       - name: Build Python package
         run: |
           python -m pip install --upgrade pip build

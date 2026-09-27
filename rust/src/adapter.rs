@@ -10,12 +10,85 @@ use sqlx::{Any, AnyConnection, AnyPool, Row};
 use std::collections::HashMap;
 
 use crate::base::{
-    build_order_by, build_where, resolve_table, set_adapter_metadata, vector_distance,
-    AdapterMetadata, Dialect, RelationDef, Where,
+    build_order_by, build_where, get_fields_for_model, resolve_table, set_adapter_metadata,
+    vector_distance, AdapterMetadata, Dialect, RelationDef, Where,
 };
 
 /// A database row as a plain JSON object.
 pub type RowMap = Map<String, Value>;
+
+/// Generates an RFC 4122 version 4 UUID from the system entropy source.
+///
+/// Used to fill string primary keys that the schema marks as `@default(uuid())`
+/// so `create` works on engines without a server-side UUID default. Matches the
+/// TypeScript adapter's `generateUUID`.
+fn generate_uuid() -> String {
+    use std::io::Read;
+
+    let mut bytes = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(&mut bytes).is_err() {
+            // Fall through to the time-seeded fallback below.
+            bytes = [0u8; 16];
+        }
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        bytes[..16].copy_from_slice(&nanos.to_le_bytes()[..16]);
+    }
+
+    // Version 4, variant 1.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Fills in a string primary key with a generated UUID when the caller omitted
+/// it and the schema declares that column as a string.
+fn apply_generated_primary_key(model: &str, data: &mut RowMap) {
+    let Some(fields) = get_fields_for_model(model) else {
+        return;
+    };
+    let Some(fields) = fields.as_object() else {
+        return;
+    };
+
+    for (name, def) in fields {
+        let is_id = def
+            .get("isId")
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(|| name.eq_ignore_ascii_case("id"));
+        if !is_id || data.contains_key(name) {
+            continue;
+        }
+
+        let declared = def
+            .get("sql")
+            .or_else(|| def.get("ts"))
+            .or_else(|| def.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_string = matches!(
+            declared.split('(').next().unwrap_or("").trim(),
+            "string" | "uuid" | "uniqueidentifier" | "nvarchar" | "varchar" | "text" | "char"
+        );
+        if is_string {
+            data.insert(name.clone(), Value::String(generate_uuid()));
+        }
+    }
+}
 
 /// Result alias for adapter operations.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -496,6 +569,9 @@ impl TableClient {
         if data.is_empty() {
             return Err("create requires at least one field".into());
         }
+        let mut data = data.clone();
+        apply_generated_primary_key(&self.table_name, &mut data);
+        let data = &data;
         let (scalars, _relations) = split_relation_writes(&self.table_name, data);
 
         let mut cols: Vec<String> = Vec::new();
