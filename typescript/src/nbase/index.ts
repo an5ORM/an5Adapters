@@ -1,17 +1,14 @@
 /**
  * NBase connection-string and adapter configuration.
  *
- * An NBase instance can be declared on the adapter directly:
+ * NBase is configured through the connection string alone:
  *
- *   createAn5Adapter({
- *     connectionString: 'sqlserver://…',
- *     nbase: { url: 'http://localhost:1307' },
- *   })
+ *    createAn5Adapter({ connectionString: 'nbase://localhost:1307' })
  *
- * …or through a connection string, which keeps the same shape as the other
- * engines:
- *
- *   nbase://localhost:1307/vectors?token=abc
+ * Accepted forms are `nbase://host:port`, `nbase:host:port` and an explicit
+ * scheme, with optional `?token=…&timeoutMs=…&method=…` options. An adapter
+ * created this way is vector-only: it has no relational database, so a search
+ * returns the NBase hits instead of table rows.
  */
 import {
   NBaseVectorClient,
@@ -37,25 +34,49 @@ export interface NBaseAdapterConfig extends NBaseClientConfig {
   method?: 'hnsw' | 'clustered';
 }
 
-/** Parses `nbase://host:port/path?token=…` into client options. */
-export function parseNBaseConnectionString(connectionString: string): NBaseAdapterConfig {
-  const raw = connectionString.trim();
-  if (!/^nbase:\/\//i.test(raw)) {
-    throw new Error(`Not an NBase connection string: ${raw}`);
-  }
+/** Matches `nbase:`, `nbase://` and `nbase=http(s)://` at the start of a value. */
+const NBASE_PREFIX = /^nbase:(?:\/\/)?/i;
 
-  const withoutScheme = raw.replace(/^nbase:\/\//i, '');
-  const [beforeQuery, query] = withoutScheme.split('?');
-  const path = (beforeQuery ?? '').replace(/\/+$/, '');
-  const url = path ? `http://${path}` : 'http://localhost:1307';
+/** True when the whole connection string points at NBase. */
+export function isNBaseConnectionString(connectionString: string): boolean {
+  return NBASE_PREFIX.test(connectionString.trim());
+}
 
+/** Builds options from a URL and an optional query string. */
+function buildOptions(url: string, query?: string): NBaseAdapterConfig {
   const params = new URLSearchParams(query ?? '');
+  const trimmed = url.trim().replace(/\/+$/, '');
+  // `nbase://host:port` is shorthand for the same host over HTTP; an explicit
+  // scheme is used as-is so https deployments work.
+  const withScheme = !trimmed
+    ? 'http://localhost:1307'
+    : /^[a-z]+:\/\//i.test(trimmed)
+      ? trimmed
+      : `http://${trimmed}`;
   return {
-    url,
+    url: withScheme,
     ...(params.get('token') ? { token: params.get('token') as string } : {}),
     ...(params.get('timeoutMs') ? { timeoutMs: Number(params.get('timeoutMs')) } : {}),
     ...(params.get('idField') ? { idField: params.get('idField') as string } : {}),
+    ...(params.get('modelField') ? { modelField: params.get('modelField') as string } : {}),
+    ...(params.get('method') ? { method: params.get('method') as 'hnsw' | 'clustered' } : {}),
   };
+}
+
+/**
+ * Parses an NBase connection string.
+ *
+ * Accepts `nbase:http://host:port`, `nbase://host:port` and
+ * `nbase:host:port`, with optional `?token=…&timeoutMs=…` options.
+ */
+export function parseNBaseConnectionString(connectionString: string): NBaseAdapterConfig {
+  const raw = connectionString.trim();
+  if (!isNBaseConnectionString(raw)) {
+    throw new Error(`Not an NBase connection string: ${raw}`);
+  }
+
+  const [url, query] = raw.replace(NBASE_PREFIX, '').split('?');
+  return buildOptions(url ?? '', query);
 }
 
 /** Builds the vector id used to link a NBase vector back to a relational row. */

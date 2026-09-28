@@ -12,6 +12,8 @@ const {
   NBaseVectorClient,
   NBaseError,
   parseNBaseConnectionString,
+  isNBaseConnectionString,
+  extractEmbeddedNBase,
   createNBaseClient,
   buildVectorId,
   parseVectorId,
@@ -199,7 +201,79 @@ async function main() {
     assert.strictEqual(seen.authorization, 'Bearer secret');
   });
 
-  // ─── Adapter integration ──────────────────────────────────────────────────────
+  // ─── Adapter integration ───
+
+  /**
+   * A NBase-configured adapter gets its vector backend from the connection
+   * string. The fetch implementation is swapped in afterwards so the suite
+   * never opens a socket.
+   */
+  function attachNBase(db, fetchImpl, url = 'http://localhost:1307') {
+    const { parseNBaseConnectionString, createNBaseVectorClient } = require(path.join(root, 'dist', 'nbase', 'index.js'));
+    const config = { ...parseNBaseConnectionString(`nbase://${url.replace('http://', '')}`), fetchImpl };
+    db._nbaseConfig = config;
+    db._nbase = createNBaseVectorClient(config);
+  }
+
+  atest('a nbase:// connection string configures a vector-only adapter', async () => {
+    const { impl, calls } = stubFetch({
+      'GET /health': { body: { status: 'ok' } },
+      'POST /api/search': { body: { results: [{ id: 'User:u1', dist: 0.2 }] } },
+    });
+    const db = createAn5Adapter({ connectionString: 'nbase://localhost:1307' });
+    db._nbaseConfig = require(path.join(root, 'dist', 'nbase', 'index.js')).parseNBaseConnectionString('nbase://localhost:1307');
+    attachNBase(db, impl);
+    assert.ok(db.nbaseOnly, 'adapter should be marked vector-only');
+
+    await db.$connect();
+    assert.ok(calls.some((c) => c.key === 'GET /health'), 'connect should probe NBase');
+
+    const hits = await db.table('User').vectorSearch({ vector: [1, 2, 3], take: 1 });
+    assert.strictEqual(hits.length, 1);
+    assert.strictEqual(hits[0].distance, 0.2);
+    // With no relational table the id and metadata are the result.
+    assert.strictEqual(hits[0].an5Id, 'u1');
+    assert.strictEqual(hits[0].an5Model, 'User');
+  });
+
+  atest('a database connection string plus nbase:// runs search in NBase', async () => {
+    const { impl, calls } = stubFetch({
+      'POST /api/search': {
+        body: { results: [{ id: 'User:u1', dist: 0.2, metadata: { an5Id: 'u1', an5Model: 'User' } }] },
+      },
+    });
+    const { engine, execCalls } = fakeEngine((query, params) => {
+      const id = String(params?.nbase_id_0 ?? '');
+      return [{ id, email: 'alice@example.com', __an5_nbase_key: id }];
+    });
+    const db = createAn5Adapter({
+      connectionString: 'sqlserver://localhost:1433;database=test',
+      nbase: 'nbase://localhost:1307',
+      engine,
+    });
+    // Swap the fetch implementation for the stub.
+    const nbase = db.nbaseClient();
+    assert.ok(nbase, 'nbase:// string should configure the vector backend');
+    assert.strictEqual(nbase.config.url, 'http://localhost:1307');
+    db._nbase = Object.create(Object.getPrototypeOf(nbase.client));
+    Object.assign(db._nbase, nbase.client, { config: { ...nbase.client.config, fetchImpl: impl } });
+
+    const rows = await db.table('User').vectorSearch({ vector: [1, 0, 0], take: 1 });
+    assert.ok(calls.some((c) => c.key === 'POST /api/search'));
+    assert.ok(execCalls.length === 1, 'rows come from the database');
+    assert.strictEqual(rows[0].email, 'alice@example.com');
+    assert.strictEqual(rows[0].distance, 0.2);
+  });
+
+  atest('$nbaseHealth reports the endpoint and its state', async () => {
+    const { impl } = stubFetch({ 'GET /health': { body: { status: 'ok' } } });
+    const db = createAn5Adapter({ connectionString: 'nbase://localhost:1307' });
+    attachNBase(db, impl);
+    const health = await db.$nbaseHealth();
+    assert.strictEqual(health.connected, true);
+    assert.strictEqual(health.endpoint, 'http://localhost:1307');
+  });
+  // ─── Adapter integration ───
 
   console.log('\nAdapter integration:');
 
@@ -243,11 +317,8 @@ async function main() {
           return { id, email: id.endsWith('u1') ? 'alice@example.com' : 'bob@example.com', __an5_nbase_key: id };
         });
     });
-    const db = createAn5Adapter({
-      connectionString: 'sqlserver://localhost:1433;database=test',
-      engine,
-      nbase: { url: 'http://localhost:1307', fetchImpl: impl },
-    });
+    const db = createAn5Adapter({ connectionString: 'sqlserver://localhost:1433;database=test', engine });
+    attachNBase(db, impl);
     return { db, nbaseCalls: calls, execCalls };
   }
 
@@ -288,11 +359,8 @@ async function main() {
 
   await atest('a NBase outage falls back to the database instead of failing', async () => {
     const { engine, execCalls } = fakeEngine(() => []);
-    const db = createAn5Adapter({
-      connectionString: 'sqlserver://localhost:1433;database=test',
-      engine,
-      nbase: { url: 'http://down:1307', fetchImpl: async () => { throw new Error('ECONNREFUSED'); } },
-    });
+    const db = createAn5Adapter({ connectionString: 'sqlserver://localhost:1433;database=test', engine });
+    attachNBase(db, async () => { throw new Error('ECONNREFUSED'); }, 'http://down:1307');
 
     const rows = await db.table('User').vectorSearch({ vector: [1, 0], take: 3 });
     assert.ok(Array.isArray(rows));
@@ -313,11 +381,8 @@ async function main() {
       { id: 'u1', email: 'alice@example.com', embedding: JSON.stringify([1, 2]) },
       { id: 'u2', email: 'bob@example.com', embedding: JSON.stringify([3, 4]) },
     ]);
-    const db = createAn5Adapter({
-      connectionString: 'sqlserver://localhost:1433;database=test',
-      engine,
-      nbase: { url: 'http://localhost:1307', fetchImpl: impl },
-    });
+    const db = createAn5Adapter({ connectionString: 'sqlserver://localhost:1433;database=test', engine });
+    attachNBase(db, impl);
     const nbaseCalls = calls;
 
     const result = await db.table('User').indexVectorsInNBase({ vectorField: 'embedding' });

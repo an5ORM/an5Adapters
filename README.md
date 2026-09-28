@@ -58,47 +58,63 @@ tagged with its row id, and search results are hydrated from the table.
 
 ### Configure
 
+NBase is configured through the connection string, like every other backend:
+
 ```ts
 import { createAn5Adapter } from '@an5/adapters';
 
+const db = createAn5Adapter({ connectionString: 'nbase://localhost:1307' });
+await db.$connect(); // probes NBase
+```
+
+Accepted forms:
+
+| Form | Result |
+|------|--------|
+| `nbase://localhost:1307` | `http://localhost:1307` |
+| `nbase:localhost:1307` | `http://localhost:1307` |
+| `nbase:http://localhost:1307` | `http://localhost:1307` |
+| `nbase:https://vectors.example.com` | `https://vectors.example.com` |
+| `nbase://localhost:1307?token=t&timeoutMs=500&method=hnsw` | options applied |
+
+`?token`, `?timeoutMs`, `?method`, `?idField` and `?modelField` are read from the
+query string, and a path is kept as a base path for deployments behind a
+reverse proxy.
+
+This adapter is **vector-only**: it has no relational database, so a search
+returns the NBase hits — id, metadata and `distance` — instead of table rows.
+
+### Search
+
+With an `nbase://` connection string, search returns the hits themselves:
+
+```ts
+const hits = await db.table('Article').vectorSearch({ vector: queryEmbedding, take: 5 });
+// hits[0] = { id: 'Article:42', an5Id: '42', an5Model: 'Article', distance: 0.11 }
+```
+
+### Search rows from your own table
+
+To get real rows back, keep your database connection string and point it at the
+same NBase instance. NBase is still configured with a connection string, never a
+params object:
+
+```ts
 const db = createAn5Adapter({
   connectionString: 'sqlserver://localhost:1433;database=mydb',
-  nbase: { url: 'http://localhost:1307' },
+  nbase: 'nbase://localhost:1307',
 });
 
-await db.$connect();
-```
-
-A connection string works too, which keeps `DATABASE_URL` as the single knob:
-
-```ts
-const db = createAn5Adapter({ connectionString: 'nbase://localhost:1307' });
-```
-
-| Option | Default | Meaning |
-|--------|---------|---------|
-| `url` | — | NBase base URL, e.g. `http://localhost:1307` |
-| `token` | — | Bearer token, for deployments behind an auth proxy |
-| `timeoutMs` | `30000` | Per-request timeout |
-| `idField` | `an5Id` | Metadata key holding the relational row id |
-| `modelField` | `an5Model` | Metadata key holding the model name |
-| `method` | NBase default | Force `hnsw` or `clustered` |
-
-### Index and search
-
-```ts
-// Push the table's embedding column into NBase once.
 await db.table('Article').indexVectorsInNBase({ vectorField: 'embedding' });
 // → { indexed: 1200 }
 
-// Search returns real rows, in the same shape as the other engines.
-const hits = await db.table('Article').vectorSearch({
-  vector: queryEmbedding,
-  take: 5,
-  distanceMetric: 'cosine',
-});
+const hits = await db.table('Article').vectorSearch({ vector: queryEmbedding, take: 5 });
 // hits[0] = { id, title, ..., distance }
 ```
+
+Vectors are tagged with their row id, so a hit is hydrated from the table by
+that id and the result keeps the `{ ...row, distance }` shape the other engines
+return.
 
 ### Standalone client
 

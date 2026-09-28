@@ -3,11 +3,11 @@ export type Dialect = 'mssql' | 'postgres' | 'mysql' | 'sqlite' | 'googlesheets'
 export interface An5AdapterConfig {
   connectionString?: string;
   /**
-   * NBase (Neural Vector Database) instance used for vector search.
-   * When present, similarity search runs in NBase and the matching rows are
-   * read from the relational table.
+   * NBase (Neural Vector Database) endpoint, written as a connection string,
+   * e.g. `nbase://localhost:1307`. Attach it here when vector search should
+   * run in NBase while the rows stay in `connectionString`'s database.
    */
-  nbase?: import('../nbase').NBaseAdapterConfig;
+  nbase?: string;
   engine?: QueryEngine;
   db?: any;
   driver?: any;

@@ -7,7 +7,16 @@ import {
 } from './googlesheets';
 import { parseSheetsConnectionString } from './googlesheets/parseConnectionString';
 import type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
-import { NBaseError, buildVectorId, parseVectorId, type NBaseAdapterConfig, type NBaseVectorClient } from './nbase';
+import {
+  NBaseError,
+  buildVectorId,
+  parseVectorId,
+  isNBaseConnectionString,
+  parseNBaseConnectionString,
+  createNBaseVectorClient,
+  type NBaseAdapterConfig,
+  type NBaseVectorClient,
+} from './nbase';
 import { buildOrderBy, parseWhere, quote } from './base/sql';
 import {
   createAdapterProxy,
@@ -207,6 +216,7 @@ export class An5Adapter {
   sheetsAdapter: An5SheetsAdapter | null = null;
   private _nbase: NBaseVectorClient | null = null;
   private _nbaseConfig: NBaseAdapterConfig | null = null;
+  private _nbaseOnly = false;
 
   /**
    * Returns the NBase client for this adapter, if the project configured one.
@@ -216,22 +226,21 @@ export class An5Adapter {
   nbaseClient(): { client: NBaseVectorClient; config: NBaseAdapterConfig } | null {
     if (this._nbase && this._nbaseConfig) return { client: this._nbase, config: this._nbaseConfig };
 
-    let config = this._engineConfig?.nbase;
-    if (!config && typeof this._engineConfig?.connectionString === 'string') {
-      if (/^nbase:\/\//i.test(this._engineConfig.connectionString)) {
-        // Lazily required so a project without NBase never loads the module.
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        config = require('./nbase').parseNBaseConnectionString(this._engineConfig.connectionString);
-      }
-    }
-    if (!config) return null;
+    if (!this._nbaseConfig) return null;
+    const config = this._nbaseConfig;
 
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { createNBaseVectorClient } = require('./nbase');
     const client: NBaseVectorClient = createNBaseVectorClient(config);
     this._nbase = client;
     this._nbaseConfig = config;
     return { client, config };
+  }
+
+  /**
+   * True when the adapter only knows about NBase, so there is no relational
+   * database to read rows from.
+   */
+  get nbaseOnly(): boolean {
+    return this._nbaseOnly === true;
   }
 
   get dialect(): Dialect {
@@ -253,6 +262,21 @@ export class An5Adapter {
     // settings and anything else on the config are read from it later.
     this._engineConfig = adapterConfig as An5AdapterConfig;
 
+    // `nbase://host:port` as the connection string configures the vector store
+    // on its own: there is no relational database, so the adapter is
+    // vector-only. The same string passed as `nbase` keeps the database from
+    // `connectionString` as the source of rows.
+    const rawConnectionString = String(this._engineConfig.connectionString ?? '').trim();
+    if (isNBaseConnectionString(rawConnectionString)) {
+      this._nbaseConfig = parseNBaseConnectionString(rawConnectionString);
+      this._nbaseOnly = true;
+      return createAdapterProxy(this, (name) => this.table(name));
+    }
+    const attached = this._engineConfig.nbase;
+    if (attached && isNBaseConnectionString(attached)) {
+      this._nbaseConfig = parseNBaseConnectionString(attached);
+    }
+
     if ((adapterConfig as any).engine) {
       this._engine = (adapterConfig as any).engine;
       this._engineType = (this._engine?.dialect as any) || 'sqlite';
@@ -267,6 +291,7 @@ export class An5Adapter {
     }
 
     const cs = (adapterConfig.connectionString || '').trim();
+
     if (cs.startsWith('googlesheets://')) {
       this.sheetsAdapter = new An5SheetsAdapter(parseSheetsConnectionString(cs));
       return createAdapterProxy(this, (name) => this.table(name));
@@ -369,7 +394,33 @@ export class An5Adapter {
 
   async $connect(): Promise<void> {
     if (this.sheetsAdapter) return this.sheetsAdapter.$connect();
+    if (this._nbaseOnly) {
+      // NBase is stateless over HTTP, so there is nothing to open. Report the
+      // endpoint so a misconfiguration is obvious.
+      const config = this.nbaseClient()?.config;
+      if (config) await this.nbaseClient()!.client.health();
+      return;
+    }
     await (await this.requireEngine()).connect();
+  }
+
+  /**
+   * Health check for the configured NBase instance, or the database when the
+   * adapter has none.
+   */
+  async $nbaseHealth(): Promise<{ connected: boolean; endpoint?: string; error?: string }> {
+    const nbase = this.nbaseClient();
+    if (!nbase) return { connected: false, error: 'No NBase instance configured.' };
+    try {
+      const health = await nbase.client.health();
+      return { connected: health.status === 'ok', endpoint: nbase.config.url };
+    } catch (err) {
+      return {
+        connected: false,
+        endpoint: nbase.config.url,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 
   async $disconnect(): Promise<void> {
@@ -1159,6 +1210,37 @@ export class AdapterTableClient<T = any> {
     return hydrated;
   }
 
+  /**
+   * Vector search for an adapter configured with only an NBase connection
+   * string. The hit id and metadata are the result, since there is no
+   * relational row to hydrate.
+   */
+  private async searchViaNBaseOnly(
+    nbase: { client: NBaseVectorClient; config: NBaseAdapterConfig },
+    args: { vector: number[]; take?: number },
+    metric: 'cosine' | 'euclidean' | 'dot',
+    take: number,
+  ): Promise<Array<Record<string, unknown> & { distance: number }>> {
+    const { client, config } = nbase;
+    const idField = config.idField ?? 'an5Id';
+    const results = await client.search(args.vector, {
+      k: take,
+      distanceMetric: metric === 'euclidean' ? 'euclidean' : 'cosine',
+      includeMetadata: true,
+      ...(config.method ? { method: config.method } : {}),
+    });
+
+    return results.map((hit) => {
+      const metadata = { ...(hit.metadata ?? {}) };
+      if (metadata[idField] === undefined) {
+        const parsed = parseVectorId(hit.id);
+        if (parsed.id) metadata[idField] = parsed.id;
+        if (parsed.model) metadata[config.modelField ?? 'an5Model'] = parsed.model;
+      }
+      return { id: hit.id, ...metadata, distance: hit.dist };
+    });
+  }
+
   /** The primary key column registered for this model, falling back to `id`. */
   private primaryKeyColumn(): string {
     const fields = this.modelFields();
@@ -1189,7 +1271,15 @@ export class AdapterTableClient<T = any> {
   } = {}): Promise<{ indexed: number }> {
     const nbase = this.adapter.nbaseClient?.() ?? null;
     if (!nbase) {
-      throw new Error('No NBase instance configured. Pass `nbase: { url }` to createAn5Adapter.');
+      throw new Error(
+        'No NBase instance configured. Use a nbase:// connection string, e.g. createAn5Adapter({ connectionString: "nbase://localhost:1307" }).',
+      );
+    }
+    if (this.adapter.nbaseOnly) {
+      throw new Error(
+        'indexVectorsInNBase reads the vectors from a table, but this adapter was created with an nbase:// connection string and has no database. ' +
+          'Create the adapter with your database connection string to index, or add the vectors with the NBase client directly.',
+      );
     }
     const vectorField = args.vectorField || 'embedding';
     const batchSize = args.batchSize ?? 200;
@@ -1252,6 +1342,11 @@ export class AdapterTableClient<T = any> {
     const nbase = this.adapter.nbaseClient?.() ?? null;
     if (nbase) {
       try {
+        // With an NBase-only connection string there is no table to read rows
+        // from, so the hits are returned as the vector metadata itself.
+        if (this.adapter.nbaseOnly) {
+          return (await this.searchViaNBaseOnly(nbase, args, metric, take)) as (T & { distance: number })[];
+        }
         return await this.searchViaNBase(nbase, args, metric, take);
       } catch (err) {
         if (!(err instanceof NBaseError)) throw err;
