@@ -22,7 +22,8 @@
     "./python": "./python/an5_adapter.py",
     "./dotnet": "./dotnet/An5Adapter.cs",
     "./golang": "./golang/an5_adapter.go",
-    "./rust": "./rust/Cargo.toml"
+    "./rust": "./rust/Cargo.toml",
+    "./nbase": "./dist/nbase/index.js"
   },
   "author": "an5ORM",
   "homepage": "https://github.com/an5ORM/an5",
@@ -49,14 +50,15 @@
     "golang/**/*",
     "rust/Cargo.toml",
     "rust/src/**/*",
-    "README.md"
+    "README.md",
+    "typescript/src/nbase/**/*.ts"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "pretest": "npm run build",
     "prepack": "npm run build",
     "build:python": "(python -m build --outdir dist-py || python3 -m build --outdir dist-py)",
-    "test": "node test/unit.test.js && node test/package.test.js",
+    "test": "node test/unit.test.js && node test/package.test.js && node test/nbase.test.js",
     "test:package:smoke": "node scripts/package-smoke.js",
     "test:integration:live": "node test/live-db.integration.test.js",
     "test:python": "(python -m compileall python 2>&1 || python3 -m compileall python 2>&1)",

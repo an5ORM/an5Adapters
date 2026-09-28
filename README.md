@@ -11,7 +11,7 @@ Standalone runtime database adapter and query engine for AN5 ORM. Provides conne
 - **Query Builder & Dialects** — Dialect-aware SQL formatting for MSSQL, PostgreSQL, MySQL, and SQLite
 - **Aggregations & GroupBy** — Standard ORM aggregates (`_count`, `_sum`, `_avg`, `_min`, `_max`) and `groupBy`
 - **Field Math Operators** — Atomic updates with `increment`, `decrement`, `multiply`, `divide`, `set`
-- **Vector Search** — Similarity search using pgvector (PostgreSQL), `VECTOR_DISTANCE` (MSSQL), or in-memory cosine/euclidean/dot similarity
+- **Vector Search** — Similarity search using NBase, pgvector (PostgreSQL), `VECTOR_DISTANCE` (MSSQL), or in-memory cosine/euclidean/dot similarity
 - **Real Transactions** — Interactive and callback transactions (`$transaction(async tx => ...)` and `$begin()/$commit()/$rollback()`)
 - **Cross-Language** — Unified API in TypeScript, Python, .NET (C#), Golang, and Rust
 - **Google Sheets Database** — Use spreadsheets as a live database with full CRUD and SQL syntax support
@@ -45,6 +45,76 @@ dotnet add package An5Adapters
 ```
 
 ---
+
+## NBase — Neural Vector Database
+
+[NBase](https://github.com/N2FlowJS/nbase) is a partitioned vector database with
+HNSW, LSH and KNN indexing behind a REST API. an5 can run vector search there
+instead of loading every row into memory, which matters once a table holds
+millions of embeddings.
+
+The rows stay in your relational table: only the vectors move to NBase, each one
+tagged with its row id, and search results are hydrated from the table.
+
+### Configure
+
+```ts
+import { createAn5Adapter } from '@an5/adapters';
+
+const db = createAn5Adapter({
+  connectionString: 'sqlserver://localhost:1433;database=mydb',
+  nbase: { url: 'http://localhost:1307' },
+});
+
+await db.$connect();
+```
+
+A connection string works too, which keeps `DATABASE_URL` as the single knob:
+
+```ts
+const db = createAn5Adapter({ connectionString: 'nbase://localhost:1307' });
+```
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `url` | — | NBase base URL, e.g. `http://localhost:1307` |
+| `token` | — | Bearer token, for deployments behind an auth proxy |
+| `timeoutMs` | `30000` | Per-request timeout |
+| `idField` | `an5Id` | Metadata key holding the relational row id |
+| `modelField` | `an5Model` | Metadata key holding the model name |
+| `method` | NBase default | Force `hnsw` or `clustered` |
+
+### Index and search
+
+```ts
+// Push the table's embedding column into NBase once.
+await db.table('Article').indexVectorsInNBase({ vectorField: 'embedding' });
+// → { indexed: 1200 }
+
+// Search returns real rows, in the same shape as the other engines.
+const hits = await db.table('Article').vectorSearch({
+  vector: queryEmbedding,
+  take: 5,
+  distanceMetric: 'cosine',
+});
+// hits[0] = { id, title, ..., distance }
+```
+
+### Standalone client
+
+```ts
+import { createNBaseVectorClient } from '@an5/adapters/nbase';
+
+const nbase = createNBaseVectorClient({ url: 'http://localhost:1307' });
+await nbase.health();
+await nbase.addVectors([{ id: 'a:1', vector: [0.1, 0.2], metadata: { an5Id: '1' } }]);
+const { results } = await nbase.search([0.1, 0.2], { k: 5, distanceMetric: 'cosine' });
+```
+
+If NBase is unreachable, `vectorSearch` logs a warning and falls back to the
+database's native vector support, then to in-memory similarity, so an outage
+degrades performance rather than breaking queries.
+
 
 ## Usage
 

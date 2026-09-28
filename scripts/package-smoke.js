@@ -86,7 +86,7 @@ try {
       `  const g = require('@an5/adapters/googlesheets');`,
       `  ['An5SheetsAdapter','SheetsTableClient','createAn5SheetsAdapter','parseSheetsConnectionString'].forEach(n => assert.strictEqual(typeof g[n], 'function', 'missing ' + n));`,
       `});`,
-      `['mssql','postgres','mysql','sqlite','base','config'].forEach(sub => {`,
+      `['mssql','postgres','mysql','sqlite','base','config','nbase'].forEach(sub => {`,
       `  test('./' + sub + ' resolves', () => assert.ok(require('@an5/adapters/' + sub)));`,
       `});`,
       `test('packaged language adapter sources are present', () => {`,

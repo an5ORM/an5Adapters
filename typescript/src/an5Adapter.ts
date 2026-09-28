@@ -7,6 +7,7 @@ import {
 } from './googlesheets';
 import { parseSheetsConnectionString } from './googlesheets/parseConnectionString';
 import type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
+import { NBaseError, buildVectorId, parseVectorId, type NBaseAdapterConfig, type NBaseVectorClient } from './nbase';
 import { buildOrderBy, parseWhere, quote } from './base/sql';
 import {
   createAdapterProxy,
@@ -204,6 +205,34 @@ export class An5Adapter {
   private _engineType: 'postgres' | 'mysql' | 'sqlite' | 'mssql' | null = null;
   private _engineConfig: An5AdapterConfig | null = null;
   sheetsAdapter: An5SheetsAdapter | null = null;
+  private _nbase: NBaseVectorClient | null = null;
+  private _nbaseConfig: NBaseAdapterConfig | null = null;
+
+  /**
+   * Returns the NBase client for this adapter, if the project configured one.
+   * The connection string may also point straight at NBase, which keeps
+   * `DATABASE_URL=nbase://host:port` working on its own.
+   */
+  nbaseClient(): { client: NBaseVectorClient; config: NBaseAdapterConfig } | null {
+    if (this._nbase && this._nbaseConfig) return { client: this._nbase, config: this._nbaseConfig };
+
+    let config = this._engineConfig?.nbase;
+    if (!config && typeof this._engineConfig?.connectionString === 'string') {
+      if (/^nbase:\/\//i.test(this._engineConfig.connectionString)) {
+        // Lazily required so a project without NBase never loads the module.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        config = require('./nbase').parseNBaseConnectionString(this._engineConfig.connectionString);
+      }
+    }
+    if (!config) return null;
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { createNBaseVectorClient } = require('./nbase');
+    const client: NBaseVectorClient = createNBaseVectorClient(config);
+    this._nbase = client;
+    this._nbaseConfig = config;
+    return { client, config };
+  }
 
   get dialect(): Dialect {
     if (this.sheetsAdapter) return 'googlesheets';
@@ -219,6 +248,10 @@ export class An5Adapter {
       this.sheetsAdapter = new An5SheetsAdapter(adapterConfig);
       return createAdapterProxy(this, (name) => this.table(name));
     }
+
+    // Keep the config even when the caller supplies its own engine: the NBase
+    // settings and anything else on the config are read from it later.
+    this._engineConfig = adapterConfig as An5AdapterConfig;
 
     if ((adapterConfig as any).engine) {
       this._engine = (adapterConfig as any).engine;
@@ -1059,6 +1092,142 @@ export class AdapterTableClient<T = any> {
     return this.doExec(query, params);
   }
 
+  /**
+   * Runs similarity search in NBase and hydrates the matching rows from the
+   * relational table, keeping the `{ ...row, distance }` shape the other
+   * engines return.
+   */
+  private async searchViaNBase(
+    nbase: { client: NBaseVectorClient; config: NBaseAdapterConfig },
+    args: { vector: number[]; take?: number; where?: any },
+    metric: 'cosine' | 'euclidean' | 'dot',
+    take: number,
+  ): Promise<(T & { distance: number })[]> {
+    const { client, config } = nbase;
+    const idField = config.idField ?? 'an5Id';
+    const modelField = config.modelField ?? 'an5Model';
+
+    const results = await client.search(args.vector, {
+      k: take,
+      // NBase implements cosine and euclidean; a dot-product request falls back
+      // to cosine, which still orders the results sensibly.
+      distanceMetric: metric === 'euclidean' ? 'euclidean' : 'cosine',
+      includeMetadata: true,
+      ...(config.method ? { method: config.method } : {}),
+    });
+
+    // Map each hit back to its row id. Ids are written as `Model:id`, and the
+    // metadata key is honoured for projects that index vectors themselves.
+    const ids: string[] = [];
+    const distances = new Map<string, number>();
+    for (const hit of results) {
+      const fromMetadata = hit.metadata?.[idField];
+      const rawId = fromMetadata !== undefined && fromMetadata !== null
+        ? String(fromMetadata)
+        : parseVectorId(hit.id).id;
+      if (!rawId) continue;
+      const model = hit.metadata?.[modelField] ?? parseVectorId(hit.id).model;
+      ids.push(model === this.modelName ? rawId : `${model}:${rawId}`);
+      distances.set(ids[ids.length - 1] as string, hit.dist);
+    }
+    if (ids.length === 0) return [];
+
+    const pk = this.primaryKeyColumn();
+    const inList = ids.map((_, i) => `@nbase_id_${i}`).join(', ');
+    const idParams: Record<string, any> = {};
+    ids.forEach((id, i) => { idParams[`nbase_id_${i}`] = id; });
+    idParams.take = take;
+
+    const selectColumns = this.modelFields().map((f) => quote(f, this.dialect)).join(', ');
+    const columns = selectColumns ? `${selectColumns}, ${quote(pk, this.dialect)} AS __an5_nbase_key` : `${quote(pk, this.dialect)} AS __an5_nbase_key`;
+    const query = `SELECT ${columns} FROM ${this.tableName} WHERE ${quote(pk, this.dialect)} IN (${inList})`;
+
+    const rows = await this.adapter.exec<Record<string, any>>(query, idParams);
+    const byKey = new Map<string, Record<string, any>>();
+    for (const row of rows ?? []) {
+      byKey.set(String(row.__an5_nbase_key), row);
+    }
+
+    const hydrated: (T & { distance: number })[] = [];
+    for (const id of ids) {
+      const row = byKey.get(id);
+      if (!row) continue;
+      const { __an5_nbase_key, ...rest } = row;
+      hydrated.push({ ...(rest as T), distance: distances.get(id) ?? 0 } as T & { distance: number });
+      if (hydrated.length >= take) break;
+    }
+    return hydrated;
+  }
+
+  /** The primary key column registered for this model, falling back to `id`. */
+  private primaryKeyColumn(): string {
+    const fields = this.modelFields();
+    const marked = fields.find((f) => f === 'id');
+    return marked ?? fields[0] ?? 'id';
+  }
+
+  /** Scalar column names known for this model from the generated metadata. */
+  private modelFields(): string[] {
+    const fields = getFieldsForModel(this.modelName);
+    if (fields && typeof fields === 'object' && !Array.isArray(fields)) {
+      return Object.keys(fields as Record<string, unknown>);
+    }
+    return [];
+  }
+
+  /**
+   * Pushes a table's embedding column into NBase so it can be searched there.
+   *
+   * Each vector keeps the row id in its metadata, which is what lets
+   * `vectorSearch` return real rows instead of bare vector ids.
+   */
+  async indexVectorsInNBase(args: {
+    vectorField?: string;
+    where?: any;
+    take?: number;
+    batchSize?: number;
+  } = {}): Promise<{ indexed: number }> {
+    const nbase = this.adapter.nbaseClient?.() ?? null;
+    if (!nbase) {
+      throw new Error('No NBase instance configured. Pass `nbase: { url }` to createAn5Adapter.');
+    }
+    const vectorField = args.vectorField || 'embedding';
+    const batchSize = args.batchSize ?? 200;
+    const pk = this.primaryKeyColumn();
+    const rows = await this.findMany({ ...(args.where ? { where: args.where } : {}), ...(args.take ? { take: args.take } : {}) });
+
+    let indexed = 0;
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const batch = rows.slice(i, i + batchSize);
+      const vectors = batch
+        .map((row) => {
+          const raw = (row as Record<string, unknown>)[vectorField];
+          if (raw === undefined || raw === null) return null;
+          let vector: number[];
+          try {
+            vector = typeof raw === 'string' ? JSON.parse(raw) : (raw as number[]);
+          } catch {
+            return null;
+          }
+          if (!Array.isArray(vector) || vector.length === 0) return null;
+          return {
+            id: buildVectorId(this.modelName, String((row as Record<string, unknown>)[pk])),
+            vector,
+            metadata: {
+              [nbase.config.idField ?? 'an5Id']: String((row as Record<string, unknown>)[pk]),
+              [nbase.config.modelField ?? 'an5Model']: this.modelName,
+            },
+          };
+        })
+        .filter((v): v is NonNullable<typeof v> => v !== null);
+
+      if (vectors.length === 0) continue;
+      const result = await nbase.client.addVectors(vectors);
+      indexed += result.count;
+    }
+    return { indexed };
+  }
+
   async vectorSearch(args: {
     vector: number[];
     take?: number;
@@ -1077,6 +1246,20 @@ export class AdapterTableClient<T = any> {
     const vectorJson = JSON.stringify(args.vector);
     const col = quote(vectorField, this.dialect);
     const params: Record<string, any> = { query_vector: vectorJson };
+
+    // 0. NBase, when the project configured one: the vectors live in the vector
+    //    database, so the search never loads the table into memory.
+    const nbase = this.adapter.nbaseClient?.() ?? null;
+    if (nbase) {
+      try {
+        return await this.searchViaNBase(nbase, args, metric, take);
+      } catch (err) {
+        if (!(err instanceof NBaseError)) throw err;
+        // A NBase outage must not take vector search down with it; fall through
+        // to the database instead of failing the query.
+        console.warn(`[an5] NBase vector search unavailable (${err.message}); falling back to ${this.dialect}.`);
+      }
+    }
 
     // 1. Try native dialect execution
     if (this.dialect === 'postgres') {
