@@ -4,9 +4,9 @@ import json
 import uuid
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 try:
-    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
+    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
 except ImportError:
-    from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
+    from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
 
 # ─── Select / Include helpers ────────────────────────────────────────────────────────
 
@@ -242,13 +242,16 @@ class AdapterTableClient(Generic[T]):
 
     @property
     def _fields(self) -> List[Dict]:
-        fields = model_fields.get(self._model, [])
+        # Dùng resolver của metadata thay vì tra thẳng: client do generator sinh
+        # đặt tên bảng kiểu PascalCase còn metadata khoá kiểu camelCase, tra thẳng
+        # sẽ ra danh sách rỗng và âm thầm bỏ qua `isId` (không tự sinh khoá chính).
+        fields = get_fields_for_model(self._model)
         if isinstance(fields, dict):
             raise TypeError(
                 "AN5 Python metadata is out of date. Regenerate with @an5/orm >= 1.0.4 "
                 "so MODEL_FIELDS uses a list of field objects."
             )
-        return fields
+        return fields or []
 
     def _pagination(self, take: Optional[int], skip: int, order_sql: str) -> str:
         if take is None:

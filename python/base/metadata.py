@@ -25,11 +25,35 @@ def set_adapter_metadata(metadata: Dict[str, Any]) -> None:
                         "localKey": defn.get("localKey") or defn.get("local_key") or "",
                     }
 
+def resolve_model_key(model_name: str) -> str:
+    """Tên model trong metadata, chấp nhận khác kiểu viết hoa.
+
+    Client do generator sinh đăng ký bảng theo tên PascalCase (`CatalogType`)
+    trong khi metadata khoá theo camelCase/snake_case (`catalogType`,
+    `catalog_type`). Nếu tra thẳng, client sinh ra sẽ không tìm thấy cột nào và
+    im lặng bỏ qua `isId` — tức là không tự sinh khoá chính.
+    """
+    if not model_name:
+        return model_name
+    if model_name in model_to_table or model_name in model_fields:
+        return model_name
+    camel = model_name[0].lower() + model_name[1:]
+    if camel in model_to_table or camel in model_fields:
+        return camel
+    lower = model_name.lower()
+    if lower in model_to_table or lower in model_fields:
+        return lower
+    return model_name
+
+
 def get_relations_for_model(model_name: str) -> Dict[str, Dict[str, str]]:
-    return relation_map.get(model_name) or {}
+    return relation_map.get(model_name) or relation_map.get(resolve_model_key(model_name)) or {}
 
 def get_model_to_table() -> Dict[str, str]:
     return dict(model_to_table)
 
 def get_fields_for_model(model_name: str) -> Any:
+    key = resolve_model_key(model_name)
+    if key in model_fields:
+        return model_fields[key]
     return model_fields.get(model_name)

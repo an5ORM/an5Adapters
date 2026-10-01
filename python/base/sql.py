@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 from .dialects import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE
-from .metadata import model_to_table, model_fields
+from .metadata import model_to_table, model_fields, resolve_model_key
 
 # ─── Quoting ───────────────────────────────────────────────────────────────────────
 
@@ -152,14 +152,9 @@ def _build_order_by(order_by: Any, dialect: str) -> str:
 # ─── Table name resolution ─────────────────────────────────────────────────────────
 
 def _resolve_table(model_name: str) -> str:
-    if model_name in model_to_table:
-        return model_to_table[model_name]
-    camel = model_name[0].lower() + model_name[1:] if model_name else model_name
-    if camel in model_to_table:
-        return model_to_table[camel]
-    lower = model_name.lower()
-    if lower in model_to_table:
-        return model_to_table[lower]
+    key = resolve_model_key(model_name)
+    if key in model_to_table:
+        return model_to_table[key]
     return model_name
 
 
