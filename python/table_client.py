@@ -4,9 +4,9 @@ import json
 import uuid
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 try:
-    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
+    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
 except ImportError:
-    from base import DIALECT_MSSQL, DIALECT_POSTGRES, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
+    from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, model_fields, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
 
 # ─── Select / Include helpers ────────────────────────────────────────────────────────
 
@@ -179,7 +179,10 @@ def _to_non_negative_int(value: Any, fallback: int = 0) -> int:
 
 def _append_update_set(set_parts: List[str], values: List[Any], col: str, val: Any, dialect: str) -> None:
     quoted = _quote(col, dialect)
-    placeholder = "?" if dialect == DIALECT_MSSQL else "%s"
+    # Chỉ PostgreSQL dùng `%s`; MSSQL và SQLite đều dùng `?`. Ghi điều kiện theo
+    # "là Postgres hay không" thay vì "là MSSQL hay không" để dialect mới không
+    # bị rơi nhầm vào nhánh `%s` — nơi từng làm SQLite sinh SQL không parse được.
+    placeholder = "%s" if dialect == DIALECT_POSTGRES else "?"
     if isinstance(val, dict):
         if "increment" in val:
             set_parts.append(f"{quoted} = {quoted} + {placeholder}")
@@ -232,7 +235,10 @@ class AdapterTableClient(Generic[T]):
 
     @property
     def _nolock(self) -> str:
-        return "" if self._dialect == DIALECT_POSTGRES else " WITH (NOLOCK)"
+        # `WITH (NOLOCK)` là table hint của MSSQL. PostgreSQL không có, và SQLite
+        # không có cả khái niệm tương đương — đặt vào thì mọi câu SELECT sinh ra
+        # đều là SQL không hợp lệ, lỗi ngay ở câu đầu tiên.
+        return "" if self._dialect in (DIALECT_POSTGRES, DIALECT_SQLITE) else " WITH (NOLOCK)"
 
     @property
     def _fields(self) -> List[Dict]:
@@ -247,7 +253,9 @@ class AdapterTableClient(Generic[T]):
     def _pagination(self, take: Optional[int], skip: int, order_sql: str) -> str:
         if take is None:
             return ""
-        if self._dialect == DIALECT_POSTGRES:
+        if self._dialect in (DIALECT_POSTGRES, DIALECT_SQLITE):
+            # SQLite có `LIMIT ... OFFSET` giống PostgreSQL. Đi nhánh
+            # `OFFSET ... FETCH NEXT` sẽ ra SQL mà SQLite không hiểu.
             return f" LIMIT {take} OFFSET {skip}"
         order_prefix = "" if order_sql else " ORDER BY (SELECT NULL)"
         return f"{order_prefix} OFFSET {skip} ROWS FETCH NEXT {take} ROWS ONLY"
@@ -304,7 +312,7 @@ class AdapterTableClient(Generic[T]):
 
         cols = [k for k, v in data.items() if v is not None]
         values = [data[c] for c in cols]
-        placeholders = ", ".join(["?" if self._dialect == DIALECT_MSSQL else "%s"] * len(cols))
+        placeholders = ", ".join(["%s" if self._dialect == DIALECT_POSTGRES else "?"] * len(cols))
         col_list = ", ".join(_quote(c, self._dialect) for c in cols)
         query = f"INSERT INTO {self._table_sql} ({col_list}) VALUES ({placeholders})"
         self._adapter.execute(query, values)
@@ -490,7 +498,7 @@ class AdapterTableClient(Generic[T]):
             query += f" ORDER BY {by_cols}"
         if has_take or has_skip:
             final_skip = _to_non_negative_int(skip)
-            if self._dialect == DIALECT_POSTGRES:
+            if self._dialect in (DIALECT_POSTGRES, DIALECT_SQLITE):
                 if has_take:
                     query += f" LIMIT {_to_non_negative_int(take, 1)}"
                 query += f" OFFSET {final_skip}"
@@ -508,34 +516,37 @@ class AdapterTableClient(Generic[T]):
         where_sql = _parse_where(self._model, where, params, self._dialect)
 
         # 1. Primary path: Native database SQL vector query execution (MSSQL VECTOR_DISTANCE / Postgres pgvector)
-        try:
-            field_sql = _quote(vector_field, self._dialect)
-            if self._dialect == DIALECT_POSTGRES:
-                op = "<=>" if distance_metric == "cosine" else ("<->" if distance_metric == "euclidean" else "<#>")
-                query = f"SELECT *, ({field_sql} {op} %s::vector) AS distance FROM {self._table_sql}"
-                query_params = [vec_json] + list(params.values())
-                if where_sql:
-                    query += f" WHERE {field_sql} IS NOT NULL AND ({where_sql})"
+        #    SQLite không có phép toán vector nào, nên bỏ qua luôn: dựng rồi bắt lỗi
+        #    sẽ tốn công mà kết quả vẫn là đường in-memory ở bước 2.
+        native_rows = None
+        if self._dialect != DIALECT_SQLITE:
+            try:
+                field_sql = _quote(vector_field, self._dialect)
+                if self._dialect == DIALECT_POSTGRES:
+                    op = "<=>" if distance_metric == "cosine" else ("<->" if distance_metric == "euclidean" else "<#>")
+                    query = f"SELECT *, ({field_sql} {op} %s::vector) AS distance FROM {self._table_sql}"
+                    query_params = [vec_json] + list(params.values())
+                    if where_sql:
+                        query += f" WHERE {field_sql} IS NOT NULL AND ({where_sql})"
+                    else:
+                        query += f" WHERE {field_sql} IS NOT NULL"
+                    query += f" ORDER BY distance ASC LIMIT {take}"
                 else:
-                    query += f" WHERE {field_sql} IS NOT NULL"
-                query += f" ORDER BY distance ASC LIMIT {take}"
-            else:
-                placeholder = "?"
-                query = f"SELECT TOP ({take}) *, VECTOR_DISTANCE('{distance_metric}', CAST({field_sql} AS VECTOR({dim}, float32)), CAST({placeholder} AS VECTOR({dim}, float32))) AS distance FROM {self._table_sql}{self._nolock}"
-                query_params = [vec_json] + list(params.values())
-                if where_sql:
-                    query += f" WHERE {field_sql} IS NOT NULL AND ({where_sql})"
-                else:
-                    query += f" WHERE {field_sql} IS NOT NULL"
-                query += " ORDER BY distance ASC"
+                    placeholder = "?"
+                    query = f"SELECT TOP ({take}) *, VECTOR_DISTANCE('{distance_metric}', CAST({field_sql} AS VECTOR({dim}, float32)), CAST({placeholder} AS VECTOR({dim}, float32))) AS distance FROM {self._table_sql}{self._nolock}"
+                    query_params = [vec_json] + list(params.values())
+                    if where_sql:
+                        query += f" WHERE {field_sql} IS NOT NULL AND ({where_sql})"
+                    else:
+                        query += f" WHERE {field_sql} IS NOT NULL"
+                    query += " ORDER BY distance ASC"
 
-            native_rows = self._adapter.exec(query, query_params)
+                native_rows = self._adapter.exec(query, query_params)
 
-
-            if native_rows is not None:
-                return native_rows
-        except Exception:
-            pass
+                if native_rows is not None:
+                    return native_rows
+            except Exception:
+                pass
 
         # 2. Secondary fallback: In-memory similarity computation if DB engine lacks native vector extension
         rows = self.find_many(where=where)

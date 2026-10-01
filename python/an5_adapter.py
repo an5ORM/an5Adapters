@@ -3,14 +3,16 @@
 from typing import Dict, List, Optional, Any
 
 try:
-    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, detect_dialect, set_adapter_metadata
+    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, detect_dialect, set_adapter_metadata
     from .mssql import connect as connect_mssql
     from .postgres import connect as connect_postgres
+    from .sqlite import connect as connect_sqlite, is_memory as is_sqlite_memory
     from .table_client import AdapterTableClient, ViewClient
 except ImportError:
-    from base import DIALECT_MSSQL, DIALECT_POSTGRES, detect_dialect, set_adapter_metadata
+    from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, detect_dialect, set_adapter_metadata
     from mssql import connect as connect_mssql
     from postgres import connect as connect_postgres
+    from sqlite import connect as connect_sqlite, is_memory as is_sqlite_memory
     from table_client import AdapterTableClient, ViewClient
 
 # Backward-compatible aliases used by tests and older imports.
@@ -24,11 +26,36 @@ class An5Adapter:
     def __init__(self, connection_string: str):
         self._dialect = detect_dialect(connection_string)
         self._conn_str = connection_string
+        # Connection đang mở của `transaction()`, nếu có. Mọi lệnh trong callback
+        # phải dùng chính connection này, nếu không rollback sẽ quay lại một
+        # connection khác đã commit xong — tức là "đã báo lỗi nhưng dữ liệu vẫn còn".
+        self._txn_conn = None
+        # Connection giữ lâu cho DB trong bộ nhớ, vì `:memory:` biến mất khi mọi
+        # connection đóng lại.
+        self._conn = None
 
     def _connect(self):
         if self._dialect == DIALECT_POSTGRES:
             return connect_postgres(self._conn_str)
+        if self._dialect == DIALECT_SQLITE:
+            return connect_sqlite(self._conn_str)
         return connect_mssql(self._conn_str)
+
+    def _acquire(self):
+        """Trả về (connection, có_phải_do_mình_mở_để_tự_đóng_không)."""
+        if self._txn_conn is not None:
+            return self._txn_conn, False
+        if self._dialect == DIALECT_SQLITE and is_sqlite_memory(self._conn_str):
+            if self._conn is None:
+                self._conn = self._connect()
+            return self._conn, False
+        return self._connect(), True
+
+    def close(self):
+        """Đóng connection giữ lâu (chỉ có với DB trong bộ nhớ)."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     def _to_dicts(self, cursor, query: str) -> List[Dict]:
         if cursor.description:
@@ -38,22 +65,24 @@ class An5Adapter:
         return []
 
     def exec(self, query: str, params: Optional[List] = None) -> List[Dict]:
-        conn = self._connect()
+        conn, owned = self._acquire()
         try:
             cursor = conn.cursor()
             cursor.execute(query, params or [])
             return self._to_dicts(cursor, query)
         finally:
-            conn.close()
+            if owned:
+                conn.close()
 
     def execute(self, query: str, params: Optional[List] = None) -> int:
-        conn = self._connect()
+        conn, owned = self._acquire()
         try:
             cursor = conn.cursor()
             cursor.execute(query, params or [])
             return cursor.rowcount
         finally:
-            conn.close()
+            if owned:
+                conn.close()
 
     def query_raw(self, query: str, *values) -> List[Dict]:
         return self.exec(query, list(values))
@@ -68,6 +97,14 @@ class An5Adapter:
         return ViewClient(self, view_name)
 
     def query_proc(self, proc_name: str, params: Optional[List] = None) -> List[Dict]:
+        if self._dialect == DIALECT_SQLITE:
+            # SQLite không có stored procedure. Trước đây lệnh này rơi vào nhánh
+            # MSSQL và sinh ra `EXEC ...` — đó là SQL không hợp lệ, lỗi chỉ hiện ra
+            # lúc gọi tới stored procedure. Nói thẳng còn hơn đưa SQL sai.
+            raise NotImplementedError(
+                "SQLite has no stored procedures. Use the generated table client "
+                "(db.<model>.*) or db.exec() with a parameterised query."
+            )
         if self._dialect == DIALECT_POSTGRES:
             placeholders = ", ".join(["%s"] * len(params or []))
             sql = f"CALL {proc_name}({placeholders})" if placeholders else f"CALL {proc_name}()"
@@ -77,6 +114,11 @@ class An5Adapter:
         return self.exec(sql, params or [])
 
     def execute_proc(self, proc_name: str, params: Optional[List] = None) -> int:
+        if self._dialect == DIALECT_SQLITE:
+            raise NotImplementedError(
+                "SQLite has no stored procedures. Use the generated table client "
+                "(db.<model>.*) or db.execute() with a parameterised query."
+            )
         if self._dialect == DIALECT_POSTGRES:
             placeholders = ", ".join(["%s"] * len(params or []))
             sql = f"CALL {proc_name}({placeholders})" if placeholders else f"CALL {proc_name}()"
@@ -89,8 +131,22 @@ class An5Adapter:
         return self.table(model_name)
 
     def transaction(self, fn):
-        conn = self._connect()
-        conn.autocommit = False
+        if self._txn_conn is not None:
+            raise RuntimeError("Nested transaction() is not supported")
+        # DB trong bộ nhớ: phải dùng đúng connection đang giữ dữ liệu. Mở
+        # connection mới ở đây sẽ trỏ tới một DB rỗng khác — bảng vừa tạo biến
+        # mất và mọi câu trong transaction đều hỏng.
+        conn = self._conn if self._conn is not None else self._connect()
+        owned = self._conn is None
+        if self._dialect == DIALECT_SQLITE:
+            # `sqlite3.Connection` không có thuộc tính `autocommit`; nó điều khiển
+            # transaction bằng `isolation_level`. Provider mở ở `None` (autocommit),
+            # nên muốn transaction phải đặt lại `""` để sqlite3 mở BEGIN ngầm trước
+            # mỗi câu DML — khi đó `commit()`/`rollback()` mới có tác dụng.
+            conn.isolation_level = ""
+        else:
+            conn.autocommit = False
+        self._txn_conn = conn
         try:
             result = fn(self)
             conn.commit()
@@ -99,9 +155,13 @@ class An5Adapter:
             conn.rollback()
             raise
         finally:
+            self._txn_conn = None
             if self._dialect == DIALECT_POSTGRES:
                 conn.autocommit = True
-            conn.close()
+            elif self._dialect == DIALECT_SQLITE:
+                conn.isolation_level = None
+            if owned:
+                conn.close()
 
 def create_an5_adapter(connection_string: str) -> An5Adapter:
     return An5Adapter(connection_string)
@@ -113,6 +173,7 @@ __all__ = [
     "create_an5_adapter",
     "DIALECT_MSSQL",
     "DIALECT_POSTGRES",
+    "DIALECT_SQLITE",
     "_detect_dialect",
     "_parse_connection_string",
     "set_adapter_metadata",

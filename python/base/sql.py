@@ -163,10 +163,44 @@ def _resolve_table(model_name: str) -> str:
     return model_name
 
 
+def _split_qualified(t: str) -> List[str]:
+    """Tách `schema.table` mà không cắt nhầm dấu chấm nằm trong ngoặc.
+
+    Metadata do generator sinh ra luôn ở dạng MSSQL `[dbo].[users]`. Nếu chỉ
+    `split(".")` thì sẽ ra `['[dbo]', '[users]']` — đúng ở MSSQL, nhưng khi đưa
+    sang PostgreSQL/SQLite thì phải bỏ ngoặc cũ và bọc lại theo kiểu của dialect
+    đích, nếu không sẽ giữ nguyên `[dbo].[users]` và sinh ra tên bảng sai.
+    """
+    parts: List[str] = []
+    buf: List[str] = []
+    open_ch = ""
+    close_ch = ""
+    for ch in t:
+        if open_ch:
+            buf.append(ch)
+            if ch == close_ch:
+                open_ch = ""
+                close_ch = ""
+            continue
+        if ch in ("[", '"'):
+            open_ch, close_ch = ch, ("]" if ch == "[" else '"')
+            buf.append(ch)
+            continue
+        if ch == ".":
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf))
+    return [p for p in parts if p]
+
+
 def _quote_table(t: str, dialect: str) -> str:
-    if t.startswith("[") or t.startswith('"'):
-        return t
-    if "." in t:
-        return ".".join(_quote(p, dialect) for p in t.split("."))
-    return _quote(t, dialect)
+    # Không trả nguyên xi tên đã bọc `[...]`: kiểu bọc đó chỉ đúng ở MSSQL. Với
+    # dialect khác phải bóc ra rồi bọc lại, nếu không sẽ mang nốt dấu ngoặc của
+    # dialect cũ sang dialect mới.
+    parts = _split_qualified(str(t))
+    if not parts:
+        parts = [str(t)]
+    return ".".join(_quote(p, dialect) for p in parts)
 
