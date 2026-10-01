@@ -13,14 +13,22 @@ namespace An5Orm
         private readonly string _connectionString;
         private readonly int _commandTimeout;
 
+        // Same shape as MssqlEngine: while a transaction is open, statements
+        // have to run on its connection and carry its transaction, or they land
+        // outside it and commit/rollback do not cover them.
+        [ThreadStatic] private static Npgsql.NpgsqlConnection _txConn;
+        [ThreadStatic] private static Npgsql.NpgsqlTransaction _tx;
+
         public PostgresEngine(string connectionString, int commandTimeout)
         {
             _connectionString = connectionString;
             _commandTimeout = commandTimeout;
         }
 
-        private Npgsql.NpgsqlConnection OpenConnection()
+        private Npgsql.NpgsqlConnection OpenConnection(out bool isInTransaction)
         {
+            if (_txConn != null) { isInTransaction = true; return _txConn; }
+            isInTransaction = false;
             var conn = new Npgsql.NpgsqlConnection(_connectionString);
             conn.Open();
             return conn;
@@ -30,6 +38,7 @@ namespace An5Orm
             Npgsql.NpgsqlConnection conn, string sql, Dictionary<string, object> parameters)
         {
             var cmd = new Npgsql.NpgsqlCommand(sql, conn) { CommandTimeout = _commandTimeout };
+            if (_tx != null) cmd.Transaction = _tx;
             if (parameters != null)
             {
                 foreach (var kv in parameters)
@@ -44,48 +53,60 @@ namespace An5Orm
         public List<Dictionary<string, object>> QueryRaw(string sql, Dictionary<string, object> parameters)
         {
             var results = new List<Dictionary<string, object>>();
-            using var conn = OpenConnection();
-            using var cmd = BuildCommand(conn, sql, parameters);
-            using var reader = cmd.ExecuteReader();
-            while (reader.Read())
+            var conn = OpenConnection(out bool isTx);
+            try
             {
-                var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-                for (int i = 0; i < reader.FieldCount; i++)
+                using var cmd = BuildCommand(conn, sql, parameters);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
                 {
-                    row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                    var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                    for (int i = 0; i < reader.FieldCount; i++)
+                    {
+                        row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                    }
+                    results.Add(row);
                 }
-                results.Add(row);
             }
+            finally { if (!isTx) conn.Dispose(); }
             return results;
         }
 
         public List<T> QueryRaw<T>(string sql, Dictionary<string, object> parameters) where T : new()
         {
             var results = new List<T>();
-            using var conn = OpenConnection();
-            using var cmd = BuildCommand(conn, sql, parameters);
-            using var reader = cmd.ExecuteReader();
-            var props = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
-            while (reader.Read())
+            var conn = OpenConnection(out bool isTx);
+            try
             {
-                var item = new T();
-                foreach (var prop in props)
+                using var cmd = BuildCommand(conn, sql, parameters);
+                using var reader = cmd.ExecuteReader();
+                var props = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
+                while (reader.Read())
                 {
-                    if (!HasColumn(reader, prop.Name)) continue;
-                    var val = reader[prop.Name];
-                    if (val == DBNull.Value) continue;
-                    try { prop.SetValue(item, Convert.ChangeType(val, prop.PropertyType)); } catch { }
+                    var item = new T();
+                    foreach (var prop in props)
+                    {
+                        if (!HasColumn(reader, prop.Name)) continue;
+                        var val = reader[prop.Name];
+                        if (val == DBNull.Value) continue;
+                        try { prop.SetValue(item, Convert.ChangeType(val, prop.PropertyType)); } catch { }
+                    }
+                    results.Add(item);
                 }
-                results.Add(item);
             }
+            finally { if (!isTx) conn.Dispose(); }
             return results;
         }
 
         public int ExecuteRaw(string sql, Dictionary<string, object> parameters)
         {
-            using var conn = OpenConnection();
-            using var cmd = BuildCommand(conn, sql, parameters);
-            return cmd.ExecuteNonQuery();
+            var conn = OpenConnection(out bool isTx);
+            try
+            {
+                using var cmd = BuildCommand(conn, sql, parameters);
+                return cmd.ExecuteNonQuery();
+            }
+            finally { if (!isTx) conn.Dispose(); }
         }
 
         private static bool HasColumn(Npgsql.NpgsqlDataReader reader, string name)
@@ -97,9 +118,14 @@ namespace An5Orm
 
         public An5TransactionBase BeginTransaction()
         {
-            var conn = OpenConnection();
+            if (_txConn != null)
+                throw new InvalidOperationException("A transaction is already open on this thread.");
+            var conn = new Npgsql.NpgsqlConnection(_connectionString);
+            conn.Open();
             var tx = conn.BeginTransaction();
-            return new PostgresTransaction(conn, tx);
+            _txConn = conn;
+            _tx = tx;
+            return new PostgresTransaction(conn, tx, () => { _txConn = null; _tx = null; });
         }
     }
 
@@ -107,15 +133,17 @@ namespace An5Orm
     {
         private readonly Npgsql.NpgsqlConnection _conn;
         private readonly Npgsql.NpgsqlTransaction _tx;
+        private readonly Action _cleanup;
 
-        public PostgresTransaction(Npgsql.NpgsqlConnection conn, Npgsql.NpgsqlTransaction tx)
+        public PostgresTransaction(Npgsql.NpgsqlConnection conn, Npgsql.NpgsqlTransaction tx, Action cleanup)
         {
             _conn = conn;
             _tx = tx;
+            _cleanup = cleanup;
         }
 
-        public override void Commit() { _tx.Commit(); }
-        public override void Rollback() { _tx.Rollback(); }
-        public override void Dispose() { _tx.Dispose(); _conn.Dispose(); }
+        public override void Commit() { _tx.Commit(); _cleanup(); }
+        public override void Rollback() { _tx.Rollback(); _cleanup(); }
+        public override void Dispose() { _tx.Dispose(); _conn.Dispose(); _cleanup(); }
     }
 }

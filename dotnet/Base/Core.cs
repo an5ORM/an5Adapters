@@ -7,7 +7,8 @@ namespace An5Orm
 public enum Dialect
     {
         Mssql,
-        Postgres
+        Postgres,
+        Sqlite
     }
 
     // ─── Config ────────────────────────────────────────────────────────────────
@@ -39,6 +40,38 @@ public enum Dialect
         public abstract void Dispose();
     }
 
+    // ─── Connection scope ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A connection borrowed for the length of one operation, and whether the
+    /// caller still owns it.
+    ///
+    /// A statement issued while a transaction is open has to run on that
+    /// transaction's connection. Opening a second one is not merely wasteful: on
+    /// SQLite the open transaction holds a write lock, so the second connection
+    /// is refused with "database is locked", and on the server engines the write
+    /// silently lands outside the transaction, so commit and rollback do not
+    /// cover it. Each engine keeps the transaction connection and hands it back
+    /// through this scope while it is set.
+    /// </summary>
+    internal readonly struct ConnectionScope<T> : IDisposable where T : class
+    {
+        public T Connection { get; }
+
+        private readonly bool _owned;
+
+        internal ConnectionScope(T connection, bool owned)
+        {
+            Connection = connection;
+            _owned = owned;
+        }
+
+        public void Dispose()
+        {
+            if (_owned && Connection is IDisposable disposable) disposable.Dispose();
+        }
+    }
+
 // ─── Dialect detection ─────────────────────────────────────────────────────
 
     internal static class DialectDetector
@@ -46,6 +79,13 @@ public enum Dialect
         public static Dialect Detect(string connectionString)
         {
             var cs = (connectionString ?? "").Trim().ToLowerInvariant();
+            // SQLite first: `Data Source=app.db` and a bare file path would
+            // otherwise fall through, and a Postgres string never looks like
+            // any of these.
+            if (cs.StartsWith("sqlite:") || cs.StartsWith("file:") || cs == ":memory:"
+                || cs.Contains("data source=") || cs.Contains("datasource=")
+                || cs.EndsWith(".db") || cs.EndsWith(".sqlite") || cs.EndsWith(".sqlite3"))
+                return Dialect.Sqlite;
             if (cs.StartsWith("postgres://") || cs.StartsWith("postgresql://") || cs.Contains("host="))
                 return Dialect.Postgres;
             return Dialect.Mssql;
@@ -66,7 +106,7 @@ public enum Dialect
         public static string QuoteName(string name, Dialect dialect)
         {
             var raw = name ?? "";
-            if (dialect == Dialect.Postgres)
+            if (dialect == Dialect.Postgres || dialect == Dialect.Sqlite)
             {
                 var unwrapped = StripWrapping(StripWrapping(raw, "[", "]"), "\"", "\"");
                 return "\"" + unwrapped.Replace("\"", "\"\"") + "\"";

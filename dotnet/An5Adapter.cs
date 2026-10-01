@@ -25,6 +25,7 @@ namespace An5Orm
             _engine = DialectDetector.Detect(connectionString) switch
             {
                 Dialect.Postgres => new PostgresEngine(connectionString, commandTimeout),
+                Dialect.Sqlite => new SqliteEngine(connectionString, commandTimeout),
                 _ => new MssqlEngine(connectionString, commandTimeout)
             };
         }
@@ -44,8 +45,16 @@ namespace An5Orm
 
         // ── Stored Procedure Execution ────────────────────────────────────────
 
+        private void ThrowIfNoStoredProcedures()
+        {
+            if (Dialect == Dialect.Sqlite)
+                throw new NotSupportedException(
+                    "SQLite has no stored procedures. Run the statements directly with QueryRaw or ExecuteRaw.");
+        }
+
         public List<T> QueryProc<T>(string procName, Dictionary<string, object> parameters = null) where T : new()
         {
+            ThrowIfNoStoredProcedures();
             var paramList = new List<string>();
             if (parameters != null)
             {
@@ -62,6 +71,7 @@ namespace An5Orm
 
         public int ExecuteProc(string procName, Dictionary<string, object> parameters = null)
         {
+            ThrowIfNoStoredProcedures();
             var paramList = new List<string>();
             if (parameters != null)
             {
@@ -418,12 +428,27 @@ namespace An5Orm
 
         private string Nolock => _dialect == Dialect.Mssql ? " WITH (NOLOCK)" : "";
 
+        /// <summary>
+        /// True for the dialects that paginate with LIMIT/OFFSET rather than
+        /// OFFSET ... FETCH NEXT, and have no SELECT TOP.
+        /// </summary>
+        private bool UsesLimitOffset => _dialect == Dialect.Postgres || _dialect == Dialect.Sqlite;
+
         private string BuildPagination(string orderBy, int? skip, int? take)
         {
-            if (take == null) return "";
-            if (_dialect == Dialect.Postgres)
-                return $" LIMIT {take.Value} OFFSET {skip ?? 0}";
+            // A skip on its own still has to skip. OFFSET without FETCH NEXT is
+            // valid on MSSQL, and on the LIMIT/OFFSET dialects an unbounded page
+            // is LIMIT -1; without this, `skip` was silently discarded whenever
+            // `take` was null.
+            if (take == null && skip == null) return "";
+            if (UsesLimitOffset)
+            {
+                if (take == null) return $" LIMIT -1 OFFSET {skip.Value}";
+                if (skip == null) return $" LIMIT {take.Value}";
+                return $" LIMIT {take.Value} OFFSET {skip.Value}";
+            }
             var o = !string.IsNullOrEmpty(orderBy) ? $" ORDER BY {orderBy}" : " ORDER BY (SELECT NULL)";
+            if (take == null) return $"{o} OFFSET {skip.Value} ROWS";
             return $"{o} OFFSET {skip ?? 0} ROWS FETCH NEXT {take.Value} ROWS ONLY";
         }
 
@@ -432,17 +457,11 @@ namespace An5Orm
         {
             var sb = new StringBuilder($"SELECT * FROM {_tableName}{Nolock}");
             if (!string.IsNullOrEmpty(whereClause)) sb.Append($" WHERE {whereClause}");
-            if (take != null && _dialect == Dialect.Postgres)
-            {
-                if (!string.IsNullOrEmpty(orderBy)) sb.Append($" ORDER BY {orderBy}");
-                if (skip != null) sb.Append($" OFFSET {skip.Value} ROWS");
-                sb.Append($" LIMIT {take.Value}");
-            }
-            else
-            {
-                if (!string.IsNullOrEmpty(orderBy)) sb.Append($" ORDER BY {orderBy}");
-                sb.Append(BuildPagination(orderBy, skip, take));
-            }
+            if (!string.IsNullOrEmpty(orderBy)) sb.Append($" ORDER BY {orderBy}");
+            // LIMIT precedes OFFSET, and neither carries MSSQL's `ROWS` keyword.
+            // Postgres tolerates either order, SQLite does not: `OFFSET n LIMIT m`
+            // is a syntax error there.
+            sb.Append(BuildPagination(orderBy, skip, take));
             return _adapter.QueryRaw<T>(sb.ToString(), parameters);
         }
 
@@ -457,7 +476,7 @@ namespace An5Orm
 
             var cols = "*";
             var keys = ArgsHelper.SelectedFields(args?.Select);
-            var isPostgres = _dialect == Dialect.Postgres;
+            var usesLimitOffset = UsesLimitOffset;
 
             if (keys.Count > 0 && !ArgsHelper.HasRelationSelect(args?.Select, An5Metadata.GetRelationsForModel(_modelName)))
             {
@@ -468,7 +487,7 @@ namespace An5Orm
             string query;
             if (take != null && !hasSkip)
             {
-                if (!isPostgres)
+                if (!usesLimitOffset)
                 {
                     query = $"SELECT TOP ({take.Value}) {cols} FROM {_tableName}{Nolock}";
                     if (!string.IsNullOrEmpty(whereSql)) query += $" WHERE {whereSql}";
@@ -484,7 +503,7 @@ namespace An5Orm
             }
             else if (hasSkip)
             {
-                if (!isPostgres)
+                if (!usesLimitOffset)
                 {
                     query = $"SELECT {cols} FROM {_tableName}{Nolock}";
                     if (!string.IsNullOrEmpty(whereSql)) query += $" WHERE {whereSql}";
@@ -498,7 +517,7 @@ namespace An5Orm
                     if (!string.IsNullOrEmpty(whereSql)) query += $" WHERE {whereSql}";
                     if (!string.IsNullOrEmpty(orderSql)) query += $" {orderSql}";
                     if (take != null) query += $" LIMIT {take.Value}";
-                    else query += " LIMIT ALL";
+                    else query += _dialect == Dialect.Sqlite ? " LIMIT -1" : " LIMIT ALL";
                     query += $" OFFSET {skip.Value}";
                 }
             }
@@ -988,6 +1007,10 @@ namespace An5Orm
             string vectorField = "Embedding", string distanceMetric = "cosine")
         {
             // 1. Primary path: Native database SQL vector query execution (MSSQL VECTOR_DISTANCE / Postgres pgvector)
+            //    SQLite has no vector operator, so it is skipped outright: building the
+            //    statement only to have it rejected costs a round trip and lands on the
+            //    in-memory path below anyway.
+            if (_dialect != Dialect.Sqlite)
             try
             {
                 var dim = vector.Count;

@@ -62,7 +62,7 @@
     "test:package:smoke": "node scripts/package-smoke.js",
     "test:integration:live": "node test/live-db.integration.test.js",
     "test:python": "(python -m compileall python 2>&1 || python3 -m compileall python 2>&1)",
-    "test:dotnet": "node scripts/dotnet-compile-check.js",
+    "test:dotnet": "node scripts/dotnet-compile-check.js && node scripts/dotnet-sqlite-smoke.js",
     "test:go": "cd golang && go test ./...",
     "test:rust": "node scripts/rust-compile-check.js"
   },
