@@ -33,10 +33,22 @@ jobs:
         run: npm test
       - name: Compile-check Rust runtime
         run: npm run test:rust
+      - name: Smoke test SQLite against the checkout
+        run: python test/python/sqlite_smoke.py
       - name: Build Python package
         run: |
           python -m pip install --upgrade pip build
-          python -m build --outdir dist-py || true
+          python -m build --outdir dist-py
+      - name: Install the built wheel and smoke test again
+        # The checkout run above resolves imports from python/, so it cannot see
+        # a subpackage missing from the distribution. This installs the wheel and
+        # runs with that path removed, which is the only way to catch it.
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install --quiet dist-py/*.whl
+          /tmp/wheel-venv/bin/python -c "import an5_adapter, sqlite.provider"
+          sed -i '/sys.path.insert/d' test/python/sqlite_smoke.py
+          /tmp/wheel-venv/bin/python test/python/sqlite_smoke.py
 
   publish-npm:
     needs: test

@@ -1,12 +1,18 @@
 r"""Smoke test SQLite cho Python adapter.
 
-Chạy:  python test/python/sqlite_smoke.py     (từ E:\git\an5\an5Adapters)
+Chạy:  python test/python/sqlite_smoke.py     (từ thư mục gốc an5Adapters)
 
 Vì sao để ngoài `python/`: adapter phải độc lập, nên thư mục đó không được tham
 chiếu tới artifact do an5-generator sinh ra (có test chặn: unit.test.js
 "adapters do not depend on generated an5-client artifacts"). Metadata ở đây là
 bản sao cố ý, mô phỏng đúng hình dạng generator sinh ra — tên bảng có schema
 prefix và cờ `isId` — để bắt được lỗi về placeholder/schema/transaction.
+
+Script tự thêm `python/` vào sys.path nên chạy được ngay từ checkout, không cần
+cài trước. Khi đã cài package (ví dụ CI cài wheel), import vẫn resolve từ bản
+cài đặt — nên chạy bằng cả hai cách là kiểm tra cả lỗi đóng gói: nếu wheel thiếu
+subpackage `sqlite`, chỉ `PYTHONPATH` mới che được, và CI cũng cần chạy
+không có `PYTHONPATH` để bắt đúng trường hợp đó.
 """
 
 import json
@@ -14,7 +20,9 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+# `python/` là gốc package (pyproject đặt package-dir = {"" = "python"}), nên đây
+# mới là thư mục chứa `an5_adapter.py` — thêm `an5Adapters/` sẽ không import được.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python"))
 
 from an5_adapter import create_an5_adapter  # noqa: E402
 from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, set_adapter_metadata  # noqa: E402
