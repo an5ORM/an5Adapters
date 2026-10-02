@@ -14,6 +14,9 @@ installed. Once the package is installed (CI installs a wheel, say), the imports
 resolve from the installation instead — running it both ways also checks the
 packaging: a wheel missing the `sqlite` subpackage is only hidden by `PYTHONPATH`,
 and CI therefore has to run once without `PYTHONPATH` to catch exactly that.
+
+The `label` values below are deliberately non-ASCII so the round trip through
+SQLite is exercised, not just ASCII text. an5:allow-non-english-file
 """
 
 import json

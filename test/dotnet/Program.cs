@@ -11,7 +11,7 @@ using An5Orm;
 // same source the compile-check uses, not a copy.
 //
 // The NameVi values are deliberately non-ASCII so the round trip through SQLite is
-// exercised, not just ASCII text.
+// exercised, not just ASCII text. an5:allow-non-english-file
 
 public class CatalogType
 {

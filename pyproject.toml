@@ -23,9 +23,9 @@ dependencies = [
 [tool.setuptools]
 package-dir = {"" = "python"}
 py-modules = ["an5_adapter", "table_client"]
-# `sqlite` phải có ở đây, nếu không nó bị bỏ khỏi gói cài đặt: bản build chỉ đóng
-# gói liệt kê tường minh, nên `import sqlite.provider` sẽ hỏng ở máy đã cài
-# trong khi vẫn chạy được khi bạn cài kiểu editable từ checkout.
+# `sqlite` has to be listed here, or it is dropped from the installed package: the
+# build only closes over the packages named explicitly, so `import sqlite.provider`
+# breaks on a machine that installed the wheel while it still works from a checkout.
 packages = ["base", "mssql", "postgres", "sqlite"]
 
 [tool.pyright]
