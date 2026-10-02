@@ -26,12 +26,12 @@ def set_adapter_metadata(metadata: Dict[str, Any]) -> None:
                     }
 
 def resolve_model_key(model_name: str) -> str:
-    """Tên model trong metadata, chấp nhận khác kiểu viết hoa.
+    """The model name in the metadata, accepting a different capitalisation.
 
-    Client do generator sinh đăng ký bảng theo tên PascalCase (`CatalogType`)
-    trong khi metadata khoá theo camelCase/snake_case (`catalogType`,
-    `catalog_type`). Nếu tra thẳng, client sinh ra sẽ không tìm thấy cột nào và
-    im lặng bỏ qua `isId` — tức là không tự sinh khoá chính.
+    The generated client registers tables under their PascalCase name
+    (`CatalogType`) while the metadata keys them camelCase/snake_case
+    (`catalogType`, `catalog_type`). A plain lookup would find no columns at all
+    and silently skip `isId` — that is, never generate the primary key.
     """
     if not model_name:
         return model_name

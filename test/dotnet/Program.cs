@@ -4,11 +4,14 @@ using System.IO;
 using System.Linq;
 using An5Orm;
 
-// Smoke test SQLite cho .NET adapter.
+// SQLite smoke test for the .NET adapter.
 //
-// Chạy qua scripts/dotnet-sqlite-smoke.js, vì package npm chỉ ship file .cs
-// thô nên test dựng project tạm từ đúng những file đó — cùng nguồn với
-// compile-check, không phải bản sao.
+// Run through scripts/dotnet-sqlite-smoke.js: the npm package ships only the raw
+// .cs files, so the test builds a temporary project from exactly those files — the
+// same source the compile-check uses, not a copy.
+//
+// The NameVi values are deliberately non-ASCII so the round trip through SQLite is
+// exercised, not just ASCII text.
 
 public class CatalogType
 {
@@ -154,7 +157,7 @@ internal static class Program
         {
             Console.WriteLine("  ok   rollback path threw");
         }
-        Check("rollback hiệu lực", table.FindUnique("t10", "Id"), null);
+        Check("rollback took effect", table.FindUnique("t10", "Id"), null);
     }
 
     private static void StoredProcedures(An5Adapter adapter)

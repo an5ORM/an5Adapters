@@ -179,9 +179,10 @@ def _to_non_negative_int(value: Any, fallback: int = 0) -> int:
 
 def _append_update_set(set_parts: List[str], values: List[Any], col: str, val: Any, dialect: str) -> None:
     quoted = _quote(col, dialect)
-    # Chỉ PostgreSQL dùng `%s`; MSSQL và SQLite đều dùng `?`. Ghi điều kiện theo
-    # "là Postgres hay không" thay vì "là MSSQL hay không" để dialect mới không
-    # bị rơi nhầm vào nhánh `%s` — nơi từng làm SQLite sinh SQL không parse được.
+    # Only PostgreSQL uses `%s`; MSSQL and SQLite both use `?`. The condition is
+    # written as "is it Postgres" rather than "is it MSSQL" so a new dialect cannot
+    # fall into the `%s` branch by default — which once made SQLite generate SQL it
+    # could not parse.
     placeholder = "%s" if dialect == DIALECT_POSTGRES else "?"
     if isinstance(val, dict):
         if "increment" in val:
@@ -235,16 +236,17 @@ class AdapterTableClient(Generic[T]):
 
     @property
     def _nolock(self) -> str:
-        # `WITH (NOLOCK)` là table hint của MSSQL. PostgreSQL không có, và SQLite
-        # không có cả khái niệm tương đương — đặt vào thì mọi câu SELECT sinh ra
-        # đều là SQL không hợp lệ, lỗi ngay ở câu đầu tiên.
+        # `WITH (NOLOCK)` is an MSSQL table hint. PostgreSQL has none and SQLite
+        # has no equivalent concept at all — leaving it in makes every generated
+        # SELECT invalid SQL, failing on the first one.
         return "" if self._dialect in (DIALECT_POSTGRES, DIALECT_SQLITE) else " WITH (NOLOCK)"
 
     @property
     def _fields(self) -> List[Dict]:
-        # Dùng resolver của metadata thay vì tra thẳng: client do generator sinh
-        # đặt tên bảng kiểu PascalCase còn metadata khoá kiểu camelCase, tra thẳng
-        # sẽ ra danh sách rỗng và âm thầm bỏ qua `isId` (không tự sinh khoá chính).
+        # Uses the metadata resolver instead of a plain lookup: the generated
+        # client names tables in PascalCase while the metadata keys them in
+        # camelCase, so a plain lookup yields an empty list and silently skips
+        # `isId` (never generating the primary key).
         fields = get_fields_for_model(self._model)
         if isinstance(fields, dict):
             raise TypeError(
@@ -257,8 +259,8 @@ class AdapterTableClient(Generic[T]):
         if take is None:
             return ""
         if self._dialect in (DIALECT_POSTGRES, DIALECT_SQLITE):
-            # SQLite có `LIMIT ... OFFSET` giống PostgreSQL. Đi nhánh
-            # `OFFSET ... FETCH NEXT` sẽ ra SQL mà SQLite không hiểu.
+            # SQLite has `LIMIT ... OFFSET` like PostgreSQL. Taking the
+            # `OFFSET ... FETCH NEXT` branch produces SQL SQLite does not understand.
             return f" LIMIT {take} OFFSET {skip}"
         order_prefix = "" if order_sql else " ORDER BY (SELECT NULL)"
         return f"{order_prefix} OFFSET {skip} ROWS FETCH NEXT {take} ROWS ONLY"
@@ -519,8 +521,9 @@ class AdapterTableClient(Generic[T]):
         where_sql = _parse_where(self._model, where, params, self._dialect)
 
         # 1. Primary path: Native database SQL vector query execution (MSSQL VECTOR_DISTANCE / Postgres pgvector)
-        #    SQLite không có phép toán vector nào, nên bỏ qua luôn: dựng rồi bắt lỗi
-        #    sẽ tốn công mà kết quả vẫn là đường in-memory ở bước 2.
+        #    SQLite has no vector operators at all, so skip it entirely: building
+        #    the SQL and catching the error would cost work and still end up on the
+        #    in-memory path in step 2.
         native_rows = None
         if self._dialect != DIALECT_SQLITE:
             try:

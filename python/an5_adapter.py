@@ -26,12 +26,13 @@ class An5Adapter:
     def __init__(self, connection_string: str):
         self._dialect = detect_dialect(connection_string)
         self._conn_str = connection_string
-        # Connection đang mở của `transaction()`, nếu có. Mọi lệnh trong callback
-        # phải dùng chính connection này, nếu không rollback sẽ quay lại một
-        # connection khác đã commit xong — tức là "đã báo lỗi nhưng dữ liệu vẫn còn".
+        # The open connection of `transaction()`, when there is one. Every
+        # statement in the callback has to use this very connection, otherwise a
+        # rollback returns to a different, already committed connection — that
+        # is "the error was raised but the data is still there".
         self._txn_conn = None
-        # Connection giữ lâu cho DB trong bộ nhớ, vì `:memory:` biến mất khi mọi
-        # connection đóng lại.
+        # Long-lived connection for in-memory databases, because `:memory:` is
+        # gone as soon as every connection is closed.
         self._conn = None
 
     def _connect(self):
@@ -42,7 +43,7 @@ class An5Adapter:
         return connect_mssql(self._conn_str)
 
     def _acquire(self):
-        """Trả về (connection, có_phải_do_mình_mở_để_tự_đóng_không)."""
+        """Returns (connection, whether we opened it and must close it)."""
         if self._txn_conn is not None:
             return self._txn_conn, False
         if self._dialect == DIALECT_SQLITE and is_sqlite_memory(self._conn_str):
@@ -52,7 +53,7 @@ class An5Adapter:
         return self._connect(), True
 
     def close(self):
-        """Đóng connection giữ lâu (chỉ có với DB trong bộ nhớ)."""
+        """Closes the long-lived connection (in-memory databases only)."""
         if self._conn is not None:
             self._conn.close()
             self._conn = None
@@ -98,9 +99,10 @@ class An5Adapter:
 
     def query_proc(self, proc_name: str, params: Optional[List] = None) -> List[Dict]:
         if self._dialect == DIALECT_SQLITE:
-            # SQLite không có stored procedure. Trước đây lệnh này rơi vào nhánh
-            # MSSQL và sinh ra `EXEC ...` — đó là SQL không hợp lệ, lỗi chỉ hiện ra
-            # lúc gọi tới stored procedure. Nói thẳng còn hơn đưa SQL sai.
+            # SQLite has no stored procedures. This used to fall through to the
+            # MSSQL branch and generate `EXEC ...`, which is not valid SQL, and
+            # the error only surfaced at the call. Saying so beats sending wrong
+            # SQL.
             raise NotImplementedError(
                 "SQLite has no stored procedures. Use the generated table client "
                 "(db.<model>.*) or db.exec() with a parameterised query."
@@ -133,16 +135,18 @@ class An5Adapter:
     def transaction(self, fn):
         if self._txn_conn is not None:
             raise RuntimeError("Nested transaction() is not supported")
-        # DB trong bộ nhớ: phải dùng đúng connection đang giữ dữ liệu. Mở
-        # connection mới ở đây sẽ trỏ tới một DB rỗng khác — bảng vừa tạo biến
-        # mất và mọi câu trong transaction đều hỏng.
+        # In-memory database: the connection holding the data has to be reused.
+        # Opening a new one here points at a different, empty database — the
+        # table just created disappears and every statement in the transaction
+        # fails.
         conn = self._conn if self._conn is not None else self._connect()
         owned = self._conn is None
         if self._dialect == DIALECT_SQLITE:
-            # `sqlite3.Connection` không có thuộc tính `autocommit`; nó điều khiển
-            # transaction bằng `isolation_level`. Provider mở ở `None` (autocommit),
-            # nên muốn transaction phải đặt lại `""` để sqlite3 mở BEGIN ngầm trước
-            # mỗi câu DML — khi đó `commit()`/`rollback()` mới có tác dụng.
+            # `sqlite3.Connection` has no `autocommit` attribute; transactions
+            # are driven by `isolation_level`. The provider opens at `None`
+            # (autocommit), so to get a transaction it has to be set back to `""`
+            # and sqlite3 opens an implicit BEGIN before each DML statement —
+            # only then do `commit()`/`rollback()` do anything.
             conn.isolation_level = ""
         else:
             conn.autocommit = False

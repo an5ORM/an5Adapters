@@ -7,6 +7,15 @@ import {
 } from './googlesheets';
 import { parseSheetsConnectionString } from './googlesheets/parseConnectionString';
 import type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
+
+/**
+ * File extensions that mean SQLite when a connection string has no scheme.
+ *
+ * `.sqlite3` is here as well as in `@an5/orm`'s `detectProvider`, because the ORM
+ * validates field types and writes the DDL from the provider this file picks: if the
+ * two lists differed, a `.sqlite3` file would be pushed as SQL Server DDL.
+ */
+const SQLITE_FILE_SUFFIXES = ['.sqlite', '.sqlite3', '.db'];
 import {
   NBaseError,
   buildVectorId,
@@ -290,19 +299,27 @@ export class An5Adapter {
       return createAdapterProxy(this, (name) => this.table(name));
     }
 
+    // Lower-cased for the dialect test only; the connection string itself keeps its
+    // case for the driver. A URI scheme is case-insensitive, and `@an5/orm` reads the
+    // provider the same way to validate field types and write DDL — if the two
+    // disagreed, a schema would be checked against one database and run on another.
     const cs = (adapterConfig.connectionString || '').trim();
+    const forDialect = cs.toLowerCase();
 
-    if (cs.startsWith('googlesheets://')) {
+    if (forDialect.startsWith('googlesheets://')) {
       this.sheetsAdapter = new An5SheetsAdapter(parseSheetsConnectionString(cs));
       return createAdapterProxy(this, (name) => this.table(name));
     }
 
     this._engineConfig = adapterConfig;
-    if (cs.startsWith('postgres://') || cs.startsWith('postgresql://')) {
+    if (forDialect.startsWith('postgres://') || forDialect.startsWith('postgresql://')) {
       this._engineType = 'postgres';
-    } else if (cs.startsWith('mysql://') || cs.startsWith('mariadb://')) {
+    } else if (forDialect.startsWith('mysql://') || forDialect.startsWith('mariadb://')) {
       this._engineType = 'mysql';
-    } else if (cs.startsWith('sqlite://') || cs.endsWith('.sqlite') || cs.endsWith('.db')) {
+    } else if (
+      forDialect.startsWith('sqlite://')
+      || SQLITE_FILE_SUFFIXES.some((suffix) => forDialect.endsWith(suffix))
+    ) {
       this._engineType = 'sqlite';
     } else {
       this._engineType = 'mssql';

@@ -206,8 +206,11 @@ test('TypeScript adapter supports PostgreSQL dialect', () => {
   assertIncludes(typesContent, "'postgres'");
   assertIncludes(postgresContent, 'class PostgresEngine');
   assertIncludes(mssqlContent, 'class MssqlEngine');
-  assertIncludes(content, "cs.startsWith('postgres://')");
-  assertIncludes(content, "cs.startsWith('postgresql://')");
+  // The scheme test runs on a lower-cased copy, so the check reads `forDialect`.
+  // `@an5/orm` reads the provider the same way and the two must agree.
+  assertIncludes(content, "forDialect = cs.toLowerCase()");
+  assertIncludes(content, "forDialect.startsWith('postgres://')");
+  assertIncludes(content, "forDialect.startsWith('postgresql://')");
   assertIncludes(postgresContent, "require('pg')");
   assertIncludes(postgresContent, '$${idx}');
 });

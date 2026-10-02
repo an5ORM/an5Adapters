@@ -159,12 +159,13 @@ def _resolve_table(model_name: str) -> str:
 
 
 def _split_qualified(t: str) -> List[str]:
-    """Tách `schema.table` mà không cắt nhầm dấu chấm nằm trong ngoặc.
+    """Splits `schema.table` without cutting a dot that sits inside brackets.
 
-    Metadata do generator sinh ra luôn ở dạng MSSQL `[dbo].[users]`. Nếu chỉ
-    `split(".")` thì sẽ ra `['[dbo]', '[users]']` — đúng ở MSSQL, nhưng khi đưa
-    sang PostgreSQL/SQLite thì phải bỏ ngoặc cũ và bọc lại theo kiểu của dialect
-    đích, nếu không sẽ giữ nguyên `[dbo].[users]` và sinh ra tên bảng sai.
+    The generated metadata is always MSSQL-shaped: `[dbo].[users]`. A plain
+    `split(".")` yields `['[dbo]', '[users]']` — right for MSSQL, but moving to
+    PostgreSQL/SQLite means stripping the old brackets and re-quoting for the
+    target dialect, otherwise `[dbo].[users]` stays as-is and the table name
+    comes out wrong.
     """
     parts: List[str] = []
     buf: List[str] = []
@@ -191,9 +192,9 @@ def _split_qualified(t: str) -> List[str]:
 
 
 def _quote_table(t: str, dialect: str) -> str:
-    # Không trả nguyên xi tên đã bọc `[...]`: kiểu bọc đó chỉ đúng ở MSSQL. Với
-    # dialect khác phải bóc ra rồi bọc lại, nếu không sẽ mang nốt dấu ngoặc của
-    # dialect cũ sang dialect mới.
+    # Never return an already bracketed `[...]` name as-is: that quoting is only
+    # correct on MSSQL. Other dialects have to strip it and re-quote, or the
+    # previous dialect's brackets follow the name into the new dialect.
     parts = _split_qualified(str(t))
     if not parts:
         parts = [str(t)]

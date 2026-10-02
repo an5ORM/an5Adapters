@@ -1,31 +1,33 @@
-"""SQLite provider — dùng `sqlite3` của thư viện chuẩn, không cần driver cài thêm.
+"""SQLite provider — uses the standard library `sqlite3`, no extra driver needed.
 
-Vì sao thêm: `base/dialects.py` đã có `DIALECT_SQLITE` và tầng SQL đã dùng
-placeholder `?` cho nó, nhưng không có provider nên `An5Adapter._connect` rơi về
-MSSQL — mọi câu lệnh sẽ mang `WITH (NOLOCK)` và `OFFSET ... FETCH NEXT`, SQL mà
-SQLite không hiểu, lỗi ngay ở câu đầu tiên.
+Why it exists: `base/dialects.py` already had `DIALECT_SQLITE` and the SQL layer
+already used the `?` placeholder for it, but with no provider `An5Adapter._connect`
+fell back to MSSQL — every statement then carried `WITH (NOLOCK)` and
+`OFFSET ... FETCH NEXT`, SQL SQLite does not understand, failing on the first one.
 
-Vì sao `isolation_level=None`: `sqlite3` mặc định mở transaction ngầm trước mỗi
-câu DML, nên `An5Adapter.exec` (mở/đóng connection mỗi lần) sẽ để lại transaction
-treo. `None` = autocommit, khớp với `pyodbc.connect(..., autocommit=True)` của
-provider MSSQL.
+Why `isolation_level=None`: `sqlite3` opens an implicit transaction before each DML
+statement by default, so `An5Adapter.exec` (which opens/closes a connection per
+statement) would leave transactions dangling. `None` means autocommit, matching the
+`pyodbc.connect(..., autocommit=True)` of the MSSQL provider.
 """
 
 import sqlite3
 from typing import Tuple
 
-# Bỏ wrapper `sqlite:`/`sqlite://`/`sqlite:///` trước, rồi mới xét `file:`.
-# Phải làm hai bước vì `sqlite:file::memory:?cache=shared` chỉ thành URI sau khi
-# đã cắt `sqlite:`; xét một lượt sẽ bỏ sót nên sqlite3 tưởng đó là tên tệp.
+# Strip the `sqlite:`/`sqlite://`/`sqlite:///` wrapper first, only then look for
+# `file:`. Two steps are required because `sqlite:file::memory:?cache=shared` only
+# becomes a URI after `sqlite:` is removed; checking once would miss it and sqlite3
+# would treat the whole thing as a file name.
 _SQLITE_PREFIXES = ("sqlite:///", "sqlite://", "sqlite:")
 _FILE_PREFIX = "file:"
 
 
 def parse_connection_string(url: str) -> Tuple[str, bool]:
-    """Trả về (đường dẫn/URI, có_phải_URI_cho_sqlite3).
+    """Returns (path/URI, whether sqlite3 should treat it as a URI).
 
-    Chấp nhận `sqlite:///path`, `sqlite:path`, `file:path` và đường dẫn trần.
-    `file:` phải trả về URI=True vì sqlite3 chỉ hiểu URI khi bật cờ `uri`.
+    Accepts `sqlite:///path`, `sqlite:path`, `file:path` and a bare path.
+    `file:` has to return URI=True because sqlite3 only understands URIs with the
+    `uri` flag on.
     """
     value = (url or "").strip()
     for prefix in _SQLITE_PREFIXES:
@@ -34,27 +36,28 @@ def parse_connection_string(url: str) -> Tuple[str, bool]:
             break
     is_uri = value.lower().startswith(_FILE_PREFIX)
     if is_uri:
-        # Giữ nguyên tiền tố `file:` — sqlite3 cần đúng dạng URI đầy đủ
-        # (`file::memory:?cache=shared`), cắt đi thành `:memory:?cache=shared`
-        # sẽ không còn là URI hợp lệ.
+        # Keep the `file:` prefix — sqlite3 needs the full URI form
+        # (`file::memory:?cache=shared`); without it `:memory:?cache=shared` is
+        # no longer a valid URI.
         return value, True
-    # `sqlite:///C:/path/x.db` trên Windows rơi còn `/C:/path/x.db`; dấu gạch chéo
-    # đầu là của URL chứ không phải của đường dẫn.
+    # On Windows `sqlite:///C:/path/x.db` is left with `/C:/path/x.db`; the
+    # leading slash belongs to the URL, not to the path.
     if len(value) > 2 and value[0] == "/" and value[2] == ":":
         value = value[1:]
     return value or ":memory:", is_uri
 
 
 def is_memory(url: str) -> bool:
-    """DB trong bộ nhớ không sống sót qua lúc mọi connection đóng.
+    """An in-memory database does not survive every connection being closed.
 
-    Adapter mở/đóng connection cho từng lệnh, nên với `:memory:` thuần dữ liệu sẽ
-    biến mất sau câu đầu tiên (bảng vừa CREATE không còn). Vì vậy loại này phải được
-    adapter giữ một connection lâu dài; xem `An5Adapter._acquire`.
+    The adapter opens/closes a connection per statement, so with a plain
+    `:memory:` the data disappears after the first statement (the table just
+    CREATEd is gone). The adapter therefore has to hold a long-lived connection
+    for this case; see `An5Adapter._acquire`.
     """
     target, is_uri = parse_connection_string(url)
     if is_uri:
-        # `parse_connection_string` trả về URI nguyên vẹn (kèm `file:`).
+        # `parse_connection_string` returns the whole URI (with `file:`).
         inner = target[len(_FILE_PREFIX):] if target.lower().startswith(_FILE_PREFIX) else target
         return inner.startswith(":memory:") or "mode=memory" in inner
     return target == ":memory:"
@@ -67,8 +70,9 @@ def connect(connection_string: str):
         check_same_thread=False,
         uri=is_uri,
     )
-    # `NOLOCK` không tồn tại; bật WAL để nhiều reader/ghi song song không khoá
-    # chặn nhau, và bật foreign_keys vì SQLite mặc định TẮT (khác mọi dialect khác).
+    # There is no `NOLOCK`; WAL lets concurrent readers and writers proceed
+    # without blocking each other, and foreign_keys is enabled because SQLite
+    # defaults it OFF (unlike every other dialect).
     conn.execute("PRAGMA foreign_keys = ON")
     if not is_memory(connection_string) and not is_uri:
         conn.execute("PRAGMA journal_mode = WAL")

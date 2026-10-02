@@ -1,18 +1,19 @@
-r"""Smoke test SQLite cho Python adapter.
+r"""SQLite smoke test for the Python adapter.
 
-Chạy:  python test/python/sqlite_smoke.py     (từ thư mục gốc an5Adapters)
+Run: python test/python/sqlite_smoke.py     (from the an5Adapters root)
 
-Vì sao để ngoài `python/`: adapter phải độc lập, nên thư mục đó không được tham
-chiếu tới artifact do an5-generator sinh ra (có test chặn: unit.test.js
-"adapters do not depend on generated an5-client artifacts"). Metadata ở đây là
-bản sao cố ý, mô phỏng đúng hình dạng generator sinh ra — tên bảng có schema
-prefix và cờ `isId` — để bắt được lỗi về placeholder/schema/transaction.
+Why it lives outside `python/`: the adapter has to stay independent, so that
+directory may not reference artifacts produced by an5-generator (a test enforces
+this: unit.test.js "adapters do not depend on generated an5-client artifacts"). The
+metadata here is a deliberate copy that mirrors the exact shape the generator
+produces — schema-prefixed table names and the `isId` flag — so that bugs around
+placeholders, schema and transactions are caught.
 
-Script tự thêm `python/` vào sys.path nên chạy được ngay từ checkout, không cần
-cài trước. Khi đã cài package (ví dụ CI cài wheel), import vẫn resolve từ bản
-cài đặt — nên chạy bằng cả hai cách là kiểm tra cả lỗi đóng gói: nếu wheel thiếu
-subpackage `sqlite`, chỉ `PYTHONPATH` mới che được, và CI cũng cần chạy
-không có `PYTHONPATH` để bắt đúng trường hợp đó.
+The script adds `python/` to sys.path, so it runs from a checkout with nothing
+installed. Once the package is installed (CI installs a wheel, say), the imports
+resolve from the installation instead — running it both ways also checks the
+packaging: a wheel missing the `sqlite` subpackage is only hidden by `PYTHONPATH`,
+and CI therefore has to run once without `PYTHONPATH` to catch exactly that.
 """
 
 import json
@@ -20,8 +21,9 @@ import os
 import sys
 import tempfile
 
-# `python/` là gốc package (pyproject đặt package-dir = {"" = "python"}), nên đây
-# mới là thư mục chứa `an5_adapter.py` — thêm `an5Adapters/` sẽ không import được.
+# `python/` is the package root (pyproject sets package-dir = {"" = "python"}), so
+# this is the directory holding `an5_adapter.py` — adding `an5Adapters/` would not
+# import.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python"))
 
 from an5_adapter import create_an5_adapter  # noqa: E402
@@ -131,20 +133,20 @@ def test_crud(url, label):
     try:
         db.catalog.create(data={"id": "c3", "catalogTypeId": "t1", "key": "XF", "label": "trùng",
                                 "position": 9, "enabled": True, "updatedAt": "x"})
-        check("unique chặn trùng", "không chặn", "IntegrityError")
+        check("unique blocks a duplicate", "no error raised", "IntegrityError")
     except Exception as exc:
-        check("unique chặn trùng", type(exc).__name__, "IntegrityError")
+        check("unique blocks a duplicate", type(exc).__name__, "IntegrityError")
 
     try:
         db.query_proc("some_proc")
-        check("query_proc", "không ném lỗi", "NotImplementedError")
+        check("query_proc", "no error raised", "NotImplementedError")
     except NotImplementedError:
         check("query_proc", "NotImplementedError", "NotImplementedError")
 
     def boom(_db):
         db.catalog.create(data={"id": "c9", "catalogTypeId": "t1", "key": "RB", "label": "x",
                                 "position": 0, "enabled": True, "updatedAt": "x"})
-        raise RuntimeError("co loi")
+        raise RuntimeError("boom")
 
     try:
         db.transaction(boom)
@@ -157,7 +159,7 @@ def test_crud(url, label):
 
     try:
         db.transaction(lambda _d: db.transaction(lambda _d: None))
-        check("nested transaction", "không ném lỗi", "RuntimeError")
+        check("nested transaction", "no error raised", "RuntimeError")
     except RuntimeError:
         check("nested transaction", "RuntimeError", "RuntimeError")
 
