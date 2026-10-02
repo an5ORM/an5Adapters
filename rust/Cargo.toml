@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "Standalone database adapter runtime for AN5 ORM (Rust) — connection handling, dialect-aware CRUD, aggregates and vector search."
 license = "MIT"
+repository = "https://github.com/an5ORM/an5Adapters"
+homepage = "https://github.com/an5ORM/an5Adapters/tree/main/rust"
+documentation = "https://docs.rs/an5-adapters"
+readme = "README.md"
+keywords = ["orm", "sql", "database", "postgres", "sqlx"]
+categories = ["database", "database-implementations"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

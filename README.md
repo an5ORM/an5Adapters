@@ -44,6 +44,12 @@ dotnet add package An5Adapters
 # Included in the npm package under golang/ or via go module
 ```
 
+### Rust
+
+```bash
+cargo add an5-adapters
+```
+
 ---
 
 ## NBase — Neural Vector Database
