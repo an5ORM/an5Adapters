@@ -50,6 +50,8 @@ dotnet add package An5Adapters
 cargo add an5-adapters
 ```
 
+The crate is driver-agnostic — it depends on `sqlx` with `any`, so the app enables the driver it needs. See [crates.io](https://crates.io/crates/an5-adapters) and [docs.rs](https://docs.rs/an5-adapters).
+
 ---
 
 ## NBase — Neural Vector Database
