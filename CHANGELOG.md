@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.7] - 2026-10-01
+## [0.2.8] - 2026-10-02
 
 ### Added
 - **SQLite in the Python adapter** — the adapter detected `DIALECT_SQLITE` but
@@ -22,6 +22,11 @@
   `scripts/dotnet-sqlite-smoke.js`.
 
 ### Fixed
+- **The PyPI version had drifted from the npm version** — `pyproject.toml` sat at
+  0.2.6 while `package.json` reached 0.2.7, so the publish step built the old
+  wheel and skipped it as already published. Both are at 0.2.7 now, and
+  `test/version-sync.test.js` fails the build if they disagree again.
+
 - **`skip` was discarded without `take`** in the .NET adapter's simple
   `FindMany`, on every dialect. `BuildPagination` returned empty unless `take`
   was set, so `skip: 2` alone returned every row.
