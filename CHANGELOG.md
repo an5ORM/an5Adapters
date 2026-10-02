@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.9] - 2026-10-02
+
+### Fixed
+- **A `.sqlite3` file was sent to the SQL Server engine** — `@an5/orm` reads the
+  database provider from the connection string to validate field types and write DDL,
+  and it read the scheme from here. A `.sqlite3` path was not in this list, so the ORM
+  produced SQLite DDL that this package then executed against SQL Server. Both accept
+  `.sqlite`, `.sqlite3` and `.db` now.
+- **A capitalised scheme selected the wrong database** — `MySQL://` fell through every
+  check here and became SQL Server, in both packages. A URI scheme is case-insensitive,
+  so the comparison now runs on a lower-cased copy of the connection string.
+
 ## [0.2.8] - 2026-10-02
 
 ### Added
