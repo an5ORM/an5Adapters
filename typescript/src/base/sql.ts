@@ -88,10 +88,11 @@ export function parseWhere(
   if (!where) return '';
   const conditions: string[] = [];
 
+  const relations = ctx?.relationMap?.[modelName] || {};
   const cleanWhere: Record<string, any> = {};
   for (const [key, value] of Object.entries(where)) {
     if (
-      key.includes('_') &&
+      key.includes('_') && !relations[key] &&
       value && typeof value === 'object' &&
       !(value instanceof Date) &&
       !isOperatorValue(value)
@@ -102,23 +103,23 @@ export function parseWhere(
     }
   }
 
-  const relations = ctx?.relationMap?.[modelName] || {};
   const colPrefix = ctx?.colPrefix || '';
 
   for (const [key, value] of Object.entries(cleanWhere)) {
+    if (value === undefined) continue;
     if (key === 'OR' && Array.isArray(value)) {
-      const sub = value.map((v, i) => parseWhere(modelName, v, params, dialect, `${prefix}or_${i}_`, ctx)).filter(Boolean);
-      if (sub.length > 0) conditions.push(`(${sub.join(' OR ')})`);
+      const sub = value.map((v, i) => parseWhere(modelName, v, params, dialect, `${prefix}or_${i}_`, ctx) || '1=1');
+      conditions.push(sub.length > 0 ? `(${sub.join(' OR ')})` : '1=0');
     } else if (key === 'AND') {
       const items = Array.isArray(value) ? value : [value];
       const sub = items.map((v, i) => parseWhere(modelName, v, params, dialect, `${prefix}and_${i}_`, ctx)).filter(Boolean);
       if (sub.length > 0) conditions.push(`(${sub.join(' AND ')})`);
     } else if (key === 'NOT') {
       const items = Array.isArray(value) ? value : [value];
-      const sub = items.map((v, i) => parseWhere(modelName, v, params, dialect, `${prefix}not_${i}_`, ctx)).filter(Boolean);
-      if (sub.length > 0) conditions.push(`NOT (${sub.join(' AND ')})`);
+      const sub = items.map((v, i) => parseWhere(modelName, v, params, dialect, `${prefix}not_${i}_`, ctx) || '1=1');
+      if (sub.length > 0) conditions.push(`NOT (${sub.join(' OR ')})`);
     } else if (relations[key] && value && typeof value === 'object') {
-      const clause = buildRelationClause(relations[key], value, modelName, params, dialect, prefix, ctx);
+      const clause = buildRelationClause(relations[key], value, modelName, params, dialect, `${prefix}${key}_`, ctx);
       if (clause) conditions.push(clause);
     } else {
       const pname = sanitizeParamName(`${prefix}${key}`);
@@ -203,28 +204,28 @@ function buildRelationClause(
 
   if (isMany) {
     if (value.some !== undefined) {
-      const inner = buildInnerWhere(relation.modelName, value.some === null ? {} : value.some, params, dialect, prefix, ctx, childAlias);
+      const inner = buildInnerWhere(relation.modelName, value.some === null ? {} : value.some, params, dialect, `${prefix}some_`, ctx, childAlias);
       parts.push(buildExists(inner));
     }
     if (value.none !== undefined) {
-      const inner = buildInnerWhere(relation.modelName, value.none === null ? {} : value.none, params, dialect, prefix, ctx, childAlias);
+      const inner = buildInnerWhere(relation.modelName, value.none === null ? {} : value.none, params, dialect, `${prefix}none_`, ctx, childAlias);
       parts.push(`NOT ${buildExists(inner)}`);
     }
     if (value.every !== undefined) {
       // "every" = no related row violates the condition.
-      const inner = buildInnerWhere(relation.modelName, value.every === null ? {} : value.every, params, dialect, prefix, ctx, childAlias);
+      const inner = buildInnerWhere(relation.modelName, value.every === null ? {} : value.every, params, dialect, `${prefix}every_`, ctx, childAlias);
       const negated = inner ? `NOT (${inner})` : '';
       const violated = `EXISTS (SELECT 1 FROM ${childTable} AS ${childAlias} WHERE ${correlation}${negated ? ` AND ${negated}` : ' AND 1=0'})`;
       parts.push(`NOT ${violated}`);
     }
   } else {
     if (value.is !== undefined) {
-      const inner = buildInnerWhere(relation.modelName, value.is === null ? {} : value.is, params, dialect, prefix, ctx, childAlias);
-      parts.push(buildExists(inner));
+      const inner = buildInnerWhere(relation.modelName, value.is === null ? {} : value.is, params, dialect, `${prefix}is_`, ctx, childAlias);
+      parts.push(value.is === null ? `NOT ${buildExists(inner)}` : buildExists(inner));
     }
     if (value.isNot !== undefined) {
-      const inner = buildInnerWhere(relation.modelName, value.isNot === null ? {} : value.isNot, params, dialect, prefix, ctx, childAlias);
-      parts.push(`NOT ${buildExists(inner)}`);
+      const inner = buildInnerWhere(relation.modelName, value.isNot === null ? {} : value.isNot, params, dialect, `${prefix}isNot_`, ctx, childAlias);
+      parts.push(value.isNot === null ? buildExists(inner) : `NOT ${buildExists(inner)}`);
     }
   }
 

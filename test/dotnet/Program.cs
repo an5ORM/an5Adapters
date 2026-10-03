@@ -187,12 +187,54 @@ internal static class Program
         public string Embedding { get; set; }
     }
 
+    private static object FromJson(System.Text.Json.JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case System.Text.Json.JsonValueKind.Object:
+                return element.EnumerateObject().ToDictionary(p => p.Name, p => FromJson(p.Value));
+            case System.Text.Json.JsonValueKind.Array:
+                return element.EnumerateArray().Select(FromJson).ToList();
+            case System.Text.Json.JsonValueKind.Number: return element.GetInt32();
+            case System.Text.Json.JsonValueKind.String: return element.GetString();
+            case System.Text.Json.JsonValueKind.True: return true;
+            case System.Text.Json.JsonValueKind.False: return false;
+            default: return null;
+        }
+    }
+
+    private static void SharedQueryContract()
+    {
+        using var fixtures = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "query-semantics.json")));
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var setup = connection.CreateCommand())
+        {
+            setup.CommandText = "CREATE TABLE users (id INTEGER, score INTEGER); INSERT INTO users VALUES (1,0),(2,10),(3,20);";
+            setup.ExecuteNonQuery();
+        }
+        foreach (var entry in fixtures.RootElement.GetProperty("cases").EnumerateArray())
+        {
+            var parameters = new Dictionary<string, object>();
+            var clause = SqlBuilder.ParseWhere(FromJson(entry.GetProperty("where")), parameters, Dialect.Sqlite);
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT id FROM users" + (clause.Length > 0 ? " WHERE " + clause : "") + " ORDER BY id";
+            foreach (var parameter in parameters) command.Parameters.AddWithValue("@" + parameter.Key, parameter.Value ?? DBNull.Value);
+            using var reader = command.ExecuteReader();
+            var actual = new List<int>();
+            while (reader.Read()) actual.Add(reader.GetInt32(0));
+            var expected = entry.GetProperty("ids").EnumerateArray().Select(id => id.GetInt32());
+            Check("shared query contract: " + entry.GetProperty("name").GetString(), string.Join(",", actual), string.Join(",", expected));
+        }
+    }
+
     private static int Main()
     {
         _dbPath = Path.Combine(Path.GetTempPath(), $"an5-sqlite-smoke-{Guid.NewGuid():N}.db");
 
         try
         {
+            SharedQueryContract();
             DialectDetection();
             Normalisation();
             Quoting();

@@ -35,7 +35,11 @@ impl Dialect {
 
     /// Quote a single identifier (column or table part).
     pub fn quote_identifier(&self, name: &str) -> String {
-        let raw = strip_wrapping(strip_wrapping(name, "[", "]"), "\"", "\"");
+        let raw = if name.starts_with('[') && name.ends_with(']') {
+            strip_wrapping(name, "[", "]").replace("]]", "]")
+        } else if name.starts_with('"') && name.ends_with('"') {
+            strip_wrapping(name, "\"", "\"").replace("\"\"", "\"")
+        } else { name.to_string() };
         match self {
             Dialect::Postgres | Dialect::Sqlite => {
                 format!("\"{}\"", raw.replace('"', "\"\""))
@@ -46,15 +50,31 @@ impl Dialect {
 
     /// Quote a possibly schema-qualified table name (`dbo.users`).
     pub fn quote_table(&self, table: &str) -> String {
-        let t = table.trim();
-        // Already quoted by the generator: `[dbo].[User]`.
-        if t.starts_with('[') || t.starts_with('"') {
-            return t.to_string();
+        let mut parts = Vec::new();
+        let mut part = String::new();
+        let mut closing = None;
+        let mut chars = table.trim().chars().peekable();
+        while let Some(ch) = chars.next() {
+            if let Some(close) = closing {
+                part.push(ch);
+                if ch == close {
+                    if chars.peek() == Some(&close) {
+                        part.push(chars.next().unwrap());
+                    } else { closing = None; }
+                }
+            } else if ch == '[' || ch == '"' {
+                closing = Some(if ch == '[' { ']' } else { '"' });
+                part.push(ch);
+            } else if ch == '.' {
+                parts.push(std::mem::take(&mut part));
+            } else { part.push(ch); }
         }
-        t.split('.')
-            .map(|p| self.quote_identifier(p))
-            .collect::<Vec<_>>()
-            .join(".")
+        parts.push(part);
+        if *self == Dialect::Sqlite && parts.len() == 2 {
+            let schema = strip_wrapping(strip_wrapping(parts[0].trim(), "[", "]"), "\"", "\"");
+            if schema.eq_ignore_ascii_case("dbo") { parts.remove(0); }
+        }
+        parts.iter().map(|p| self.quote_identifier(p.trim())).collect::<Vec<_>>().join(".")
     }
 
     /// Positional placeholder: `$N` for Postgres, `?` otherwise.
@@ -132,6 +152,15 @@ pub fn vector_distance(a: &[f64], b: &[f64], metric: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converts_generated_table_names_for_sqlite() {
+        assert_eq!(Dialect::Sqlite.quote_table("[dbo].[users]"), "\"users\"");
+        assert_eq!(Dialect::Sqlite.quote_table("[main].[users]"), "\"main\".\"users\"");
+        assert_eq!(Dialect::Sqlite.quote_table("[dot.name]"), "\"dot.name\"");
+        assert_eq!(Dialect::Postgres.quote_table("[dbo].[a]]b]"), "\"dbo\".\"a]b\"");
+        assert_eq!(Dialect::Mssql.quote_table("[dbo].[a]]b]"), "[dbo].[a]]b]");
+    }
 
     #[test]
     fn detects_dialects() {

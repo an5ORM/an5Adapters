@@ -51,10 +51,8 @@ def _parse_where(model_name: str, where: Optional[Dict], params: Dict, dialect: 
 
     for key, value in clean_where.items():
         if key == "OR" and isinstance(value, list):
-            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}or{i}_") for i, v in enumerate(value)]
-            sub = [s for s in sub if s]
-            if sub:
-                conditions.append(f"({' OR '.join(sub)})")
+            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}or{i}_") or "1=1" for i, v in enumerate(value)]
+            conditions.append(f"({' OR '.join(sub)})" if sub else "1=0")
         elif key == "AND":
             items = value if isinstance(value, list) else [value]
             sub = [_parse_where(model_name, v, params, dialect, f"{prefix}and{i}_") for i, v in enumerate(items)]
@@ -63,10 +61,9 @@ def _parse_where(model_name: str, where: Optional[Dict], params: Dict, dialect: 
                 conditions.append(f"({' AND '.join(sub)})")
         elif key == "NOT":
             items = value if isinstance(value, list) else [value]
-            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}not{i}_") for i, v in enumerate(items)]
-            sub = [s for s in sub if s]
+            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}not{i}_") or "1=1" for i, v in enumerate(items)]
             if sub:
-                conditions.append(f"NOT ({' AND '.join(sub)})")
+                conditions.append(f"NOT ({' OR '.join(sub)})")
         else:
             col = _quote(key, dialect)
             pname = _sanitize_param_name(f"{prefix}{key}")
@@ -196,6 +193,8 @@ def _quote_table(t: str, dialect: str) -> str:
     # correct on MSSQL. Other dialects have to strip it and re-quote, or the
     # previous dialect's brackets follow the name into the new dialect.
     parts = _split_qualified(str(t))
+    if dialect == DIALECT_SQLITE and len(parts) == 2 and _strip_wrapping(_strip_wrapping(parts[0], "[", "]"), '"', '"').lower() == "dbo":
+        parts = parts[1:]
     if not parts:
         parts = [str(t)]
     return ".".join(_quote(p, dialect) for p in parts)

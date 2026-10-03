@@ -44,10 +44,6 @@ fn as_object(v: &Value) -> Option<&Map<String, Value>> {
     }
 }
 
-fn is_list(v: &Value) -> bool {
-    v.is_array()
-}
-
 fn to_list(v: &Value) -> Vec<Value> {
     match v {
         Value::Array(items) => items.clone(),
@@ -113,38 +109,23 @@ fn build_where_rec(
         let value = &where_obj[key];
 
         match key.as_str() {
-            "AND" | "OR" if is_list(value) => {
-                let joiner = if key == "AND" { " AND " } else { " OR " };
+            "AND" | "OR" | "NOT" => {
                 let mut subs: Vec<String> = Vec::new();
                 for item in to_list(value) {
                     if let Some(m) = as_object(&item) {
-                        let s = build_where_rec(m, dialect, args, ph);
-                        if !s.is_empty() {
-                            subs.push(s);
-                        }
+                        let s = build_where_rec(&clean_where(m), dialect, args, ph);
+                        subs.push(if s.is_empty() { "1=1".to_string() } else { s });
                     }
                 }
-                if !subs.is_empty() {
-                    conditions.push(format!("({})", subs.join(joiner)));
+                if subs.is_empty() {
+                    if key == "OR" { conditions.push("1=0".to_string()); }
+                } else {
+                    let joiner = if key == "AND" { " AND " } else { " OR " };
+                    let negation = if key == "NOT" { "NOT " } else { "" };
+                    conditions.push(format!("{}({})", negation, subs.join(joiner)));
                 }
                 continue;
             }
-            "NOT" => {
-                let mut subs: Vec<String> = Vec::new();
-                for item in to_list(value) {
-                    if let Some(m) = as_object(&item) {
-                        let s = build_where_rec(m, dialect, args, ph);
-                        if !s.is_empty() {
-                            subs.push(s);
-                        }
-                    }
-                }
-                if !subs.is_empty() {
-                    conditions.push(format!("NOT ({})", subs.join(" AND ")));
-                }
-                continue;
-            }
-            "AND" | "OR" => continue,
             _ => {}
         }
 

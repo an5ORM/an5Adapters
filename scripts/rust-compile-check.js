@@ -2,7 +2,7 @@
 /**
  * Compile-check the standalone Rust adapter crate.
  *
- * Runs `cargo check` in an5Adapters/rust. Skips gracefully when cargo is
+ * Runs `cargo test` in an5Adapters/rust. Skips gracefully when cargo is
  * missing; falls back to structural verification when crates.io is unreachable.
  *
  * Uses a shared CARGO_TARGET_DIR so the sqlx dependency tree is compiled once
@@ -48,8 +48,8 @@ fs.mkdirSync(targetDir, { recursive: true });
 const env = { ...process.env, CARGO_TARGET_DIR: targetDir };
 
 try {
-  execFileSync('cargo', ['check'], { cwd: rustDir, stdio: 'inherit', env });
-  console.log('an5Adapters Rust crate cargo check passed');
+  execFileSync('cargo', ['test'], { cwd: rustDir, stdio: 'inherit', env });
+  console.log('an5Adapters Rust crate cargo test passed');
 } catch (err) {
   const msg = String((err && err.message) || err);
   if (/offline|network|failed to download|no matching package|failed to query/i.test(msg)) {

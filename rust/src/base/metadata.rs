@@ -2,6 +2,9 @@
 //!
 //! Mirrors the Go `an5adapters/base` metadata store.
 
+#[cfg(test)]
+pub(crate) static TEST_METADATA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
@@ -123,6 +126,7 @@ mod tests {
     fn resolves_table_with_case_fallback() {
         let mut map = HashMap::new();
         map.insert("User".to_string(), "[dbo].[Users]".to_string());
+        let _guard = TEST_METADATA_LOCK.lock().unwrap();
         set_adapter_metadata(AdapterMetadata {
             model_to_table: map,
             ..Default::default()

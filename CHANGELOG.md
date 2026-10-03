@@ -1,5 +1,59 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Query composition behaved differently from what it said, identically in all five
+  runtimes.** `OR: []` silently dropped the clause and returned every row; it now matches
+  no rows. An empty branch inside an `OR` was dropped; it is a true disjunct and now
+  matches every row. `NOT` over an array was built as `NOT (a AND b)`, matching only rows
+  that fail *every* condition; it now excludes each branch, `NOT (a OR b)`. `NOT: {}` now
+  matches no rows. A filter value of `undefined` is skipped instead of corrupting the
+  clause. `AND` accepts a bare object, not only an array.
+
+  **This changes results.** Queries relying on `OR: []` returning every row, or on the old
+  `NOT`-over-an-array behaviour, will return different rows.
+- **Relation filters overwrote each other's bound parameters** — every quantifier
+  (`some`, `none`, `every`, `is`, `isNot`) now gets its own parameter prefix, so two
+  relations pointing at the same model no longer clobber each other's values.
+- **`is: null` and `isNot: null` were inverted for to-one relations** — `is: null` now
+  means *no related row* (`NOT EXISTS`) and `isNot: null` means *a related row exists*
+  (`EXISTS`).
+- **A relation whose name contains an underscore was treated as a compound key** — the
+  key was destructured into the parent clause. TypeScript now checks the relation map
+  first, and the Google Sheets matcher uses the full operator list instead of a partial
+  one, which also preserves falsy operands such as `{ total_score: { equals: 0 } }`.
+- **Google Sheets string operators skipped empty cells** — `contains`, `startsWith` and
+  `endsWith` no longer match a `null`/empty cell, `''` matches an empty cell, and nested
+  `not`, bare-object `AND` and `notIn` are supported.
+- **Rust and Python kept the SQL Server `dbo.` prefix under SQLite** — both strip it now.
+  Rust additionally parses dots inside quoted identifiers instead of splitting on every
+  dot, so `[dot.name]` survives.
+- **`sqlite:` and `:memory:` connection strings were not detected as SQLite** in
+  TypeScript; both are recognised now.
+
+### Added
+- **A shared query-semantics contract.** One 12-case fixture
+  (`test/fixtures/query-semantics.json`) is now executed by the TypeScript SQL builder,
+  the Google Sheets matcher, Python, Go, Rust and .NET — the first cross-language parity
+  contract for query semantics rather than five separate interpretations.
+- Real SQLite runtime tests for Python, Go, Rust and .NET. `test:python` ran
+  `compileall` only and now executes the query-semantics and smoke suites; the Rust gate
+  runs `cargo test` instead of `cargo check`; `golang/base/where_test.go` runs the shared
+  fixture through `BuildWhere`, executing the SQL with Python's stdlib SQLite to stay
+  driver-neutral. It therefore requires `python3` on `PATH`.
+- `test/query-relations.integration.test.js` covers `some`+`none` combined, `every`, two
+  relations to the same model, a nullable to-one, and transaction rollback — against
+  SQLite, and against PostgreSQL, SQL Server and MySQL when their URLs are set.
+- A `TEST_METADATA_LOCK` in the Rust unit tests, which mutate process-global metadata and
+  were racing.
+
+### Changed
+- **`mysql2` is now a declared optional peer dependency.** Consumers of the MySQL engine
+  must install it themselves; the engine already failed with a clear error. `googleapis`
+  moves to 183.x.
+- SQLite connection-string detection is consistent across TypeScript, Go, Rust and Python.
+
 ## [0.2.9] - 2026-10-02
 
 ### Fixed

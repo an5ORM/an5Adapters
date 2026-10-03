@@ -58,16 +58,16 @@
     "pretest": "npm run build",
     "prepack": "npm run build",
     "build:python": "(python -m build --outdir dist-py || python3 -m build --outdir dist-py)",
-    "test": "node test/unit.test.js && node test/package.test.js && node test/nbase.test.js && node --test test/version-sync.test.js",
+    "test": "node test/unit.test.js && node test/package.test.js && node test/nbase.test.js && node --test test/version-sync.test.js && node --test test/query-semantics.test.js && node test/query-relations.integration.test.js",
     "test:package:smoke": "node scripts/package-smoke.js",
-    "test:integration:live": "node test/live-db.integration.test.js",
-    "test:python": "(python -m compileall python 2>&1 || python3 -m compileall python 2>&1)",
+    "test:integration:live": "node test/live-db.integration.test.js && node test/query-relations.integration.test.js",
+    "test:python": "node scripts/python-tests.js",
     "test:dotnet": "node scripts/dotnet-compile-check.js && node scripts/dotnet-sqlite-smoke.js",
     "test:go": "cd golang && go test ./...",
     "test:rust": "node scripts/rust-compile-check.js"
   },
   "dependencies": {
-    "googleapis": "^134.0.0",
+    "googleapis": "^183.0.0",
     "mssql": "^12.5.5",
     "pg": "^8.13.0"
   },
@@ -79,5 +79,13 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "peerDependencies": {
+    "mysql2": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "mysql2": {
+      "optional": true
+    }
   }
 }

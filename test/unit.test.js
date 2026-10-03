@@ -807,7 +807,7 @@ test('package manifest includes cross-language adapter sources and gates', () =>
   assert.ok(pkg.files.includes('python/**/*.py'), 'python sources must be packaged');
   assert.ok(pkg.files.includes('dotnet/**/*'), 'dotnet sources must be packaged');
   assert.ok(pkg.files.includes('golang/**/*'), 'golang sources must be packaged');
-  assert.strictEqual(pkg.scripts['test:python'], '(python -m compileall python 2>&1 || python3 -m compileall python 2>&1)');
+  assert.strictEqual(pkg.scripts['test:python'], 'node scripts/python-tests.js');
   // The .NET gate has to build the sources *and* run them: a provider that
   // compiles but cannot query SQLite used to pass.
   assert.ok(
@@ -816,7 +816,7 @@ test('package manifest includes cross-language adapter sources and gates', () =>
     'test:dotnet must compile-check and smoke test the .NET adapter'
   );
   assert.strictEqual(pkg.scripts['test:go'], 'cd golang && go test ./...');
-  assert.strictEqual(pkg.scripts['test:integration:live'], 'node test/live-db.integration.test.js');
+  assert.strictEqual(pkg.scripts['test:integration:live'], 'node test/live-db.integration.test.js && node test/query-relations.integration.test.js');
 });
 
 test('adapters do not depend on generated an5-client artifacts', () => {

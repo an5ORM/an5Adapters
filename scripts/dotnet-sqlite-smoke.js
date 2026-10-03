@@ -37,6 +37,7 @@ try {
   copy('dotnet/Postgres/PostgresEngine.cs', 'Postgres/PostgresEngine.cs');
   copy('dotnet/Sqlite/SqliteEngine.cs', 'Sqlite/SqliteEngine.cs');
   copy('test/dotnet/Program.cs', 'Program.cs');
+  copy('test/fixtures/query-semantics.json', 'query-semantics.json');
 
   fs.writeFileSync(
     path.join(tmp, 'An5DotnetSqliteSmoke.csproj'),
@@ -49,6 +50,7 @@ try {
       '    <ImplicitUsings>enable</ImplicitUsings>',
       '  </PropertyGroup>',
       '  <ItemGroup>',
+      '    <None Update="query-semantics.json" CopyToOutputDirectory="PreserveNewest" />',
       '    <PackageReference Include="Npgsql" Version="8.0.6" />',
       '    <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.2" />',
       '    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />',

@@ -1238,6 +1238,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_physical_table() {
+        let _guard = crate::base::metadata::TEST_METADATA_LOCK.lock().unwrap();
         crate::base::set_adapter_metadata(AdapterMetadata {
             model_to_table: HashMap::from([("User".to_string(), "[dbo].[Users]".to_string())]),
             ..Default::default()
@@ -1285,6 +1286,7 @@ mod tests {
 
     #[test]
     fn split_relations_uses_metadata() {
+        let _guard = crate::base::metadata::TEST_METADATA_LOCK.lock().unwrap();
         crate::base::set_adapter_metadata(AdapterMetadata {
             relation_map: HashMap::from([(
                 "Order".to_string(),

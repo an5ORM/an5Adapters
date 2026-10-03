@@ -317,7 +317,8 @@ export class An5Adapter {
     } else if (forDialect.startsWith('mysql://') || forDialect.startsWith('mariadb://')) {
       this._engineType = 'mysql';
     } else if (
-      forDialect.startsWith('sqlite://')
+      forDialect === ':memory:'
+      || forDialect.startsWith('sqlite:')
       || SQLITE_FILE_SUFFIXES.some((suffix) => forDialect.endsWith(suffix))
     ) {
       this._engineType = 'sqlite';

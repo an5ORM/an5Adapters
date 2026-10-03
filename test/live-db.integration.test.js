@@ -3,14 +3,17 @@ const { createAn5Adapter, setAdapterMetadata } = require('../dist/index.js');
 
 const POSTGRES_URL = process.env.POSTGRES_DATABASE_URL;
 const MSSQL_URL = process.env.MSSQL_DATABASE_URL;
+const MYSQL_URL = process.env.MYSQL_DATABASE_URL;
 const REQUIRE_LIVE_DB = process.env.REQUIRE_LIVE_DB === '1';
 
 const targets = [
   POSTGRES_URL && { dialect: 'postgres', connectionString: POSTGRES_URL },
   MSSQL_URL && { dialect: 'mssql', connectionString: MSSQL_URL },
+  MYSQL_URL && { dialect: 'mysql', connectionString: MYSQL_URL },
 ].filter(Boolean);
 
 function quoteIdent(name, dialect) {
+  if (dialect === 'mysql') return `\`${name.replace(/`/g, '``')}\``;
   return dialect === 'postgres' ? `"${name.replace(/"/g, '""')}"` : `[${name.replace(/]/g, ']]')}]`;
 }
 
@@ -22,6 +25,7 @@ function paramCast(dialect, paramName, type) {
 
 function createTableSql(table, dialect) {
   const t = quoteIdent(table, dialect);
+  if (dialect === 'mysql') return `CREATE TABLE ${t} (id VARCHAR(64) PRIMARY KEY, name VARCHAR(255) NOT NULL, category VARCHAR(255) NULL, score INTEGER NOT NULL DEFAULT 0, embedding TEXT NULL)`;
   if (dialect === 'postgres') {
     return [
       `CREATE TABLE ${t} (`,

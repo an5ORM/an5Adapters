@@ -21,9 +21,7 @@ export function matchWhere(row: Record<string, any>, where: any): boolean {
       key.includes('_') &&
       value && typeof value === 'object' &&
       !(value instanceof Date) &&
-      !(value as any).in && !(value as any).contains &&
-      !(value as any).not && !(value as any).gte &&
-      !(value as any).lte && !(value as any).gt && !(value as any).lt
+      !['equals', 'in', 'notIn', 'contains', 'startsWith', 'endsWith', 'not', 'gte', 'lte', 'gt', 'lt'].some(op => op in value)
     ) {
       Object.assign(cleanWhere, value);
     } else {
@@ -32,12 +30,14 @@ export function matchWhere(row: Record<string, any>, where: any): boolean {
   }
 
   for (const [key, value] of Object.entries(cleanWhere)) {
+    if (value === undefined) continue;
     if (key === 'OR' && Array.isArray(value)) {
       if (!value.some((v: any) => matchWhere(row, v))) return false;
       continue;
     }
-    if (key === 'AND' && Array.isArray(value)) {
-      if (!value.every((v: any) => matchWhere(row, v))) return false;
+    if (key === 'AND') {
+      const clauses = Array.isArray(value) ? value : [value];
+      if (!clauses.every((v: any) => matchWhere(row, v))) return false;
       continue;
     }
     if (key === 'NOT') {
@@ -57,17 +57,20 @@ export function matchWhere(row: Record<string, any>, where: any): boolean {
 
       if (v.not !== undefined) {
         if (v.not === null) { if (cellVal === null || cellVal === undefined) return false; }
+        else if (v.not && typeof v.not === 'object' && !(v.not instanceof Date) && !Array.isArray(v.not)) {
+          if (matchWhere(row, { [key]: v.not })) return false;
+        }
         else if (normalize(cellVal) == normalize(v.not)) return false;
       }
       if (v.equals !== undefined && normalize(cellVal) != normalize(v.equals)) return false;
       if (v.contains !== undefined) {
-        if (!cellVal || !normalize(String(cellVal)).includes(normalize(v.contains))) return false;
+        if (cellVal === null || cellVal === undefined || !normalize(String(cellVal)).includes(normalize(v.contains))) return false;
       }
       if (v.startsWith !== undefined) {
-        if (!cellVal || !normalize(String(cellVal)).startsWith(normalize(v.startsWith))) return false;
+        if (cellVal === null || cellVal === undefined || !normalize(String(cellVal)).startsWith(normalize(v.startsWith))) return false;
       }
       if (v.endsWith !== undefined) {
-        if (!cellVal || !normalize(String(cellVal)).endsWith(normalize(v.endsWith))) return false;
+        if (cellVal === null || cellVal === undefined || !normalize(String(cellVal)).endsWith(normalize(v.endsWith))) return false;
       }
       if (v.gte !== undefined && !(Number(cellVal) >= Number(v.gte))) return false;
       if (v.lte !== undefined && !(Number(cellVal) <= Number(v.lte))) return false;

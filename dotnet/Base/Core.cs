@@ -259,40 +259,30 @@ public enum Dialect
             {
                 var key = kv.Key;
                 var value = kv.Value;
-                if (key == "OR" && value is System.Collections.IList orList && orList.Count > 0)
+                if (key == "OR" || key == "AND" || key == "NOT")
                 {
+                    var items = value is System.Collections.IList list
+                        ? list : new object[] { value };
                     var subs = new List<string>();
                     var i = 0;
-                    foreach (var item in orList)
+                    foreach (var item in items)
                     {
                         if (item is Dictionary<string, object> subMap)
                         {
-                            var s = ParseWhere(subMap, parameters, dialect, $"{prefix}or{i++}_");
-                            if (!string.IsNullOrEmpty(s)) subs.Add(s);
+                            var s = ParseWhere(subMap, parameters, dialect, $"{prefix}{key}{i++}_");
+                            subs.Add(string.IsNullOrEmpty(s) ? "1=1" : s);
                         }
                     }
-                    if (subs.Count > 0) conditions.Add("(" + string.Join(" OR ", subs) + ")");
-                    continue;
-                }
-                if (key == "AND" && value is System.Collections.IList andList && andList.Count > 0)
-                {
-                    var subs = new List<string>();
-                    var i = 0;
-                    foreach (var item in andList)
+                    if (subs.Count == 0)
                     {
-                        if (item is Dictionary<string, object> subMap)
-                        {
-                            var s = ParseWhere(subMap, parameters, dialect, $"{prefix}and{i++}_");
-                            if (!string.IsNullOrEmpty(s)) subs.Add(s);
-                        }
+                        if (key == "OR") conditions.Add("1=0");
                     }
-                    if (subs.Count > 0) conditions.Add("(" + string.Join(" AND ", subs) + ")");
-                    continue;
-                }
-                if (key == "NOT" && value is Dictionary<string, object> notMap)
-                {
-                    var s = ParseWhere(notMap, parameters, dialect, $"{prefix}not_");
-                    if (!string.IsNullOrEmpty(s)) conditions.Add("NOT (" + s + ")");
+                    else
+                    {
+                        var joiner = key == "AND" ? " AND " : " OR ";
+                        var negation = key == "NOT" ? "NOT " : "";
+                        conditions.Add(negation + "(" + string.Join(joiner, subs) + ")");
+                    }
                     continue;
                 }
 

@@ -289,3 +289,23 @@ async fn aggregate_and_group_by() {
         .expect("group by");
     assert_eq!(groups.len(), 3);
 }
+
+#[tokio::test]
+async fn shared_query_contract() {
+    let (db, _tmp) = adapter().await;
+    db.execute_raw("ALTER TABLE users ADD COLUMN score INTEGER", &[]).await.unwrap();
+    let contract: serde_json::Value = serde_json::from_str(include_str!("../../test/fixtures/query-semantics.json")).unwrap();
+    for row in contract["rows"].as_array().unwrap() {
+        db.execute_raw("INSERT INTO users (id, score) VALUES (?, ?)", &[json!(row["id"].as_i64().unwrap().to_string()), row["score"].clone()]).await.unwrap();
+    }
+    for case in contract["cases"].as_array().unwrap() {
+        let rows = db.table("User").find_many(&FindManyArgs {
+            r#where: Some(case["where"].clone()),
+            order_by: Some(json!({"id": "asc"})),
+            ..Default::default()
+        }).await.unwrap_or_else(|err| panic!("{}: {err}", case["name"]));
+        let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_str().unwrap().parse().unwrap()).collect();
+        let expected: Vec<i64> = case["ids"].as_array().unwrap().iter().map(|id| id.as_i64().unwrap()).collect();
+        assert_eq!(ids, expected, "{}", case["name"]);
+    }
+}

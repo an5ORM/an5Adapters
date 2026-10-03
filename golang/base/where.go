@@ -80,55 +80,41 @@ func buildWhereRec(where map[string]interface{}, dialect Dialect, args *[]interf
 		value := where[key]
 
 		switch key {
-		case "OR":
-			if list, ok := toSlice(value); ok && len(list) > 0 {
-				var subs []string
-				for i, item := range list {
-					if m, ok := item.(map[string]interface{}); ok && m != nil {
-						if s := buildWhereRec(m, dialect, args, ph, fmt.Sprintf("%sor%d_", prefix, i)); s != "" {
-							subs = append(subs, s)
-						}
-					}
-				}
-				if len(subs) > 0 {
-					conditions = append(conditions, "("+strings.Join(subs, " OR ")+")")
-				}
-				continue
-			}
-		case "AND":
-			if list, ok := toSlice(value); ok && len(list) > 0 {
-				var subs []string
-				for i, item := range list {
-					if m, ok := item.(map[string]interface{}); ok && m != nil {
-						if s := buildWhereRec(m, dialect, args, ph, fmt.Sprintf("%sand%d_", prefix, i)); s != "" {
-							subs = append(subs, s)
-						}
-					}
-				}
-				if len(subs) > 0 {
-					conditions = append(conditions, "("+strings.Join(subs, " AND ")+")")
-				}
-				continue
-			}
-		case "NOT":
+		case "OR", "AND", "NOT":
 			items := value
 			if m, ok := value.(map[string]interface{}); ok {
 				items = []interface{}{m}
 			}
-			if list, ok := toSlice(items); ok && len(list) > 0 {
-				var subs []string
-				for i, item := range list {
-					if m, ok := item.(map[string]interface{}); ok && m != nil {
-						if s := buildWhereRec(m, dialect, args, ph, fmt.Sprintf("%snot%d_", prefix, i)); s != "" {
-							subs = append(subs, s)
-						}
-					}
-				}
-				if len(subs) > 0 {
-					conditions = append(conditions, "NOT ("+strings.Join(subs, " AND ")+")")
-				}
+			list, ok := toSlice(items)
+			if !ok {
 				continue
 			}
+			var subs []string
+			for i, item := range list {
+				if m, ok := item.(map[string]interface{}); ok {
+					s := buildWhereRec(cleanWhere(m), dialect, args, ph, fmt.Sprintf("%s%s%d_", prefix, key, i))
+					if s == "" {
+						s = "1=1"
+					}
+					subs = append(subs, s)
+				}
+			}
+			if len(subs) == 0 {
+				if key == "OR" {
+					conditions = append(conditions, "1=0")
+				}
+			} else {
+				joiner := " OR "
+				if key == "AND" {
+					joiner = " AND "
+				}
+				clause := "(" + strings.Join(subs, joiner) + ")"
+				if key == "NOT" {
+					clause = "NOT " + clause
+				}
+				conditions = append(conditions, clause)
+			}
+			continue
 		}
 
 		conditions = append(conditions, buildFieldCondition(key, value, dialect, args, ph, prefix)...)
@@ -171,13 +157,10 @@ func buildFieldCondition(key string, value interface{}, dialect Dialect, args *[
 		case "not":
 			if val == nil {
 				parts = append(parts, col+" IS NOT NULL")
-			} else if nested, ok := val.(map[string]interface{}); ok && !isOperatorMap(val) {
-				if nestedArgs := len(*args); true {
-					nestedCond := buildWhereRec(map[string]interface{}{key: nested}, dialect, args, ph, key+"_not_")
-					_ = nestedArgs
-					if nestedCond != "" {
-						parts = append(parts, "NOT ("+nestedCond+")")
-					}
+			} else if nested, ok := val.(map[string]interface{}); ok {
+				nestedCond := buildWhereRec(map[string]interface{}{key: nested}, dialect, args, ph, key+"_not_")
+				if nestedCond != "" {
+					parts = append(parts, "NOT ("+nestedCond+")")
 				}
 			} else {
 				parts = append(parts, fmt.Sprintf("%s <> %s", col, addArg(val)))
