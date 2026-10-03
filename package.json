@@ -75,16 +75,21 @@
     "@types/mssql": "^9.1.8",
     "@types/node": "^20.11.0",
     "@types/pg": "^8.11.0",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "better-sqlite3": "^11.5.0"
   },
   "publishConfig": {
     "access": "public"
   },
   "peerDependencies": {
-    "mysql2": "^3.0.0"
+    "mysql2": "^3.0.0",
+    "better-sqlite3": "^11.0.0"
   },
   "peerDependenciesMeta": {
     "mysql2": {
+      "optional": true
+    },
+    "better-sqlite3": {
       "optional": true
     }
   }

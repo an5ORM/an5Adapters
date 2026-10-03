@@ -47,4 +47,22 @@ async function run(target) {
     await db.$disconnect().catch(() => {});
   }
 }
-(async () => { for (const target of targets) await run(target); })().catch(error => { console.error(error); process.exitCode = 1; });
+// A missing optional driver must not fail the run: the publish jobs depend on this
+// one, so an absent SQLite driver used to turn a release into a silent skip — the
+// version was tagged, the PyPI and GitHub Release jobs never ran, and nothing
+// failed where anyone was looking.
+const MISSING_DRIVER = /better-sqlite3 package is required/;
+
+(async () => {
+  for (const target of targets) {
+    try {
+      await run(target);
+    } catch (error) {
+      if (target.dialect === 'sqlite' && MISSING_DRIVER.test(error.message)) {
+        console.log(`Query/relation contract skipped for sqlite: ${error.message}`);
+        continue;
+      }
+      throw error;
+    }
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });

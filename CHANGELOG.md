@@ -2,6 +2,20 @@
 
 ## [0.2.10] - 2026-10-03
 
+### Fixed
+- **`better-sqlite3` was required but never declared** — the SQLite engine
+  `require`s it, yet it appeared in no dependency list, so it was present only by
+  accident of a workspace root. A consumer without it got a runtime error instead
+  of an install instruction, and it is now a declared optional peer dependency and
+  a dev dependency, matching how `mysql2` is handled.
+- **A missing SQLite driver failed the whole release pipeline.** The publish jobs
+  depend on the test job, so the relations contract failing on a runner without the
+  driver skipped PyPI, npm and the GitHub Release without failing where anyone was
+  looking: `v0.2.10` was tagged and never published. The contract now skips with
+  the reason when the driver is absent.
+
+
+
 - Align query composition across TypeScript, Python, .NET, Go and Rust.
 
 ## [Unreleased]
