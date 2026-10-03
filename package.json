@@ -1,6 +1,6 @@
 {
   "name": "@an5/adapters",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET, Go, Rust, and Google Sheets query execution.",
   "license": "MIT",
   "main": "dist/index.js",

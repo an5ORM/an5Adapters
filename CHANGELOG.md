@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.10] - 2026-10-03
+
+- Align query composition across TypeScript, Python, .NET, Go and Rust.
+
 ## [Unreleased]
 
 ### Fixed
