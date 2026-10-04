@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.11] - 2026-10-04
+
+### Added
+- Support desktop Google Sheets OAuth credentials with automatic refresh, shared concurrent refresh requests and one retry after an expired access token.
+- Use explicit schema primary-key metadata when creating SQL or Google Sheets records, with legacy name inference retained.
+### Fixed
+- Keep filter and update parameters distinct when column names normalize to the same parameter name.
+- Generate valid skip-only pagination for SQLite and MySQL, including grouped queries; apply relation context in grouped filters.
+- Handle mixed createMany column sets and generated IDs without replaying failed bulk inserts. skipDuplicates suppresses only unique/primary-key violations; Google Sheets append failures propagate.
+- Reject desktop refresh tokens, client secrets and service-account credentials in browser connections; browser apps must provide a user access token.
+
 ## [0.2.10] - 2026-10-03
 
 ### Fixed
@@ -156,4 +167,3 @@
 ## [0.1.0] - 2026-07-04
 
 - Initial release
-

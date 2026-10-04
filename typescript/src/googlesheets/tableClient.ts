@@ -1,17 +1,10 @@
 import { generateUUID } from '../base/uuid';
-import { getFieldsForModel } from '../base/metadata';
+import { getFieldsForModel, resolveIdField } from '../base/metadata';
 import type { An5SheetsAdapter } from './adapter';
 import { buildOrderBy, coerceCell, esc, matchWhere, resolveSheetName, sortRows } from './helpers';
 import { withRetry } from './retry';
 
 // ─── Utility ──────────────────────────────────────────────────────────────────
-
-function resolveIdField(fields: Record<string, any>): string | undefined {
-  if (Object.prototype.hasOwnProperty.call(fields, 'id')) return 'id';
-  return Object.keys(fields).find(
-    name => name.endsWith('_id') || name.endsWith('Id') || name.toLowerCase() === 'id'
-  );
-}
 
 // ─── Table Client ─────────────────────────────────────────────────────────────
 
@@ -227,17 +220,10 @@ export class SheetsTableClient<T = any> {
       return this.rowToValues(data, headers);
     });
 
-    try {
-      await this.adapter.appendRange(`${this.escSheetName}!A:A`, batchValues);
-      return { count: batchValues.length };
-    } catch (e) {
-      if (!args.skipDuplicates) throw e;
-      let count = 0;
-      for (const row of args.data) {
-        try { await this.create({ data: row }); count++; } catch { /* skip */ }
-      }
-      return { count };
-    }
+    // Sheets has no unique constraints. An append failure must propagate;
+    // retrying individual rows could duplicate a batch the service accepted.
+    await this.adapter.appendRange(`${this.escSheetName}!A:A`, batchValues);
+    return { count: batchValues.length };
   }
 
   async update(args: { where: any; data: Partial<T> }): Promise<T> {

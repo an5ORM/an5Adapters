@@ -1,4 +1,5 @@
 import { An5SheetsAdapterConfig, resolveConfig } from './config';
+import { sheetsTokenProvider } from './oauth';
 import type { sheets_v4 } from 'googleapis';
 import { execQuery } from './sqlExecutor';
 import { SheetsTableClient } from './tableClient';
@@ -8,12 +9,10 @@ import { createAdapterProxy } from '../base/metadata';
 
 // ─── Fetch-based API proxy for OAuth Access Token / API Key (browser-compatible) ──
 
-function createFetchApi(spreadsheetId: string, accessToken?: string, apiKey?: string) {
+function createFetchApi(spreadsheetId: string, accessToken?: string, apiKey?: string, oauth: An5SheetsAdapterConfig = { spreadsheetId }) {
   const base = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}`;
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (accessToken) {
-    headers['Authorization'] = `Bearer ${accessToken}`;
-  }
+  const tokenProvider = sheetsTokenProvider({ ...oauth, ...(accessToken ? { accessToken } : {}) });
 
   async function request<T>(method: string, path: string, body?: any): Promise<T> {
     let url = path.startsWith('http') ? path : `${base}${path}`;
@@ -21,9 +20,14 @@ function createFetchApi(spreadsheetId: string, accessToken?: string, apiKey?: st
       const sep = url.includes('?') ? '&' : '?';
       url += `${sep}key=${encodeURIComponent(apiKey)}`;
     }
-    const opts: RequestInit = { method, headers };
+    const token = await tokenProvider();
+    const opts: RequestInit = { method, headers: { ...headers, ...(token ? { Authorization: `Bearer ${token}` } : {}) } };
     if (body) opts.body = JSON.stringify(body);
-    const res = await fetch(url, opts);
+    let res = await fetch(url, opts);
+    if (res.status === 401 && oauth.refreshToken) {
+      const refreshed = await tokenProvider(true);
+      res = await fetch(url, { ...opts, headers: { ...headers, Authorization: `Bearer ${refreshed}` } });
+    }
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       const err = new Error(`Google Sheets API error (${res.status}): ${text}`);
@@ -85,13 +89,17 @@ export class An5SheetsAdapter {
   private sheetsCache: Promise<SheetMeta[]> | null = null;
 
   constructor(config: An5SheetsAdapterConfig) {
+    const browser = typeof window !== 'undefined' || (typeof self !== 'undefined' && typeof process === 'undefined');
+    if (browser && (config.refreshToken || config.oauthClientSecret || config.privateKey || config.credentials)) {
+      throw new Error('Browser Google Sheets connections require a user access token. Keep desktop OAuth refresh tokens and service account keys outside the browser.');
+    }
     this.config = resolveConfig(config);
     // Dynamic model access (`db.user` / `db.User`), same as An5Adapter.
     return createAdapterProxy(this, (name) => this.table(name));
   }
 
   private get isFetchMode(): boolean {
-    return !!(this.config as any).accessToken || !!(this.config as any).apiKey;
+    return !!(this.config as any).accessToken || !!(this.config as any).refreshToken || !!(this.config as any).apiKey;
   }
 
   async getSheets(): Promise<any> {
@@ -100,7 +108,8 @@ export class An5SheetsAdapter {
         this.fetchApi = createFetchApi(
           this.config.spreadsheetId,
           (this.config as any).accessToken,
-          (this.config as any).apiKey
+          (this.config as any).apiKey,
+          this.config as An5SheetsAdapterConfig
         );
       }
       return this.fetchApi;

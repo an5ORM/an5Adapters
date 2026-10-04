@@ -39,6 +39,15 @@ function sanitizeParamName(name: string): string {
   return /^[A-Za-z]/.test(cleaned) ? cleaned : `p_${cleaned}`;
 }
 
+/** Allocate parameters without overwriting values from sibling clauses. */
+export function bindParam(params: Record<string, any>, name: string, value: any): string {
+  let candidate = name;
+  let suffix = 1;
+  while (Object.prototype.hasOwnProperty.call(params, candidate)) candidate = `${name}_${suffix++}`;
+  params[candidate] = value;
+  return candidate;
+}
+
 function normalizeSortDirection(dir: unknown): 'ASC' | 'DESC' {
   return typeof dir === 'string' && dir.toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
 }
@@ -132,26 +141,24 @@ export function parseWhere(
         if (v.not !== undefined) {
           if (v.not === null) { conditions.push(`${col} IS NOT NULL`); }
           else if (v.not && typeof v.not === 'object' && !(v.not instanceof Date) && !Array.isArray(v.not)) {
-            const nestedParams: Record<string, any> = {};
-            const nestedSql = parseWhere(modelName, { [key]: v.not }, nestedParams, dialect, `${prefix}${key}_not_`, ctx);
-            Object.assign(params, nestedParams);
+            const nestedSql = parseWhere(modelName, { [key]: v.not }, params, dialect, `${prefix}${key}_not_`, ctx);
             if (nestedSql) conditions.push(`NOT (${nestedSql})`);
-          } else { const p = `${pname}_not`; params[p] = v.not; conditions.push(`${col} <> @${p}`); }
+          } else { const p = bindParam(params, `${pname}_not`, v.not); conditions.push(`${col} <> @${p}`); }
         }
         if (v.equals !== undefined) {
           if (v.equals === null) { conditions.push(`${col} IS NULL`); }
-          else { const p = `${pname}_eq`; params[p] = v.equals; conditions.push(`${col} = @${p}`); }
+          else { const p = bindParam(params, `${pname}_eq`, v.equals); conditions.push(`${col} = @${p}`); }
         }
-        if (v.contains !== undefined) { const p = `${pname}_co`; params[p] = `%${v.contains}%`; conditions.push(`${col} LIKE @${p}`); }
-        if (v.startsWith !== undefined) { const p = `${pname}_sw`; params[p] = `${v.startsWith}%`; conditions.push(`${col} LIKE @${p}`); }
-        if (v.endsWith !== undefined) { const p = `${pname}_ew`; params[p] = `%${v.endsWith}`; conditions.push(`${col} LIKE @${p}`); }
-        if (v.gte !== undefined) { const p = `${pname}_gte`; params[p] = v.gte; conditions.push(`${col} >= @${p}`); }
-        if (v.lte !== undefined) { const p = `${pname}_lte`; params[p] = v.lte; conditions.push(`${col} <= @${p}`); }
-        if (v.gt !== undefined) { const p = `${pname}_gt`; params[p] = v.gt; conditions.push(`${col} > @${p}`); }
-        if (v.lt !== undefined) { const p = `${pname}_lt`; params[p] = v.lt; conditions.push(`${col} < @${p}`); }
+        if (v.contains !== undefined) { const p = bindParam(params, `${pname}_co`, `%${v.contains}%`); conditions.push(`${col} LIKE @${p}`); }
+        if (v.startsWith !== undefined) { const p = bindParam(params, `${pname}_sw`, `${v.startsWith}%`); conditions.push(`${col} LIKE @${p}`); }
+        if (v.endsWith !== undefined) { const p = bindParam(params, `${pname}_ew`, `%${v.endsWith}`); conditions.push(`${col} LIKE @${p}`); }
+        if (v.gte !== undefined) { const p = bindParam(params, `${pname}_gte`, v.gte); conditions.push(`${col} >= @${p}`); }
+        if (v.lte !== undefined) { const p = bindParam(params, `${pname}_lte`, v.lte); conditions.push(`${col} <= @${p}`); }
+        if (v.gt !== undefined) { const p = bindParam(params, `${pname}_gt`, v.gt); conditions.push(`${col} > @${p}`); }
+        if (v.lt !== undefined) { const p = bindParam(params, `${pname}_lt`, v.lt); conditions.push(`${col} < @${p}`); }
         if (v.in !== undefined) {
           if (Array.isArray(v.in) && v.in.length > 0) {
-            const ps = v.in.map((x: any, i: number) => { const p = `${pname}_in${i}`; params[p] = x; return `@${p}`; });
+            const ps = v.in.map((x: any, i: number) => { const p = bindParam(params, `${pname}_in${i}`, x); return `@${p}`; });
             conditions.push(`${col} IN (${ps.join(', ')})`);
           } else {
             conditions.push('1=0');
@@ -159,15 +166,15 @@ export function parseWhere(
         }
         if (v.notIn !== undefined) {
           if (Array.isArray(v.notIn) && v.notIn.length > 0) {
-            const ps = v.notIn.map((x: any, i: number) => { const p = `${pname}_notin${i}`; params[p] = x; return `@${p}`; });
+            const ps = v.notIn.map((x: any, i: number) => { const p = bindParam(params, `${pname}_notin${i}`, x); return `@${p}`; });
             conditions.push(`${col} NOT IN (${ps.join(', ')})`);
           } else {
             conditions.push('1=1');
           }
         }
       } else {
-        params[pname] = value;
-        conditions.push(`${col} = @${pname}`);
+        const p = bindParam(params, pname, value);
+        conditions.push(`${col} = @${p}`);
       }
     }
   }

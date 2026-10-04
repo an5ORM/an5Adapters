@@ -10,6 +10,11 @@ export interface An5SheetsAdapterConfig {
    * When provided, the adapter uses raw fetch() instead of googleapis JWT, making it compatible
    * with browser environments. Mutually exclusive with clientEmail/privateKey/credentials. */
   accessToken?: string;
+  /** Offline desktop OAuth credentials. Keep these in secure storage, never source control. */
+  refreshToken?: string;
+  oauthClientId?: string;
+  oauthClientSecret?: string;
+  tokenExpiresAt?: number;
   /** Google API key for browser-based API access. */
   apiKey?: string;
 }
@@ -22,10 +27,14 @@ export function normalizeKey(key: string): string {
 }
 
 export function resolveConfig(config: An5SheetsAdapterConfig) {
-  if (config.accessToken || config.apiKey) {
+  if (config.accessToken || config.refreshToken || config.apiKey) {
     return {
       spreadsheetId: config.spreadsheetId,
       accessToken: config.accessToken,
+      refreshToken: config.refreshToken,
+      oauthClientId: config.oauthClientId,
+      oauthClientSecret: config.oauthClientSecret,
+      tokenExpiresAt: config.tokenExpiresAt,
       apiKey: config.apiKey,
       sheetMapping: config.sheetMapping,
     };

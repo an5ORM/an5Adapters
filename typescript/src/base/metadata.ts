@@ -13,6 +13,14 @@ export interface ModelFieldMeta {
   [key: string]: any;
 }
 
+/** Prefer schema primary-key metadata; retain name inference for legacy clients. */
+export function resolveIdField(fields: Record<string, any>): string | undefined {
+  const primaryKey = Object.keys(fields).find(name => fields[name]?.isId === true);
+  if (primaryKey) return primaryKey;
+  if (Object.prototype.hasOwnProperty.call(fields, 'id')) return 'id';
+  return Object.keys(fields).find(name => name.endsWith('_id') || name.endsWith('Id') || name.toLowerCase() === 'id');
+}
+
 export interface AdapterMetadata {
   modelToTable?: Record<string, string>;
   modelFields?: Record<string, any>;

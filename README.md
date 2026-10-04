@@ -276,8 +276,38 @@ db.transaction(perform_transfer)
 | `groupBy(args)` | Group by fields with aggregations and pagination |
 | `vectorSearch(args)` | Semantic vector similarity search |
 
+Generated TypeScript field metadata marks schema primary keys with `isId: true`.
+SQL and Google Sheets `create` use this marker to identify custom primary-key
+names before falling back to `id` or `...Id` for older metadata. Regenerate the
+client to enable this behavior for existing custom-key schemas.
+
+`createMany` uses a bulk statement when every row supplies the same columns.
+Rows with different column sets or missing generated UUID keys are inserted
+individually so omitted columns retain their defaults and UUID keys are assigned. Bulk failures are propagated without retrying
+individual rows. Wrap mixed-column inserts in `$transaction` when they must
+succeed or roll back together.
+
+For SQL adapters, `skipDuplicates: true` skips only unique or primary-key
+violations. Connection failures and other constraint errors are propagated.
+Google Sheets does not enforce unique constraints; this flag does not deduplicate
+sheet rows, and failed batch appends are propagated without individual retries.
+
+For SQL adapters, `findMany` and `groupBy` accept `skip` without `take` to
+return all remaining rows or groups. Supply `orderBy` for stable row pagination;
+`groupBy` orders by its grouping fields when pagination has no explicit ordering.
+With relation metadata configured, `groupBy.where` supports the same relation
+filters as `findMany.where`, including `some`, `none`, `every`, `is`, and `isNot`.
+
 ---
 
 ## License
 
 MIT
+
+### Google Sheets desktop OAuth
+
+Google Sheets connections accept `accessToken`, `refreshToken`, `oauthClientId`, optional `oauthClientSecret`, and `tokenExpiresAt` (Unix milliseconds). The VS Code connection UI can generate and store this URI after browser sign-in and spreadsheet selection. Values in the semicolon-delimited URI must be URL encoded. Keep offline credentials in secure storage; do not commit them.
+
+The adapter refreshes expired access tokens before requests, shares concurrent refresh requests, and retries authentication failures once after refreshing. Revoked credentials report a reconnect error. Existing service account, API key and access-token-only configurations remain supported.
+
+For web applications, use a Google Web OAuth client and per-user access tokens. The browser adapter rejects offline desktop credentials and service account private keys. A browser connection manager must handle account selection, token reacquisition and SQLite persistence; see the [browser connection design](https://an5orm.github.io/docs/guides/browser-connections/).

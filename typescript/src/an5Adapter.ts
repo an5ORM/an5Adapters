@@ -26,10 +26,11 @@ import {
   type NBaseAdapterConfig,
   type NBaseVectorClient,
 } from './nbase';
-import { buildOrderBy, parseWhere, quote } from './base/sql';
+import { bindParam, buildOrderBy, parseWhere, quote } from './base/sql';
 import {
   createAdapterProxy,
   getFieldsForModel,
+  resolveIdField,
   getModelToTable,
   getRelationMap,
   getRelationsForModel,
@@ -51,39 +52,56 @@ function sanitizeParamName(name: string): string {
   return /^[A-Za-z]/.test(cleaned) ? cleaned : `p_${cleaned}`;
 }
 
+/** Match only unique/primary-key violations, never general constraint errors. */
+function isDuplicateKeyError(error: unknown, dialect: Dialect): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const e = error as any;
+  if (dialect === 'postgres') return e.code === '23505';
+  if (dialect === 'mysql') return e.code === 'ER_DUP_ENTRY' || e.errno === 1062;
+  if (dialect === 'sqlite') {
+    return e.code === 'SQLITE_CONSTRAINT_UNIQUE' || e.code === 'SQLITE_CONSTRAINT_PRIMARYKEY'
+      || e.errcode === 2067 || e.errcode === 1555;
+  }
+  if (dialect === 'mssql') {
+    const number = e.number ?? e.originalError?.info?.number;
+    return number === 2601 || number === 2627;
+  }
+  return false;
+}
+
 function appendUpdateSet(sets: string[], params: Record<string, any>, col: string, val: any, dialect: Dialect): void {
   const quoted = quote(col, dialect);
   const safeCol = sanitizeParamName(col);
   if (val && typeof val === 'object' && !(val instanceof Date)) {
     if (val.increment !== undefined) {
-      sets.push(`${quoted} = ${quoted} + @s_${safeCol}_inc`);
-      params[`s_${safeCol}_inc`] = val.increment;
+      const p = bindParam(params, `s_${safeCol}_inc`, val.increment);
+      sets.push(`${quoted} = ${quoted} + @${p}`);
       return;
     }
     if (val.decrement !== undefined) {
-      sets.push(`${quoted} = ${quoted} - @s_${safeCol}_dec`);
-      params[`s_${safeCol}_dec`] = val.decrement;
+      const p = bindParam(params, `s_${safeCol}_dec`, val.decrement);
+      sets.push(`${quoted} = ${quoted} - @${p}`);
       return;
     }
     if (val.multiply !== undefined) {
-      sets.push(`${quoted} = ${quoted} * @s_${safeCol}_mul`);
-      params[`s_${safeCol}_mul`] = val.multiply;
+      const p = bindParam(params, `s_${safeCol}_mul`, val.multiply);
+      sets.push(`${quoted} = ${quoted} * @${p}`);
       return;
     }
     if (val.divide !== undefined) {
-      sets.push(`${quoted} = ${quoted} / @s_${safeCol}_div`);
-      params[`s_${safeCol}_div`] = val.divide;
+      const p = bindParam(params, `s_${safeCol}_div`, val.divide);
+      sets.push(`${quoted} = ${quoted} / @${p}`);
       return;
     }
     if (val.set !== undefined) {
-      sets.push(`${quoted} = @s_${safeCol}_set`);
-      params[`s_${safeCol}_set`] = val.set;
+      const p = bindParam(params, `s_${safeCol}_set`, val.set);
+      sets.push(`${quoted} = @${p}`);
       return;
     }
   }
 
-  sets.push(`${quoted} = @s_${safeCol}`);
-  params[`s_${safeCol}`] = val;
+  const p = bindParam(params, `s_${safeCol}`, val);
+  sets.push(`${quoted} = @${p}`);
 }
 
 function selectedAggregateFields(fields: any): string[] {
@@ -789,7 +807,8 @@ export class AdapterTableClient<T = any> {
         query = `SELECT ${cols} FROM ${this.tableName}`;
         if (whereSql) query += ` WHERE ${whereSql}`;
         if (orderSql) query += ` ${orderSql}`;
-        query += ` LIMIT ${take ?? 'ALL'} OFFSET ${skip}`;
+        const limit = take ?? (this.dialect === 'sqlite' ? '-1' : this.dialect === 'mysql' ? '18446744073709551615' : 'ALL');
+        query += ` LIMIT ${limit} OFFSET ${skip}`;
       } else {
         // mssql requires ORDER BY before OFFSET/FETCH
         query = `SELECT ${cols} FROM ${this.tableName}${this.nolock}`;
@@ -854,9 +873,7 @@ export class AdapterTableClient<T = any> {
     }
 
     const fields = getFieldsForModel(this.modelName);
-    const idFieldName = Object.prototype.hasOwnProperty.call(fields, 'id')
-      ? 'id'
-      : Object.keys(fields).find((name) => name.endsWith('_id') || name.endsWith('Id') || name.toLowerCase() === 'id');
+    const idFieldName = resolveIdField(fields);
 
     const data: any = { ...rawData };
     if (idFieldName) {
@@ -918,8 +935,20 @@ export class AdapterTableClient<T = any> {
     if (firstRow === undefined) return { count: 0 };
     const firstCols = Object.keys(firstRow).filter(k => (firstRow as any)[k] !== undefined);
 
-    // Bulk INSERT for the common case (same columns, no skipDuplicates)
-    if (firstCols.length > 0 && !args.skipDuplicates) {
+    const sameColumns = args.data.every(row => {
+      const cols = Object.keys(row).filter(k => (row as any)[k] !== undefined);
+      return cols.length === firstCols.length && firstCols.every(col => cols.includes(col));
+    });
+
+    const fields = getFieldsForModel(this.modelName);
+    const idFieldName = resolveIdField(fields);
+    const idDef = idFieldName ? fields[idFieldName] : undefined;
+    const idType = typeof idDef === 'string' ? idDef : (idDef?.ts || idDef?.sql || idDef?.type || '');
+    const generatesId = ['string', 'uuid', 'uniqueidentifier', 'nvarchar', 'varchar', 'text'].includes(String(idType).toLowerCase());
+    const needsGeneratedId = idFieldName && generatesId && args.data.some(row => !(row as any)[idFieldName]);
+
+    // Rows needing generated IDs follow create's default handling.
+    if (firstCols.length > 0 && sameColumns && !needsGeneratedId && !args.skipDuplicates) {
       const params: Record<string, any> = {};
       const rowPlaceholders: string[] = [];
 
@@ -934,19 +963,15 @@ export class AdapterTableClient<T = any> {
       }
 
       const query = `INSERT INTO ${this.tableName} (${firstCols.map(c => quote(c, this.dialect)).join(', ')}) VALUES ${rowPlaceholders.join(', ')}`;
-      try {
-        await this.doExecuteRaw(query, params);
-        return { count: args.data.length };
-      } catch {
-        // fallback below if bulk fails (e.g. mixed column sets)
-      }
+      await this.doExecuteRaw(query, params);
+      return { count: args.data.length };
     }
 
     // Row-by-row fallback
     let count = 0;
     for (const row of args.data) {
       try { await this.create({ data: row }); count++; }
-      catch (e) { if (!args.skipDuplicates) throw e; }
+      catch (e) { if (!args.skipDuplicates || !isDuplicateKeyError(e, this.dialect)) throw e; }
     }
     return { count };
   }
@@ -1132,7 +1157,7 @@ export class AdapterTableClient<T = any> {
 
   async groupBy(args: any): Promise<any[]> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect);
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect, '', this.whereContext());
     const byFields = normalizeByFields(args?.by);
     if (byFields.length === 0) throw new Error("groupBy requires 'by' fields");
     const byCols = byFields.map((b: string) => quote(b, this.dialect)).join(', ');
@@ -1151,8 +1176,8 @@ export class AdapterTableClient<T = any> {
       const skip = toNonNegativeInt(args?.skip);
       const take = toNonNegativeInt(args?.take, 1);
       if (this.dialect === 'postgres' || this.dialect === 'mysql' || this.dialect === 'sqlite') {
-        if (hasTake) query += ` LIMIT ${take}`;
-        query += ` OFFSET ${skip}`;
+        const limit = hasTake ? take : (this.dialect === 'sqlite' ? '-1' : this.dialect === 'mysql' ? '18446744073709551615' : 'ALL');
+        query += ` LIMIT ${limit} OFFSET ${skip}`;
       } else {
         query += ` OFFSET ${skip} ROWS`;
         if (hasTake) query += ` FETCH NEXT ${take} ROWS ONLY`;

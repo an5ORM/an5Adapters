@@ -36,6 +36,12 @@ async function run(target) {
     assert.deepEqual(await ids(order, { user: { isNot: null } }), [1,2,3]);
     assert.deepEqual(await ids(order, { user: { is: { id: 2 } } }), [3]);
     assert.deepEqual(await ids(order, { user: { isNot: { id: 2 } } }), [1,2,4]);
+    const groups = await user.groupBy({
+      by: ['id'], where: { orders: { some: { score: 10 }, none: { score: 20 } } }, orderBy: { id: 'asc' },
+    });
+    assert.deepEqual(groups.map(row => [Number(row.id), Number(row._count)]), [[2, 1]]);
+    const absentGroups = await order.groupBy({ by: ['id'], where: { user: { is: null } } });
+    assert.deepEqual(absentGroups.map(row => Number(row.id)), [4]);
     await assert.rejects(db.$transaction(async tx => {
       await tx.table('Order').updateMany({ where: { id: 4 }, data: { userId: 3 } });
       throw new Error('nullable relation rollback');
