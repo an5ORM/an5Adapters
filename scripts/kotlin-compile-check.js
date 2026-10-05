@@ -69,6 +69,30 @@ if (!kotlinc) {
   console.log('kotlin-compile-check: kotlinc not installed, skipping');
   process.exit(0);
 }
+
+// Where the stdlib sits depends on how the compiler was installed: a KOTLIN_HOME distro
+// has it under `lib`, an apt/symlink install only shows it once the link is resolved. The
+// candidates are tried in order rather than assumed from one layout, because the smoke is
+// run by the JVM and without the jar the class files load and then fail on the first
+// stdlib reference.
+function kotlinStdlib(compiler) {
+  let real = compiler;
+  try {
+    real = fs.realpathSync(compiler);
+  } catch {
+    // the compiler was found by toolchain(), so keep the path as given
+  }
+  const roots = [
+    process.env.KOTLIN_HOME,
+    path.dirname(path.dirname(real)),
+    path.dirname(path.dirname(path.dirname(real))),
+  ].filter(Boolean);
+  for (const root of roots) {
+    const jar = path.join(root, 'lib', 'kotlin-stdlib.jar');
+    if (fs.existsSync(jar)) return jar;
+  }
+  return null;
+}
 if (!fs.existsSync(path.join(kotlinDir, 'src', 'main', 'kotlin'))) {
   console.log('kotlin-compile-check: no Kotlin adapter found, skipping');
   process.exit(0);
@@ -118,7 +142,7 @@ try {
   ];
   // The stdlib travels with the compiler, so it is both on the compile classpath and the
   // runtime one; without it the class files load and then fail on the first null check.
-  const stdlib = path.join(path.dirname(path.dirname(kotlinc)), 'lib', 'kotlin-stdlib.jar');
+  const stdlib = kotlinStdlib(kotlinc);
   const runtimeClasspath = [outDir, classes, stdlib, driverJar]
     .filter((entry) => fs.existsSync(entry))
     .join(path.delimiter);
@@ -146,6 +170,10 @@ try {
     .find(Boolean);
   if (!mainClass) {
     console.log('kotlin-compile-check: compiled clean, no smoke entry point to run');
+    process.exit(0);
+  }
+  if (!stdlib) {
+    console.log('kotlin-compile-check: kotlin-stdlib.jar not found next to the compiler, compiled but not run');
     process.exit(0);
   }
   execFileSync(
