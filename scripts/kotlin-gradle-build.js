@@ -87,6 +87,10 @@ if (!installed) {
 }
 
 try {
+  // The version is printed because the Test task's rules differ across Gradle majors, and
+  // a failure without it cannot be told from a broken manifest.
+  const version = (command(gradle, ['-version']).match(/^Gradle .*$/m) || ['unknown'])[0];
+  console.log(`kotlin-gradle-build: ${gradle} (${version})`);
   command(gradle, ['build', '--console=plain', '--no-daemon'], { cwd: kotlinDir });
 } catch (error) {
   if (isNetworkFailure(error)) skip('Gradle plugin repository unreachable');
