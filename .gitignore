@@ -22,3 +22,4 @@ env/
 .DS_Store
 .vscode/
 .idea/
+swift/.build/

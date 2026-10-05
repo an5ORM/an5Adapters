@@ -1,0 +1,16 @@
+an5/adapters/base/RelationDef.class
+an5/adapters/An5GroupBy.class
+an5/adapters/An5Adapter$TransactionWork.class
+an5/adapters/base/Dialect.class
+an5/adapters/base/FieldMeta.class
+an5/adapters/An5TableClient.class
+an5/adapters/An5Aggregate.class
+an5/adapters/base/Vectors.class
+an5/adapters/An5ViewClient.class
+an5/adapters/base/Metadata.class
+an5/adapters/base/SqlBuilder$Where.class
+an5/adapters/An5Adapter.class
+an5/adapters/An5TableClient$1.class
+an5/adapters/base/JdbcUrls.class
+an5/adapters/An5Query.class
+an5/adapters/base/SqlBuilder.class

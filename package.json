@@ -1,7 +1,7 @@
 {
   "name": "@an5/adapters",
   "version": "0.2.11",
-  "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET, Go, Rust, and Google Sheets query execution.",
+  "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET, Go, Rust, Java, Kotlin, Swift, and Google Sheets query execution.",
   "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -23,6 +23,9 @@
     "./dotnet": "./dotnet/An5Adapter.cs",
     "./golang": "./golang/an5_adapter.go",
     "./rust": "./rust/Cargo.toml",
+    "./java": "./java/src/main/java",
+    "./kotlin": "./kotlin/src/main/kotlin",
+    "./swift": "./swift/Sources/An5Adapters",
     "./nbase": "./dist/nbase/index.js"
   },
   "author": "an5ORM",
@@ -40,18 +43,31 @@
     "dotnet",
     "go",
     "golang",
-    "rust"
+    "rust",
+    "java",
+    "kotlin",
+    "swift"
   ],
   "files": [
     "dist/**/*.{js,d.ts}",
     "typescript/src/**/*.ts",
+    "typescript/src/nbase/**/*.ts",
     "python/**/*.py",
     "dotnet/**/*",
     "golang/**/*",
     "rust/Cargo.toml",
     "rust/src/**/*",
-    "README.md",
-    "typescript/src/nbase/**/*.ts"
+    "java/pom.xml",
+    "java/src/main/java/**/*",
+    "java/src/test/java/**/*",
+    "kotlin/build.gradle.kts",
+    "kotlin/settings.gradle.kts",
+    "kotlin/src/main/kotlin/**/*",
+    "kotlin/src/test/kotlin/**/*",
+    "swift/Package.swift",
+    "swift/Sources/**/*",
+    "swift/Tests/**/*",
+    "README.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -64,7 +80,11 @@
     "test:python": "node scripts/python-tests.js",
     "test:dotnet": "node scripts/dotnet-compile-check.js && node scripts/dotnet-sqlite-smoke.js",
     "test:go": "cd golang && go test ./...",
-    "test:rust": "node scripts/rust-compile-check.js"
+    "test:rust": "node scripts/rust-compile-check.js",
+    "test:java": "node scripts/java-compile-check.js && node scripts/java-sqlite-smoke.js",
+    "test:kotlin": "node scripts/kotlin-compile-check.js",
+    "test:gradle": "node scripts/kotlin-gradle-build.js",
+    "test:swift": "node scripts/swift-test.js"
   },
   "dependencies": {
     "googleapis": "^183.0.0",

@@ -3,8 +3,12 @@
 ## [0.2.11] - 2026-10-04
 
 ### Added
+- Add the Java (JDBC), Kotlin and Swift runtimes: a dependency-free Java adapter, a Kotlin front door over it, and a Swift package that links the system SQLite. All three execute the shared query-semantics contract.
 - Support desktop Google Sheets OAuth credentials with automatic refresh, shared concurrent refresh requests and one retry after an expired access token.
 - Use explicit schema primary-key metadata when creating SQL or Google Sheets records, with legacy name inference retained.
+- Run the Java runtime's SQLite smoke and the shared query-semantics fixture from `test:java`.
+  Both were written for the Java adapter and no script invoked them, so the Java SQL builder
+  was compile-checked but never executed against a database.
 ### Fixed
 - Keep filter and update parameters distinct when column names normalize to the same parameter name.
 - Generate valid skip-only pagination for SQLite and MySQL, including grouped queries; apply relation context in grouped filters.
@@ -30,6 +34,22 @@
 - Align query composition across TypeScript, Python, .NET, Go and Rust.
 
 ## [Unreleased]
+
+### Added
+- Publish the Java and Kotlin adapters to Maven Central: a `publish-maven` job on `v*` tags
+  (and through the workflow's dispatch input) builds both manifests first, then uploads the
+  Java module with `-Prelease` — sources, javadoc, detached signatures, `central-publishing` —
+  and the Kotlin module with `maven-publish` and in-memory signing. A tag that does not match
+  the module versions fails before anything is uploaded.
+- Build a checkout with Gradle: `build.gradle.kts` now declares `mavenLocal()`, so the Java
+  sibling resolves from `~/.m2` after `mvn -f java/pom.xml install` instead of being looked
+  up on a repository that does not have it yet.
+- Run the Kotlin manifest through Gradle in CI (`test:gradle`), because `useJUnitPlatform()`
+  without an engine and a broken repository block compile fine under `kotlinc` and fail on a
+  Gradle consumer's machine.
+- Extend the version sync test to `java/pom.xml` and `kotlin/build.gradle.kts`, which are
+  maintained by hand and now publish: a stale one would ask Central for a version that
+  already exists.
 
 ### Fixed
 - **Query composition behaved differently from what it said, identically in all five

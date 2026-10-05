@@ -90,7 +90,7 @@ try {
       `  test('./' + sub + ' resolves', () => assert.ok(require('@an5/adapters/' + sub)));`,
       `});`,
       `test('packaged language adapter sources are present', () => {`,
-      `  ['python/an5_adapter.py','dotnet/An5Adapter.cs','golang/an5_adapter.go','golang/table_client.go','rust/Cargo.toml','rust/src/lib.rs'].forEach(rel => {`,
+      `  ['python/an5_adapter.py','dotnet/An5Adapter.cs','golang/an5_adapter.go','golang/table_client.go','rust/Cargo.toml','rust/src/lib.rs','java/pom.xml','java/src/main/java/an5/adapters/An5Adapter.java','kotlin/build.gradle.kts','kotlin/src/main/kotlin/an5/adapters/An5.kt','swift/Package.swift','swift/Sources/An5Adapters/An5Adapter.swift'].forEach(rel => {`,
       `    assert.ok(fs.existsSync(path.join(pkgDir, rel)), 'missing packaged file: ' + rel);`,
       `  });`,
       `});`,

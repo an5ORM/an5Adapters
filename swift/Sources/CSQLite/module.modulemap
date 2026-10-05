@@ -1,0 +1,8 @@
+module CSQLite [system] {
+    // The real header, not a hand-written copy of the declarations: a copied subset drifts
+    // from the library it claims to describe, and the compiler then accepts calls with the
+    // wrong signatures.
+    header "shim.h"
+    link "sqlite3"
+    export *
+}

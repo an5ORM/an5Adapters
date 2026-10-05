@@ -13,7 +13,7 @@ Standalone runtime database adapter and query engine for AN5 ORM. Provides conne
 - **Field Math Operators** — Atomic updates with `increment`, `decrement`, `multiply`, `divide`, `set`
 - **Vector Search** — Similarity search using NBase, pgvector (PostgreSQL), `VECTOR_DISTANCE` (MSSQL), or in-memory cosine/euclidean/dot similarity
 - **Real Transactions** — Interactive and callback transactions (`$transaction(async tx => ...)` and `$begin()/$commit()/$rollback()`)
-- **Cross-Language** — Unified API in TypeScript, Python, .NET (C#), Golang, and Rust
+- **Cross-Language** — Unified API in TypeScript, Python, .NET (C#), Golang, Rust, Java, Kotlin, and Swift
 - **Google Sheets Database** — Use spreadsheets as a live database with full CRUD and SQL syntax support
 
 ---
@@ -51,6 +51,76 @@ cargo add an5-adapters
 ```
 
 The crate is driver-agnostic — it depends on `sqlx` with `any`, so the app enables the driver it needs. See [crates.io](https://crates.io/crates/an5-adapters) and [docs.rs](https://docs.rs/an5-adapters).
+
+### Java
+
+```bash
+# Included in the npm package under java/, which ships its own pom.xml
+```
+
+`java/` is a Maven module with **no dependencies**: the adapter speaks JDBC through
+`java.sql`, so the app picks the driver it already has — `org.xerial:sqlite-jdbc`,
+`org.postgresql:postgresql` or `com.microsoft.sqlserver:mssql-jdbc`. That is what lets one
+runtime serve all three engines and what keeps it usable on Android, where an adapter that
+dragged in three drivers would not fit.
+
+```xml
+<dependency>
+  <groupId>org.an5orm</groupId>
+  <artifactId>an5-adapters-java</artifactId>
+  <version>0.2.11</version>
+</dependency>
+```
+
+From a checkout the same module is built and installed into `~/.m2`:
+
+```bash
+mvn -f java/pom.xml install
+mvn -f java/pom.xml test
+```
+
+### Kotlin
+
+```bash
+# Included in the npm package under kotlin/, which ships build.gradle.kts
+```
+
+Gradle rather than Maven, because Kotlin on Android is built with Gradle and a runtime a
+phone app cannot resolve is not a mobile runtime. The Kotlin runtime depends on the Java one
+rather than reimplementing it, so the dialect rules and the where builder exist once:
+
+```kotlin
+dependencies {
+    implementation("org.an5orm:an5-adapters-kotlin:0.2.11")
+}
+```
+
+From a checkout the Kotlin module resolves its Java sibling from `~/.m2` — declared as
+`mavenLocal()` in `build.gradle.kts`, so the checkout builds without publishing anything
+first:
+
+```bash
+mvn -f java/pom.xml install
+gradle -p kotlin build
+```
+
+Both JVM modules publish to Maven Central: a `v*` tag runs the `publish-maven` job in
+`.github/workflows/publish.yml` (`mvn -Prelease deploy` and `gradle publish`), and a manual
+run is available through the workflow's `publish-maven` input. It needs the repository
+secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTRAL_TOKEN` (a Central Portal token),
+`MAVEN_GPG_PRIVATE_KEY` and `MAVEN_GPG_PASSPHRASE`.
+
+### Swift
+
+```swift
+.package(url: "https://github.com/an5ORM/an5Adapters.git", from: "0.2.11")
+```
+
+A SwiftPM package that links the **system** SQLite — the database every Apple platform
+already ships, so there is no bundled engine and the same file works on device and in the
+simulator. Building it needs SQLite's headers (`apt-get install libsqlite3-dev` on Linux).
+The runtime takes a `SQLDriver`, so an app that already has a database layer can put GRDB or
+SQLite.swift underneath instead.
 
 ---
 
