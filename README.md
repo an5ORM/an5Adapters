@@ -68,7 +68,7 @@ dragged in three drivers would not fit.
 <dependency>
   <groupId>io.github.an5orm</groupId>
   <artifactId>an5-adapters-java</artifactId>
-  <version>0.2.12</version>
+  <version>0.2.11</version>
 </dependency>
 ```
 
@@ -91,7 +91,7 @@ rather than reimplementing it, so the dialect rules and the where builder exist 
 
 ```kotlin
 dependencies {
-    implementation("io.github.an5orm:an5-adapters-kotlin:0.2.12")
+    implementation("io.github.an5orm:an5-adapters-kotlin:0.2.11")
 }
 ```
 
@@ -104,11 +104,12 @@ mvn -f java/pom.xml install
 gradle -p kotlin build
 ```
 
-Both JVM modules publish to Maven Central: a `v*` tag runs the `publish-maven` job in
-`.github/workflows/publish.yml` (`mvn -Prelease deploy` and `gradle publish`), and a manual
-run is available through the workflow's `publish-maven` input. It needs the repository
-secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTRAL_TOKEN` (a Central Portal token),
-`MAVEN_GPG_PRIVATE_KEY` and `MAVEN_GPG_PASSPHRASE`.
+Both JVM modules publish to Maven Central, and `io.github.an5orm:an5-adapters-java:0.2.11`
+and `io.github.an5orm:an5-adapters-kotlin:0.2.11` are live: a `v*` tag runs the
+`publish-maven` job in `.github/workflows/publish.yml` (`mvn -Prelease deploy` and
+`gradle publish`), and a manual run is available through the workflow's `publish-maven`
+input. It needs the repository secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTRAL_TOKEN`
+(a Central Portal token), `MAVEN_GPG_PRIVATE_KEY` and `MAVEN_GPG_PASSPHRASE`.
 
 ### Swift
 
@@ -213,6 +214,13 @@ degrades performance rather than breaking queries.
 
 ## SQLite — vector search without a vector database
 
+For host-language-free distance calculation, build the shared
+[AN5 C extension](native/sqlite/README.md) with
+`npm run build:sqlite:native` and pass the printed library path as `sqliteVec`.
+It runs cosine, Euclidean and dot-product distances natively, with SSE2 on
+x86-64 and query-vector caching. The existing fallback remains available when
+an extension is not loaded.
+
 SQLite has no vector type, so a `VECTOR(n)` column stores a **BLOB of
 little-endian float32** — 4 bytes per dimension. Write a plain array of numbers
 and the adapter encodes it; read it back and you get the same array. A column
@@ -230,7 +238,7 @@ The search is ranked **inside the database**, trying four strategies in order:
 
 | Order | Strategy | Needs | Reaches |
 |-------|----------|-------|---------|
-| 1 | `sqlite-vec` | The extension loaded | `BLOB` columns, and `vec0` tables |
+| 1 | `sqlite-vec` | The extension loaded | Scalar distances over ordinary tables |
 | 2 | `udf` | A driver that can register a function | `BLOB` and legacy text columns |
 | 3 | `sql` | JSON1 (built in since SQLite 3.38) | Legacy text columns |
 | 4 | `memory` | Nothing | Any column, whole table loaded |
@@ -239,21 +247,22 @@ Strategies 1-3 transfer only the rows that match, which is the reason to prefer
 them. A row whose stored vector cannot be scored is left out rather than returned
 with a null distance.
 
-[sqlite-vec](https://github.com/asg017/sqlite-vec) adds an approximate nearest
-neighbour index and is worth loading once a table holds many embeddings:
+[sqlite-vec](https://github.com/asg017/sqlite-vec) supplies native vector distance
+functions for exact search. The adapter scans an ordinary table with those
+functions; it does not create or synchronize a `vec0` virtual table:
 
 ```ts
 const db = createAn5Adapter({
   connectionString: 'sqlite:///app.db',
-  sqliteVec: './node_modules/sqlite-vec/vec0',
+  sqliteVec: require('sqlite-vec').getLoadablePath(),
 });
 ```
 
 `vectorStrategy` pins one strategy instead of probing — `'auto'` (the default),
 `'sqlite-vec'`, `'udf'`, `'sql'` or `'memory'`. Every other runtime implements
 the same four strategies with the same order; `sqlx` (Rust) and JDBC (Java,
-Kotlin) cannot register a SQL function, so they reach `sql` and `memory`, which
-still ranks in the database.
+Kotlin) use `sql` for JSON text and `memory` for BLOB columns without
+driver-specific vector functions.
 
 ```python
 from an5_adapter import create_an5_adapter

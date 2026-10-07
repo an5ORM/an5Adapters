@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Added
+- Ship a portable C SQLite extension under `native/sqlite` for cosine, Euclidean
+  and negative-dot-product distances over float32 BLOBs or legacy JSON text.
+  It uses SSE2 on x86-64, double-precision accumulation and SQLite auxdata to cache
+  the query vector. Build it with `build:sqlite:native`; the existing extension-path
+  option loads it. TypeScript, Python, .NET and Swift preserve its native functions
+  instead of replacing them with host-language callbacks. Add real-extension
+  correctness tests, optional UBSan checks and a public-adapter benchmark.
 - **Vector search on SQLite** in every runtime — TypeScript, Python, .NET, Go, Rust, Java,
   Kotlin and Swift. A `VECTOR(n)` column is stored as a BLOB of little-endian float32 and
   ranked inside the database rather than in the client, trying four strategies in a fixed
@@ -44,8 +51,9 @@
 - Publish the Java and Kotlin adapters to Maven Central as `io.github.an5orm:an5-adapters-java` and `io.github.an5orm:an5-adapters-kotlin`.
   The first deployment used `org.an5orm`, which the Portal rejects unless the `an5orm.org`
   domain is proven; `io.github.an5orm` is granted from the GitHub identity that owns the
-  repository. `0.2.11` of the Java adapter was published under the new coordinates before the
-  Kotlin runtime could follow, so the pair ships as `0.2.12`.
+  repository. Both runtimes are live as `0.2.11` under the new coordinates — Java first,
+  Kotlin beside it — so `0.2.12` is the next pair to ship, carrying the credentials fix
+  below.
 
 ### Fixed
 - Write the `central` server entry with `${env.…}` rather than letting `setup-java` copy the
