@@ -66,7 +66,7 @@ dragged in three drivers would not fit.
 
 ```xml
 <dependency>
-  <groupId>org.an5orm</groupId>
+  <groupId>io.github.an5orm</groupId>
   <artifactId>an5-adapters-java</artifactId>
   <version>0.2.11</version>
 </dependency>
@@ -91,7 +91,7 @@ rather than reimplementing it, so the dialect rules and the where builder exist 
 
 ```kotlin
 dependencies {
-    implementation("org.an5orm:an5-adapters-kotlin:0.2.11")
+    implementation("io.github.an5orm:an5-adapters-kotlin:0.2.11")
 }
 ```
 

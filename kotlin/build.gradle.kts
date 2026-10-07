@@ -8,7 +8,7 @@ plugins {
 // Gradle rather than Maven because Kotlin on Android is built with Gradle, and a runtime a
 // phone app cannot resolve is not a mobile runtime. Maven consumers can still use the
 // published Maven coordinates; this module publishes both.
-group = "org.an5orm"
+group = "io.github.an5orm"
 version = "0.2.11"
 
 repositories {
@@ -24,7 +24,7 @@ dependencies {
     // The Java adapter is the implementation; this module is the Kotlin surface over it.
     // One SQL builder and one set of dialect rules, so a where tree cannot mean one thing in
     // Java and another in Kotlin.
-    api("org.an5orm:an5-adapters-java:${version}")
+    api("io.github.an5orm:an5-adapters-java:${version}")
 
     // `api`, not `implementation`: a row's accessors return stdlib types, so consumers see
     // them in their own signatures.
