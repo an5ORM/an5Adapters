@@ -68,6 +68,9 @@ func GetRelationsForModel(modelName string) map[string]RelationDef {
 type An5Adapter struct {
 	DB      *sql.DB
 	Dialect Dialect
+	// VectorSupport carries the SQLite vector settings. Set it before the first
+	// search to load sqlite-vec or to pin a strategy.
+	VectorSupport sqlite.VectorSupport
 }
 
 // NewAn5Adapter constructs an An5Adapter instance.
@@ -167,14 +170,47 @@ func (a *An5Adapter) VectorSearch(ctx context.Context, tableName string, targetV
 	vecBytes, _ := json.Marshal(targetVector)
 	vecStr := string(vecBytes)
 
-	// 1. Primary path: Native database SQL vector query execution via dialect provider (mssql / postgres / sqlite)
+	// 1. SQLite ranks through sqlite-vec, a driver function or json_each,
+	//    whichever this connection supports, so the table never has to leave the
+	//    database. `database/sql` cannot register a user function, so the UDF
+	//    strategy needs the driver to install them; see sqlite.RegisterVectorFunctions.
+	if a.Dialect == base.DialectSqlite {
+		tail := ""
+		if strings.TrimSpace(whereClause) != "" {
+			tail = " WHERE " + whereClause
+		}
+		support := a.VectorSupport
+		ranked, ran, err := sqlite.RunVectorSearch(
+			ctx,
+			a.DB,
+			a.QueryRaw,
+			base.QuoteTable(tableName, a.Dialect),
+			sqlite.NormalizeTableName(tableName),
+			base.QuoteIdentifier(vectorField, a.Dialect),
+			vectorField,
+			targetVector,
+			distanceMetric,
+			take,
+			tail,
+			args,
+			support,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if ran {
+			return DecodeVectorRows(ranked, vectorField), nil
+		}
+		// No in-database strategy: score the column in Go instead.
+		return a.vectorSearchInMemory(ctx, tableName, targetVector, take, whereClause, vectorField, distanceMetric, args)
+	}
+
+	// 2. Primary path: Native database SQL vector query execution via dialect provider (mssql / postgres)
 	var sqlQuery string
 	if a.Dialect == base.DialectPostgres {
 		sqlQuery = postgres.BuildVectorSearchQuery(tableName, vectorField, distanceMetric, dim, take, whereClause)
 	} else if a.Dialect == base.DialectMssql {
 		sqlQuery = mssql.BuildVectorSearchQuery(tableName, vectorField, distanceMetric, dim, take, whereClause)
-	} else if a.Dialect == base.DialectSqlite {
-		sqlQuery = sqlite.BuildVectorSearchQuery(tableName, vectorField, distanceMetric, dim, take, whereClause)
 	}
 
 	if sqlQuery != "" {
@@ -185,7 +221,7 @@ func (a *An5Adapter) VectorSearch(ctx context.Context, tableName string, targetV
 		}
 	}
 
-	// 2. Secondary fallback: Fetch rows and compute vector distance in-memory if DB lacks native vector extensions
+	// 3. Secondary fallback: Fetch rows and compute vector distance in-memory if DB lacks native vector extensions
 	fallbackQuery := "SELECT * FROM " + base.QuoteTable(tableName, a.Dialect)
 	if strings.TrimSpace(whereClause) != "" {
 		fallbackQuery += " WHERE " + whereClause
@@ -197,6 +233,42 @@ func (a *An5Adapter) VectorSearch(ctx context.Context, tableName string, targetV
 	}
 
 	return VectorSearchFallback(rows, targetVector, take, vectorField, distanceMetric), nil
+}
+
+// vectorSearchInMemory loads the table and scores the vector column in Go.
+//
+// The last resort for every provider, and the only option on a SQLite connection
+// that offers neither sqlite-vec, a driver function nor JSON1. The whole table is
+// loaded, so it is only reasonable for a table small enough to fit in memory.
+func (a *An5Adapter) vectorSearchInMemory(ctx context.Context, tableName string, targetVector []float64, take int, whereClause string, vectorField string, distanceMetric string, args []interface{}) ([]map[string]interface{}, error) {
+	query := "SELECT * FROM " + base.QuoteTable(tableName, a.Dialect)
+	if strings.TrimSpace(whereClause) != "" {
+		query += " WHERE " + whereClause
+	}
+	rows, err := a.QueryRaw(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return VectorSearchFallback(rows, targetVector, take, vectorField, distanceMetric), nil
+}
+
+// DecodeVectorRows replaces every stored `VECTOR(n)` column with a decoded
+// float64 slice, so a caller reads numbers rather than float32 bytes or JSON text.
+func DecodeVectorRows(rows []map[string]interface{}, vectorField string) []map[string]interface{} {
+	for _, row := range rows {
+		for key, value := range row {
+			decoded := base.DecodeVector(value)
+			if decoded == nil {
+				continue
+			}
+			// A `distance` column is a real number, not a stored vector.
+			if key == "distance" {
+				continue
+			}
+			row[key] = decoded
+		}
+	}
+	return rows
 }
 
 // VectorSearchFallback ranks rows in-memory.
@@ -213,34 +285,12 @@ func VectorSearchFallback(rows []map[string]interface{}, targetVector []float64,
 			continue
 		}
 
-		var rowVec []float64
-		switch v := raw.(type) {
-		case string:
-			_ = json.Unmarshal([]byte(v), &rowVec)
-		case []byte:
-			_ = json.Unmarshal(v, &rowVec)
-		case []float64:
-			rowVec = v
-		case []interface{}:
-			for _, item := range v {
-				if f, ok := item.(float64); ok {
-					rowVec = append(rowVec, f)
-				}
-			}
-		}
-
-		if len(rowVec) != len(targetVector) {
+		// A float32 BLOB, a legacy JSON text column and an already-decoded slice
+		// all read the same way.
+		rowVec := base.DecodeVector(raw)
+		dist, ok := base.VectorDistance(targetVector, rowVec, distanceMetric)
+		if !ok {
 			continue
-		}
-
-		var dist float64
-		switch strings.ToLower(distanceMetric) {
-		case "euclidean":
-			dist = base.EuclideanDistance(targetVector, rowVec)
-		case "dot":
-			dist = -base.DotProduct(targetVector, rowVec)
-		default: // cosine
-			dist = 1.0 - base.CosineSimilarity(targetVector, rowVec)
 		}
 
 		rCopy := make(map[string]interface{})
@@ -311,4 +361,3 @@ func (a *An5Adapter) ExecuteProc(ctx context.Context, procName string, args ...i
 	}
 	return a.ExecuteRaw(ctx, sql, args...)
 }
-

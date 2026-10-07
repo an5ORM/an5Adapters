@@ -209,6 +209,57 @@ If NBase is unreachable, `vectorSearch` logs a warning and falls back to the
 database's native vector support, then to in-memory similarity, so an outage
 degrades performance rather than breaking queries.
 
+---
+
+## SQLite — vector search without a vector database
+
+SQLite has no vector type, so a `VECTOR(n)` column stores a **BLOB of
+little-endian float32** — 4 bytes per dimension. Write a plain array of numbers
+and the adapter encodes it; read it back and you get the same array. A column
+that already holds JSON text (`'[0.1, 0.2]'`) keeps working, so nothing has to
+be migrated.
+
+```ts
+await db.table('Article').create({ data: { title: '…', embedding: queryEmbedding } });
+
+const row = await db.table('Article').findFirst({ where: { title: '…' } });
+row.embedding; // number[]
+```
+
+The search is ranked **inside the database**, trying four strategies in order:
+
+| Order | Strategy | Needs | Reaches |
+|-------|----------|-------|---------|
+| 1 | `sqlite-vec` | The extension loaded | `BLOB` columns, and `vec0` tables |
+| 2 | `udf` | A driver that can register a function | `BLOB` and legacy text columns |
+| 3 | `sql` | JSON1 (built in since SQLite 3.38) | Legacy text columns |
+| 4 | `memory` | Nothing | Any column, whole table loaded |
+
+Strategies 1-3 transfer only the rows that match, which is the reason to prefer
+them. A row whose stored vector cannot be scored is left out rather than returned
+with a null distance.
+
+[sqlite-vec](https://github.com/asg017/sqlite-vec) adds an approximate nearest
+neighbour index and is worth loading once a table holds many embeddings:
+
+```ts
+const db = createAn5Adapter({
+  connectionString: 'sqlite:///app.db',
+  sqliteVec: './node_modules/sqlite-vec/vec0',
+});
+```
+
+`vectorStrategy` pins one strategy instead of probing — `'auto'` (the default),
+`'sqlite-vec'`, `'udf'`, `'sql'` or `'memory'`. Every other runtime implements
+the same four strategies with the same order; `sqlx` (Rust) and JDBC (Java,
+Kotlin) cannot register a SQL function, so they reach `sql` and `memory`, which
+still ranks in the database.
+
+```python
+from an5_adapter import create_an5_adapter
+db = create_an5_adapter("sqlite:///app.db", sqlite_vec="vec0", vector_strategy="auto")
+```
+
 
 ## Usage
 
@@ -344,7 +395,7 @@ db.transaction(perform_transfer)
 | `count(args)` | Count matching records |
 | `aggregate(args)` | Compute `_count`, `_sum`, `_avg`, `_min`, `_max` |
 | `groupBy(args)` | Group by fields with aggregations and pagination |
-| `vectorSearch(args)` | Semantic vector similarity search |
+| `vectorSearch(args)` | Semantic vector similarity search; SQLite ranks it in the database (sqlite-vec, `an5_vec_*`, `json_each`), everything else uses the engine's native support or scores in memory |
 
 Generated TypeScript field metadata marks schema primary keys with `isId: true`.
 SQL and Google Sheets `create` use this marker to identify custom primary-key

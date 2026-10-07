@@ -59,7 +59,7 @@ public struct TableClient {
             }
             rows = rows.map { project($0, selected: select) }
         }
-        return rows
+        return decodeVectorRows(rows)
     }
 
     /// The rows matching `filter`, with the optional refinements `query` adds.
@@ -110,9 +110,10 @@ public struct TableClient {
             if missing { scalars[idField.name] = UUID().uuidString }
         }
 
+        let encoded = encodeVectorFields(scalars)
         var columns: [String] = []
         var values: [SQLValue] = []
-        for (column, value) in scalars {
+        for (column, value) in encoded {
             // A null column is left out rather than bound as NULL: an unset column takes the
             // schema's DEFAULT, which is what the caller meant by leaving it out.
             guard let value, !(value is NSNull) else { continue }
@@ -188,7 +189,7 @@ public struct TableClient {
         let clause = SQLBuilder.whereClause(filter, dialect: dialect, prefix: "w_")
         var setParts: [String] = []
         var setValues: [SQLValue] = []
-        for (column, value) in data {
+        for (column, value) in encodeVectorFields(data) {
             guard let value, !(value is NSNull) else { continue }
             SQLBuilder.appendUpdateSet(&setParts, &setValues, column: column, value: value, dialect: dialect)
         }
@@ -299,6 +300,14 @@ public struct TableClient {
         let quotedField = dialect.quote(field)
 
         if dialect == .sqlite {
+            // SQLite has no vector operator, so the ranking runs through sqlite-vec, a
+            // registered distance function or json_each, whichever this driver supports.
+            if let ranked = try sqliteVectorSearch(
+                vector, take: take, field: field, metric: metric, clause: clause
+            ) {
+                return ranked
+            }
+            // No in-database strategy: score the column in Swift instead.
             return try vectorSearchInMemory(
                 vector, take: take, filter: filter, field: field, metric: metric
             )
@@ -331,6 +340,83 @@ public struct TableClient {
         }
     }
 
+    /// SQLite ranks a `VECTOR(n)` column inside the database.
+    ///
+    /// Returns `nil` when the connection offers no strategy, so the caller falls back to
+    /// scoring in Swift.
+    private func sqliteVectorSearch(
+        _ vector: [Double],
+        take: Int,
+        field: String,
+        metric: DistanceMetric,
+        clause: SQLBuilder.WhereClause
+    ) throws -> [Row]? {
+        guard !vector.isEmpty else { return [] }
+        let capabilities = adapter.sqliteCapabilities
+        let declared = (try? adapter.queryColumnType(table: metadata.table(model), column: field)) ?? nil
+        let tail = clause.isEmpty ? "" : " WHERE \(clause.sql)"
+        let column = dialect.quote(field)
+
+        for strategy in SqliteVectors.plan(
+            capabilities: capabilities, declaredType: declared, preference: adapter.vectorStrategy
+        ) {
+            var bind: [SQLValue] = []
+            guard let sql = SqliteVectors.rankingQuery(
+                strategy: strategy, metric: metric, table: tableSQL, column: column,
+                vector: vector, take: take, tail: tail,
+                placeholder: dialect.placeholder, bind: &bind
+            ) else { continue }
+            // The strategy's own placeholders sit inside the ranked subquery, so their values
+            // lead the list; the caller's WHERE values follow, because its placeholders do too.
+            guard let rows = try? adapter.query(sql, parameters(bind + clause.parameters)) else {
+                // The connection advertised the capability but the query failed, e.g. an
+                // extension that did not really load. The next strategy is cheaper than
+                // reporting the failure.
+                continue
+            }
+            return decodeVectorRows(rows)
+        }
+        return nil
+    }
+
+    /// The `VECTOR(n)` columns of this model, from the generated metadata.
+    private var vectorFields: [String] {
+        metadata.fields(model).filter(SqliteVectors.isVectorField).map(\.name)
+    }
+
+    /// Encodes every `VECTOR(n)` value on its way into SQLite.
+    ///
+    /// The column holds a float32 BLOB, which is a third of the size of the JSON text it
+    /// replaces. Values that already arrived as text or bytes are left alone, so rows written
+    /// by an older version stay readable.
+    private func encodeVectorFields(_ values: Values) -> Values {
+        guard dialect == .sqlite else { return values }
+        let names = vectorFields
+        guard !names.isEmpty else { return values }
+        var out = values
+        for name in names {
+            guard let value = out[name], SqliteVectors.needsEncoding(value),
+                  let decoded = SqliteVectors.decode(value) else { continue }
+            out[name] = SqliteVectors.encode(decoded)
+        }
+        return out
+    }
+
+    /// Decodes `VECTOR(n)` columns back into arrays of numbers after a read.
+    private func decodeVectorRows(_ rows: [Row]) -> [Row] {
+        guard dialect == .sqlite, !rows.isEmpty else { return rows }
+        let names = vectorFields
+        guard !names.isEmpty else { return rows }
+        return rows.map { row in
+            var out = row
+            for name in names where out[name] != nil {
+                guard let decoded = SqliteVectors.decode(out[name] ?? nil) else { continue }
+                out[name] = decoded
+            }
+            return out
+        }
+    }
+
     private func vectorSearchInMemory(
         _ vector: [Double],
         take: Int,
@@ -341,7 +427,8 @@ public struct TableClient {
         let rows = try findMany(Query(filter: filter))
         var scored: [(row: Row, distance: Double)] = []
         for row in rows {
-            guard let stored = Vectors.parse(cell(row, field), expectedLength: vector.count) else { continue }
+            guard let stored = SqliteVectors.decode(cell(row, field), expectedLength: vector.count)
+            else { continue }
             scored.append((row, DistanceMetric.distance(metric, vector, stored)))
         }
         scored.sort { $0.distance < $1.distance }

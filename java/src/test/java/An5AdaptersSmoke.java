@@ -7,6 +7,7 @@ import an5.adapters.An5ViewClient;
 import an5.adapters.base.Dialect;
 import an5.adapters.base.JdbcUrls;
 import an5.adapters.base.Metadata;
+import an5.adapters.base.SqliteVectors;
 import an5.adapters.base.Vectors;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -39,6 +40,9 @@ public final class An5AdaptersSmoke {
     transactionRollback();
     viewIsReadOnly();
     vectorFallback();
+    sqliteVectorCodecAndPlan();
+    sqliteVectorSearch();
+    sqliteVectorColumnRoundTrip();
 
     if (failures > 0) {
       System.out.println("java smoke: " + failures + " check(s) failed");
@@ -352,6 +356,273 @@ public final class An5AdaptersSmoke {
       equals("vector search skips rows without a vector", 2, hits.size());
       equals("vector search orders by distance", "near", hits.get(0).get("title"));
       equals("vector search reports the distance", true, hits.get(0).containsKey("distance"));
+    } finally {
+      adapter.close();
+    }
+  }
+
+  /**
+   * SQLite vector codec and strategy plan.
+   *
+   * <p>The docstring in {@code SqliteVectors} is the shared specification every runtime
+   * implements; test/sqlite-vector.test.js (TypeScript) is the mirror of this coverage.
+   */
+  private static void sqliteVectorCodecAndPlan() {
+    System.out.println("\n[sqlite vector codec]");
+    byte[] encoded = SqliteVectors.encodeVector(new double[] {1, -2, 0.5});
+    equals("float32 blob length", Integer.valueOf(12), Integer.valueOf(encoded.length));
+    equals(
+        "little-endian 1.0",
+        "0,0,128,63",
+        (encoded[0] & 0xff) + "," + (encoded[1] & 0xff) + "," + (encoded[2] & 0xff) + ","
+            + (encoded[3] & 0xff));
+    equals(
+        "blob round trip",
+        "[1.0, -2.0, 0.5]",
+        java.util.Arrays.toString(SqliteVectors.decodeVector(encoded, 0)));
+    equals(
+        "legacy JSON text",
+        "[1.0, 0.0, 0.0]",
+        java.util.Arrays.toString(SqliteVectors.decodeVector("[1, 0, 0]", 0)));
+    equals(
+        "a float array reads back",
+        "[1.0, 2.0]",
+        java.util.Arrays.toString(SqliteVectors.decodeVector(new float[] {1, 2}, 0)));
+    equals(
+        "a mismatched dimension is rejected",
+        null,
+        SqliteVectors.decodeVector(encoded, Integer.valueOf(5)));
+    equals("a partial blob is rejected", null, SqliteVectors.decodeVectorBytes(new byte[3], 0));
+    equals("text that is not JSON is rejected", null, SqliteVectors.decodeVector("nope", 0));
+    equals("a null vector stays null", null, SqliteVectors.decodeVector(null, 0));
+    equals(
+        "cosine of a vector with itself",
+        0.0,
+        Vectors.distance("cosine", new double[] {1, 0}, new double[] {1, 0}));
+    equals(
+        "euclidean distance",
+        5.0,
+        Vectors.distance("euclidean", new double[] {0, 3}, new double[] {4, 0}));
+    equals(
+        "dot distance is negated",
+        -10.0,
+        Vectors.distance("dot", new double[] {1, 2}, new double[] {2, 4}));
+    equals("a VECTOR column", true, SqliteVectors.isVectorField("VECTOR(3)"));
+    equals("a TEXT column", false, SqliteVectors.isVectorField("TEXT"));
+
+    System.out.println("\n[sqlite vector strategy plan]");
+    SqliteVectors.Capabilities all = new SqliteVectors.Capabilities(true, true, true);
+    equals(
+        "sqlite-vec and the driver function come first",
+        "[sqlite-vec, udf]",
+        SqliteVectors.planStrategies(all, "BLOB", null).toString());
+    // A BLOB column has no JSON to read, so json_each could only produce NULLs.
+    equals(
+        "a BLOB column drops the JSON strategy",
+        "[]",
+        SqliteVectors.planStrategies(
+            new SqliteVectors.Capabilities(false, false, true), "BLOB", null).toString());
+    equals(
+        "a TEXT column keeps the JSON strategy",
+        "[sql]",
+        SqliteVectors.planStrategies(
+            new SqliteVectors.Capabilities(false, false, true), "TEXT", null).toString());
+    equals(
+        "a pinned strategy wins",
+        "[udf]",
+        SqliteVectors.planStrategies(all, "BLOB", "udf").toString());
+    equals(
+        "memory is the caller's own path",
+        "[]",
+        SqliteVectors.planStrategies(all, "BLOB", "memory").toString());
+    equals(
+        "an unknown metric falls back to cosine",
+        "an5_vec_cosine",
+        SqliteVectors.distanceFunction("udf", "nonsense"));
+
+    System.out.println("\n[sqlite vector ranking sql]");
+    List<Object> bind = new ArrayList<Object>();
+    String udf =
+        SqliteVectors.buildRankingQuery(
+            "udf", "cosine", "[documents]", "[embedding]", new double[] {1, 0, 0}, 5,
+            " WHERE [id] = ?", "?", bind);
+    equals(
+        "one WHERE in the ranked subquery",
+        Integer.valueOf(1),
+        Integer.valueOf(countOf(udf.substring(0, udf.indexOf("an5_ranked")), " WHERE ")));
+    equals(
+        "the tail stays inside the subquery",
+        true,
+        udf.indexOf("WHERE [id] = ?") < udf.indexOf("an5_ranked"));
+    equals("a NULL distance is filtered", true, udf.contains("WHERE distance IS NOT NULL"));
+    equals("the query vector is bound as bytes", true, bind.get(0) instanceof byte[]);
+    bind.clear();
+    String json =
+        SqliteVectors.buildRankingQuery(
+            "sql", "cosine", "[documents]", "[embedding]", new double[] {1, 0, 0}, 5, "", "?", bind);
+    equals("json_each reads the vector as text", "[1.0, 0.0, 0.0]", bind.get(0));
+    equals("the JSON path walks the column", true, json.contains("json_each"));
+  }
+
+  private static int countOf(String haystack, String needle) {
+    int count = 0;
+    int index = haystack.indexOf(needle);
+    while (index >= 0) {
+      count++;
+      index = haystack.indexOf(needle, index + needle.length());
+    }
+    return count;
+  }
+
+  /**
+   * SQLite ranks a {@code VECTOR(n)} column inside the database.
+   *
+   * <p>Plain JDBC cannot register a user function or load an extension, so a stock adapter
+   * reaches the {@code json_each} strategy for a JSON text column and the in-memory fallback
+   * for a float32 BLOB one.
+   */
+  private static void sqliteVectorSearch() throws Exception {
+    System.out.println("\n[sqlite vector search -> json_each on a TEXT column]");
+    An5Adapter adapter = open();
+    try {
+      An5TableClient docs = adapter.table("Document");
+      docs.create(map("title", "d1", "embedding", "[1.0, 0.0, 0.0]"));
+      docs.create(map("title", "d2", "embedding", "[0.8, 0.2, 0.0]"));
+      docs.create(map("title", "d3", "embedding", "[0.0, 1.0, 0.0]"));
+      // A row with another dimension must never rank against a 3-dimension query.
+      docs.create(map("title", "d4", "embedding", "[1.0, 0.0, 0.0, 1.0]"));
+      docs.create(map("title", "d5", "embedding", null));
+
+      for (String metric : new String[] {"cosine", "euclidean", "dot"}) {
+        List<Map<String, Object>> hits =
+            docs.vectorSearch(new double[] {1, 0, 0}, Integer.valueOf(9), null, "embedding", metric);
+        equals(metric + ": row order", "d1,d2,d3", titles(hits));
+        equals(metric + ": the distance is a number", true, hits.get(0).get("distance") instanceof Double);
+      }
+
+      System.out.println("\n[sqlite vector search -> in-memory on a BLOB column]");
+      An5Adapter blobAdapter = openWithBlobDocuments();
+      try {
+        List<Map<String, Object>> hits =
+            blobAdapter
+                .table("Document")
+                .vectorSearch(new double[] {1, 0, 0}, Integer.valueOf(9), null, "embedding", "cosine");
+        equals("row order", "d1,d2,d3", titles(hits));
+        equals("the vector decodes to numbers", true, hits.get(0).get("embedding") instanceof double[]);
+      } finally {
+        blobAdapter.close();
+      }
+
+      System.out.println("\n[sqlite vector search -> a pinned strategy]");
+      An5Adapter pinned = open();
+      try {
+        An5TableClient pinnedDocs = pinned.table("Document");
+        pinnedDocs.create(map("title", "d1", "embedding", "[1.0, 0.0, 0.0]"));
+        pinnedDocs.create(map("title", "d2", "embedding", "[0.8, 0.2, 0.0]"));
+        pinnedDocs.create(map("title", "d3", "embedding", "[0.0, 1.0, 0.0]"));
+        // `memory` yields no query plan, so the rows are scored in Java instead.
+        pinned.setVectorStrategy("memory");
+        List<Map<String, Object>> hits =
+            pinned
+                .table("Document")
+                .vectorSearch(new double[] {1, 0, 0}, Integer.valueOf(9), null, "embedding", "cosine");
+        equals("the memory fallback ranks correctly", "d1,d2,d3", titles(hits));
+      } finally {
+        pinned.close();
+      }
+    } finally {
+      adapter.close();
+    }
+  }
+
+  private static String titles(List<Map<String, Object>> rows) {
+    StringBuilder out = new StringBuilder();
+    for (int i = 0; i < rows.size(); i++) {
+      if (i > 0) {
+        out.append(',');
+      }
+      out.append(rows.get(i).get("title"));
+    }
+    return out.toString();
+  }
+
+  /** A database whose vector column holds float32 BLOBs, as {@code VECTOR(n)} now maps to. */
+  private static An5Adapter openWithBlobDocuments() throws Exception {
+    Metadata.setAdapterMetadata(blobMetadata());
+    An5Adapter adapter = new An5Adapter(":memory:");
+    adapter.executeRaw("CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT, embedding BLOB)");
+    double[][] vectors = {{1, 0, 0}, {0.8, 0.2, 0}, {0, 1, 0}};
+    for (int i = 0; i < vectors.length; i++) {
+      adapter.executeRaw(
+          "INSERT INTO documents (id, title, embedding) VALUES (?, ?, ?)",
+          "d" + (i + 1),
+          "d" + (i + 1),
+          SqliteVectors.encodeVector(vectors[i]));
+    }
+    // A row with another dimension must never rank against a 3-dimension query.
+    adapter.executeRaw(
+        "INSERT INTO documents (id, title, embedding) VALUES ('d4', 'd4', ?)",
+        SqliteVectors.encodeVector(new double[] {1, 0, 0, 1}));
+    return adapter;
+  }
+
+  private static Map<String, Object> blobMetadata() {
+    Map<String, Object> metadata = metadata();
+    @SuppressWarnings("unchecked")
+    Map<String, Object> fields = (Map<String, Object>) metadata.get("modelFields");
+    Map<String, Object> embedding = new LinkedHashMap<String, Object>();
+    embedding.put("name", "embedding");
+    embedding.put("type", "number[] | string");
+    embedding.put("sql", "VECTOR(3)");
+    embedding.put("isOptional", Boolean.TRUE);
+    embedding.put("hasDefault", Boolean.FALSE);
+    embedding.put("isId", Boolean.FALSE);
+    fields.put("Document", list(field("id", true), field("title", false), embedding));
+    return metadata;
+  }
+
+  /** A {@code VECTOR(n)} column stores float32 bytes and reads back as numbers. */
+  private static void sqliteVectorColumnRoundTrip() throws Exception {
+    System.out.println("\n[sqlite vector column round trip]");
+    An5Adapter adapter = openWithBlobDocuments();
+    try {
+      An5TableClient docs = adapter.table("Document");
+      Map<String, Object> written =
+          docs.create(
+              map("id", "d9", "title", "written", "embedding", new double[] {0.25, 0.5, 1.0}));
+      equals(
+          "create returns numbers",
+          "[0.25, 0.5, 1.0]",
+          java.util.Arrays.toString((double[]) written.get("embedding")));
+
+      List<Map<String, Object>> stored =
+          adapter.exec("SELECT typeof(embedding) AS t FROM documents WHERE id = 'd9'");
+      equals("a double[] is written as a BLOB", "blob", stored.get(0).get("t"));
+
+      List<Map<String, Object>> rows = docs.findMany(new An5Query().where(map("id", "d9")));
+      equals(
+          "findMany returns numbers",
+          "[0.25, 0.5, 1.0]",
+          java.util.Arrays.toString((double[]) rows.get(0).get("embedding")));
+
+      docs.update(map("id", "d1"), map("embedding", new double[] {0.5, 0.5, 0}));
+      List<Map<String, Object>> updated = docs.findMany(new An5Query().where(map("id", "d1")));
+      equals(
+          "update encodes",
+          "[0.5, 0.5, 0.0]",
+          java.util.Arrays.toString((double[]) updated.get(0).get("embedding")));
+
+      docs.updateMany(map("id", "d2"), map("embedding", new double[] {0, 0, 1}));
+      List<Map<String, Object>> many = docs.findMany(new An5Query().where(map("id", "d2")));
+      equals(
+          "updateMany encodes",
+          "[0.0, 0.0, 1.0]",
+          java.util.Arrays.toString((double[]) many.get(0).get("embedding")));
+
+      equals(
+          "a non-vector column is untouched",
+          "d1",
+          String.valueOf(docs.findMany(new An5Query().where(map("id", "d1"))).get(0).get("title")));
     } finally {
       adapter.close();
     }

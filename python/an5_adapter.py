@@ -4,15 +4,17 @@ from typing import Dict, List, Optional, Any
 
 try:
     from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, detect_dialect, set_adapter_metadata
+    from .base.vectors import decode_vector, encode_vector, vector_distance
     from .mssql import connect as connect_mssql
     from .postgres import connect as connect_postgres
-    from .sqlite import connect as connect_sqlite, is_memory as is_sqlite_memory
+    from .sqlite import connect as connect_sqlite, is_memory as is_sqlite_memory, register_vector_functions as register_sqlite_vector_functions
     from .table_client import AdapterTableClient, ViewClient
 except ImportError:
     from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, detect_dialect, set_adapter_metadata
+    from base.vectors import decode_vector, encode_vector, vector_distance
     from mssql import connect as connect_mssql
     from postgres import connect as connect_postgres
-    from sqlite import connect as connect_sqlite, is_memory as is_sqlite_memory
+    from sqlite import connect as connect_sqlite, is_memory as is_sqlite_memory, register_vector_functions as register_sqlite_vector_functions
     from table_client import AdapterTableClient, ViewClient
 
 # Backward-compatible aliases used by tests and older imports.
@@ -23,9 +25,15 @@ except ImportError:
     from mssql import parse_connection_string as _parse_connection_string
 
 class An5Adapter:
-    def __init__(self, connection_string: str):
+    def __init__(self, connection_string: str, sqlite_vec: Optional[str] = None, vector_strategy: Optional[str] = None):
         self._dialect = detect_dialect(connection_string)
         self._conn_str = connection_string
+        # SQLite only. `sqlite_vec` names the extension binary to load;
+        # `vector_strategy` pins one of "sqlite-vec" | "udf" | "sql" | "memory"
+        # instead of probing for the fastest one available.
+        self._sqlite_vec = sqlite_vec
+        self.vector_strategy = vector_strategy
+        self._vector_supports: Dict[int, Any] = {}
         # The open connection of `transaction()`, when there is one. Every
         # statement in the callback has to use this very connection, otherwise a
         # rollback returns to a different, already committed connection — that
@@ -39,8 +47,22 @@ class An5Adapter:
         if self._dialect == DIALECT_POSTGRES:
             return connect_postgres(self._conn_str)
         if self._dialect == DIALECT_SQLITE:
-            return connect_sqlite(self._conn_str)
+            conn = connect_sqlite(self._conn_str)
+            self._vector_supports[id(conn)] = register_sqlite_vector_functions(conn, self._sqlite_vec)
+            return conn
         return connect_mssql(self._conn_str)
+
+    def vector_support(self):
+        """The SQLite vector hooks of the current connection, or None.
+
+        They register the distance functions SQLite ranks with and load the
+        sqlite-vec extension. A connection with none still searches, by falling
+        back to `json_each` or to Python.
+        """
+        if self._dialect != DIALECT_SQLITE:
+            return None
+        conn, _owned = self._acquire()
+        return self._vector_supports.get(id(conn))
 
     def _acquire(self):
         """Returns (connection, whether we opened it and must close it)."""
@@ -167,11 +189,14 @@ class An5Adapter:
             if owned:
                 conn.close()
 
-def create_an5_adapter(connection_string: str) -> An5Adapter:
-    return An5Adapter(connection_string)
+def create_an5_adapter(connection_string: str, sqlite_vec: Optional[str] = None, vector_strategy: Optional[str] = None) -> An5Adapter:
+    return An5Adapter(connection_string, sqlite_vec=sqlite_vec, vector_strategy=vector_strategy)
 
 __all__ = [
     "An5Adapter",
+    "encode_vector",
+    "decode_vector",
+    "vector_distance",
     "AdapterTableClient",
     "ViewClient",
     "create_an5_adapter",

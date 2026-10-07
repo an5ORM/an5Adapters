@@ -1,4 +1,5 @@
 import type { Dialect, QueryEngine, TransactionHandle } from '../base/types';
+import { SqliteVectorSupport } from './vector';
 
 // ─── Browser SQLite Driver & Config ──────────────────────────────────────────────────
 
@@ -13,18 +14,41 @@ export interface SqliteBrowserConfig {
   driver?: SqliteDriver;
   exec?: <T = any>(query: string, params?: Record<string, any>) => Promise<T[]> | T[];
   executeRaw?: (query: string, params?: Record<string, any>) => Promise<number> | number;
+  /** Path to the sqlite-vec extension, for WASM builds that allow loading one. */
+  sqliteVec?: string;
+  /** Pin the vector search strategy instead of probing for one. */
+  vectorStrategy?: 'auto' | 'sqlite-vec' | 'udf' | 'sql' | 'memory';
+  /** Register a scalar function with the driver, when its API allows it. */
+  registerFunction?: (name: string, fn: (...args: any[]) => any) => void;
 }
 
 // ─── Browser SQLite Engine ──────────────────────────────────────────────────────────
 
 export class SqliteBrowserEngine implements QueryEngine {
   dialect: Dialect = 'sqlite';
+  /**
+   * A WASM build cannot register a JS callback as an SQL function, so this only
+   * reaches the `sql` strategy (json_each in plain SQL) and the in-memory one.
+   * A custom `registerFunction` hook unlocks `udf` as well.
+   */
+  readonly vectorSupport: SqliteVectorSupport;
   private db: any = null;
   private driver: SqliteDriver | null = null;
   private customExec: ((query: string, params?: Record<string, any>) => Promise<any[]> | any[]) | null = null;
   private customExecuteRaw: ((query: string, params?: Record<string, any>) => Promise<number> | number) | null = null;
 
   constructor(config?: SqliteBrowserConfig | any) {
+    this.vectorSupport = new SqliteVectorSupport({
+      native: () => this.db,
+      registerFunction: (name, fn) => {
+        const register = config?.registerFunction;
+        if (typeof register === 'function') return register(name, fn);
+        const db = this.db;
+        if (db && typeof db.create_function === 'function') return db.create_function(name, fn);
+        throw new Error('this SQLite build cannot register functions');
+      },
+    }, { sqliteVec: config?.sqliteVec, vectorStrategy: config?.vectorStrategy });
+
     if (!config) return;
 
     if (config.exec && typeof config.exec === 'function') {

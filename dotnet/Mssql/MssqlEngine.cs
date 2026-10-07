@@ -11,6 +11,8 @@ namespace An5Orm
     internal class MssqlEngine : IQueryEngine
     {
         public Dialect Dialect => Dialect.Mssql;
+        // Only SQLite has a vector hook; this provider has none to offer.
+        public SqliteVectorSupport VectorSupport => null;
         private readonly string _connectionString;
         private readonly int _commandTimeout;
 

@@ -1,5 +1,43 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Vector search on SQLite** in every runtime — TypeScript, Python, .NET, Go, Rust, Java,
+  Kotlin and Swift. A `VECTOR(n)` column is stored as a BLOB of little-endian float32 and
+  ranked inside the database rather than in the client, trying four strategies in a fixed
+  order: the sqlite-vec extension, the runtime's own `an5_vec_cosine` / `an5_vec_l2` /
+  `an5_vec_ip` functions, `json_each` in plain SQL, and the in-memory fallback. Only the
+  matching rows are transferred, and a row that cannot be scored is dropped rather than
+  returned with a null distance.
+- `sqliteVec` (a sqlite-vec extension path) and `vectorStrategy`
+  (`sqlite-vec` | `udf` | `sql` | `memory`) on the adapter config, spelled `sqlite_vec` /
+  `vector_strategy` in Python, `SqliteVec` / `VectorStrategy` in .NET, `VectorSupport` in Go,
+  `vector_strategy` in Rust, `SQLiteDriver.sqliteVecPath` / `An5Adapter.vectorStrategy` in
+  Swift and `An5.vectorStrategy(…)` in Kotlin. Nothing is required: a plain SQLite connection
+  ranks in-database through whichever of the first three it can reach.
+- The vector codec is public per runtime, so a project that manages its own SQL can reuse it:
+  `encodeVector` / `decodeVector` (TypeScript), `encode_vector` / `decode_vector` (Python and
+  Rust), `SqliteVectors.EncodeVector` / `DecodeVector` (.NET), `EncodeVector` / `DecodeVector`
+  (Go), `SqliteVectors.encodeVector` / `decodeVector` (Java, and Kotlin over the same JVM
+  runtime) and `SqliteVectors.encode` / `decode` (Swift).
+
+### Changed
+- A `number[]` written to a `VECTOR(n)` column is encoded to the float32 BLOB, which is about
+  a third of the JSON text it replaces, and read back as numbers. A column that already holds
+  JSON text is still decoded, so an existing database needs no migration.
+- `vectorSearch` on a row that cannot be scored leaves it out of the result. It was previously
+  returned with a null distance on some providers.
+
+### Fixed
+- `test:gradle` looks for the Java runtime under the coordinates that are actually published,
+  `io.github.an5orm:an5-adapters-java`, and checks the version the manifest asks for. The
+  gate still probed the rejected `org.an5orm` group, so it reinstalled the artifact on every
+  run and never skipped when it was already there.
+- An `update`/`updateMany` whose value is a `Buffer` or `Uint8Array` no longer reads it as a
+  Prisma-style `{ set: … }` operator. `TypedArray.prototype.set` is the copy method, so the
+  value became an unbound parameter and SQLite rejected the statement.
+
 ## [0.2.12] - 2026-10-07
 
 ### Changed

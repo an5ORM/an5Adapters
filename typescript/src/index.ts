@@ -29,6 +29,19 @@ export type {
   AdapterMetadata,
   Dialect,
 } from './an5Adapter';
+export {
+  encodeVector,
+  decodeVector,
+  vectorDistance,
+  isVectorField,
+  AN5_VECTOR_FUNCTIONS,
+  SQLITE_VEC_FUNCTIONS,
+} from './sqlite/vector';
+export type {
+  SqliteVectorStrategy,
+  VectorMetric,
+  VectorStrategyPreference,
+} from './sqlite/vector';
 export type { TypedAn5Adapter, AdapterAPI } from './typed';
 export {
   getLlmConfig, setLlmConfig,

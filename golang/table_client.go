@@ -286,6 +286,67 @@ func projectFields(row map[string]interface{}, selectVal interface{}) map[string
 	return projected
 }
 
+// vectorFields returns the `VECTOR(n)` columns of this model, from the generated
+// metadata.
+func (t *TableClient) vectorFields() map[string]bool {
+	fields, _ := base.GetFieldsForModel(t.TableName).(map[string]interface{})
+	names := map[string]bool{}
+	for name, def := range fields {
+		if base.IsVectorField(def) {
+			names[name] = true
+		}
+	}
+	return names
+}
+
+// encodeVectorFields encodes every `VECTOR(n)` value on its way into SQLite.
+//
+// The column holds a float32 BLOB, which is a third of the size of the JSON text
+// it replaces and is what the in-database distance functions read. Values that
+// already arrived as text or bytes are left alone, so rows written by an older
+// version stay readable.
+func (t *TableClient) encodeVectorFields(data map[string]interface{}) map[string]interface{} {
+	if t.Adapter == nil || t.Adapter.Dialect != base.DialectSqlite {
+		return data
+	}
+	names := t.vectorFields()
+	if len(names) == 0 {
+		return data
+	}
+	out := make(map[string]interface{}, len(data))
+	for key, value := range data {
+		out[key] = value
+		if names[key] && base.NeedsVectorEncoding(value) {
+			if decoded := base.DecodeVector(value); decoded != nil {
+				out[key] = base.EncodeVector(decoded)
+			}
+		}
+	}
+	return out
+}
+
+// decodeVectorRows decodes `VECTOR(n)` columns back into float64 slices after a read.
+func (t *TableClient) decodeVectorRows(rows []map[string]interface{}) []map[string]interface{} {
+	if t.Adapter == nil || t.Adapter.Dialect != base.DialectSqlite || len(rows) == 0 {
+		return rows
+	}
+	names := t.vectorFields()
+	if len(names) == 0 {
+		return rows
+	}
+	for _, row := range rows {
+		for key, value := range row {
+			if !names[key] {
+				continue
+			}
+			if decoded := base.DecodeVector(value); decoded != nil {
+				row[key] = decoded
+			}
+		}
+	}
+	return rows
+}
+
 // FindMany fetches rows matching structured ORM args (where/orderBy/skip/take/select/include).
 func (t *TableClient) FindMany(ctx context.Context, args *FindManyArgs) ([]map[string]interface{}, error) {
 	whereCond, queryArgs := t.buildWhere(args.Where)
@@ -384,7 +445,7 @@ func (t *TableClient) FindMany(ctx context.Context, args *FindManyArgs) ([]map[s
 			rows[i] = projectFields(rows[i], args.Select)
 		}
 	}
-	return rows, nil
+	return t.decodeVectorRows(rows), nil
 }
 
 // FindFirst fetches the first row matching structured ORM args.
@@ -498,6 +559,7 @@ func (t *TableClient) Create(ctx context.Context, args *CreateArgs) (map[string]
 	}
 
 	data, relationWrites := splitRelationWrites(t.TableName, args.Data)
+	data = t.encodeVectorFields(data)
 
 	var cols []string
 	var vals []string
@@ -641,6 +703,7 @@ func (t *TableClient) Update(ctx context.Context, args *UpdateArgs) (map[string]
 		return nil, fmt.Errorf("update requires args")
 	}
 	data, relationWrites := splitRelationWrites(t.TableName, args.Data)
+	data = t.encodeVectorFields(data)
 
 	whereCond, whereArgs := t.buildWhere(args.Where)
 	setParts := []string{}
@@ -727,10 +790,11 @@ func (t *TableClient) UpdateMany(ctx context.Context, args *UpdateManyArgs) (map
 	if args == nil || len(args.Data) == 0 {
 		return map[string]interface{}{"count": 0}, nil
 	}
+	data := t.encodeVectorFields(args.Data)
 	whereCond, whereArgs := t.buildWhere(args.Where)
 	setParts := []string{}
 	setValues := []interface{}{}
-	for col, val := range args.Data {
+	for col, val := range data {
 		appendUpdateSet(&setParts, &setValues, col, val, t.Adapter.Dialect)
 	}
 	if len(setParts) == 0 {

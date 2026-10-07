@@ -5,6 +5,7 @@ import an5.adapters.base.FieldMeta;
 import an5.adapters.base.Metadata;
 import an5.adapters.base.RelationDef;
 import an5.adapters.base.SqlBuilder;
+import an5.adapters.base.SqliteVectors;
 import an5.adapters.base.Vectors;
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -54,6 +55,69 @@ public class An5TableClient {
     return Metadata.fieldsFor(modelName);
   }
 
+  /** The {@code VECTOR(n)} columns of this model, from the generated metadata. */
+  private List<String> vectorFields() {
+    List<String> names = new ArrayList<String>();
+    for (FieldMeta field : fields()) {
+      if (SqliteVectors.isVectorField(field.sqlType) || SqliteVectors.isVectorField(field.type)) {
+        names.add(field.name);
+      }
+    }
+    return names;
+  }
+
+  /**
+   * Encodes every {@code VECTOR(n)} value on its way into SQLite.
+   *
+   * <p>The column holds a float32 BLOB, which is a third of the size of the JSON text it
+   * replaces. Values that already arrived as text or bytes are left alone, so rows written by
+   * an older version stay readable.
+   */
+  private Map<String, Object> encodeVectorFields(Map<String, Object> data) {
+    if (dialect != Dialect.SQLITE) {
+      return data;
+    }
+    List<String> names = vectorFields();
+    if (names.isEmpty()) {
+      return data;
+    }
+    Map<String, Object> out = new LinkedHashMap<String, Object>(data);
+    for (String name : names) {
+      Object value = out.get(name);
+      if (!SqliteVectors.needsVectorEncoding(value)) {
+        continue;
+      }
+      double[] decoded = SqliteVectors.decodeVector(value, 0);
+      if (decoded != null) {
+        out.put(name, SqliteVectors.encodeVector(decoded));
+      }
+    }
+    return out;
+  }
+
+  /** Decodes {@code VECTOR(n)} columns back into arrays of numbers after a read. */
+  private List<Map<String, Object>> decodeVectorRows(List<Map<String, Object>> rows) {
+    if (dialect != Dialect.SQLITE || rows.isEmpty()) {
+      return rows;
+    }
+    List<String> names = vectorFields();
+    if (names.isEmpty()) {
+      return rows;
+    }
+    for (Map<String, Object> row : rows) {
+      for (String name : names) {
+        if (!row.containsKey(name)) {
+          continue;
+        }
+        double[] decoded = SqliteVectors.decodeVector(row.get(name), 0);
+        if (decoded != null) {
+          row.put(name, decoded);
+        }
+      }
+    }
+    return rows;
+  }
+
   // ─── Reads ──────────────────────────────────────────────────────────────────────
 
   public List<Map<String, Object>> findMany() throws SQLException {
@@ -92,7 +156,7 @@ public class An5TableClient {
       }
       rows = projectFields(rows, selected);
     }
-    return rows;
+    return decodeVectorRows(rows);
   }
 
   /** The first matching row, or {@code null}. Always limited to one row server-side. */
@@ -155,6 +219,7 @@ public class An5TableClient {
     if (idField != null && !scalars.containsKey(idField.name)) {
       scalars.put(idField.name, UUID.randomUUID().toString());
     }
+    scalars = encodeVectorFields(scalars);
 
     List<String> columns = new ArrayList<String>();
     List<Object> values = new ArrayList<Object>();
@@ -240,6 +305,7 @@ public class An5TableClient {
     Map<String, Object> relationWrites = splitRelationWrites(data);
     Map<String, Object> scalars = withoutRelations(data);
 
+    scalars = encodeVectorFields(scalars);
     List<String> setParts = new ArrayList<String>();
     List<Object> setValues = new ArrayList<Object>();
     for (Map.Entry<String, Object> entry : scalars.entrySet()) {
@@ -275,9 +341,10 @@ public class An5TableClient {
     Map<String, Object> params = new LinkedHashMap<String, Object>();
     SqlBuilder.Where clause = SqlBuilder.parseWhere(where, dialect, params, "w_");
 
+    Map<String, Object> encoded = encodeVectorFields(data);
     List<String> setParts = new ArrayList<String>();
     List<Object> setValues = new ArrayList<Object>();
-    for (Map.Entry<String, Object> entry : data.entrySet()) {
+    for (Map.Entry<String, Object> entry : encoded.entrySet()) {
       if (entry.getValue() != null) {
         SqlBuilder.appendUpdateSet(setParts, setValues, entry.getKey(), entry.getValue(), dialect);
       }
@@ -424,26 +491,86 @@ public class An5TableClient {
     Map<String, Object> params = new LinkedHashMap<String, Object>();
     SqlBuilder.Where clause = SqlBuilder.parseWhere(where, dialect, params, "");
 
-    if (dialect != Dialect.SQLITE) {
-      try {
-        return nativeVectorSearch(vector, limit, field, distanceMetric, clause);
-      } catch (SQLException ignored) {
-        // The engine may have no vector extension installed at all. Falling through to the
-        // in-memory path is the documented behaviour, not a silent success.
+    if (dialect == Dialect.SQLITE) {
+      // SQLite ranks through sqlite-vec, a registered distance function or json_each,
+      // whichever this connection supports, so the table never has to leave the database.
+      List<Map<String, Object>> ranked =
+          sqliteVectorSearch(vector, limit, field, distanceMetric, clause);
+      if (ranked != null) {
+        return ranked;
       }
+      // No in-database strategy: score the column in Java instead.
+      return scoreVectorsInMemory(vector, limit, field, distanceMetric, where);
     }
 
+    try {
+      return nativeVectorSearch(vector, limit, field, distanceMetric, clause);
+    } catch (SQLException ignored) {
+      // The engine may have no vector extension installed at all. Falling through to the
+      // in-memory path is the documented behaviour, not a silent success.
+    }
+    return scoreVectorsInMemory(vector, limit, field, distanceMetric, where);
+  }
+
+  /**
+   * SQLite ranks a {@code VECTOR(n)} column inside the database.
+   *
+   * <p>Returns {@code null} when the connection offers no strategy, so the caller falls back to
+   * scoring in Java.
+   */
+  private List<Map<String, Object>> sqliteVectorSearch(
+      double[] vector, int limit, String field, String metric, SqlBuilder.Where where) {
+    String column = dialect.quoteIdentifier(field);
+    String tail = where.isEmpty() ? "" : " WHERE " + where.sql;
+    SqliteVectors.Capabilities capabilities = adapter.sqliteVectorCapabilities();
+    String declared = adapter.sqliteColumnType(Metadata.resolveTable(modelName), field);
+
+    for (String strategy :
+        SqliteVectors.planStrategies(capabilities, declared, adapter.vectorStrategy())) {
+      List<Object> bind = new ArrayList<Object>();
+      String sql =
+          SqliteVectors.buildRankingQuery(
+              strategy, metric, tableSql(), column, vector, limit, tail,
+              dialect.placeholder(), bind);
+      if (sql == null) {
+        continue;
+      }
+      // The strategy's own placeholders sit inside the ranked subquery, so their values lead
+      // the list; the caller's WHERE values follow, because its placeholders come after them.
+      List<Object> values = new ArrayList<Object>(bind);
+      values.addAll(where.params);
+      try {
+        return decodeVectorRows(adapter.exec(sql, values));
+      } catch (SQLException ignored) {
+        // The connection advertised the capability but the query failed, e.g. an extension
+        // that did not really load. The next strategy is cheaper than reporting the failure.
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Ranks the vector column in Java.
+   *
+   * <p>The last resort for every provider, and the only option on a SQLite connection that
+   * offers no in-database strategy. The whole table is loaded, so it is only reasonable for a
+   * table small enough to fit in memory.
+   */
+  private List<Map<String, Object>> scoreVectorsInMemory(
+      double[] vector, int limit, String field, String metric, Map<String, Object> where)
+      throws SQLException {
+    int dimension = vector.length;
     An5Query query = where == null ? new An5Query() : new An5Query().where(where);
     List<Map<String, Object>> rows = findMany(query);
     List<Integer> scored = new ArrayList<Integer>();
     List<Double> distances = new ArrayList<Double>();
     for (int i = 0; i < rows.size(); i++) {
-      double[] stored = Vectors.parseVector(rows.get(i).get(field), dimension);
+      double[] stored = SqliteVectors.decodeVector(rows.get(i).get(field), dimension);
       if (stored == null) {
         continue;
       }
       scored.add(i);
-      distances.add(Vectors.distance(distanceMetric, vector, stored));
+      distances.add(Vectors.distance(metric, vector, stored));
     }
     Comparator<Integer> byDistance =
         new Comparator<Integer>() {

@@ -18,6 +18,17 @@ public enum Dialect
         public string ConnectionString { get; set; }
         public int CommandTimeout { get; set; } = 60;
         public int ConnectRetryCount { get; set; } = 3;
+        /// <summary>
+        /// SQLite only: path to the sqlite-vec extension binary. Loaded on every
+        /// connection so vector search ranks inside the database. Other
+        /// providers ignore it.
+        /// </summary>
+        public string SqliteVec { get; set; }
+        /// <summary>
+        /// SQLite only: pin one of "sqlite-vec" | "udf" | "sql" | "memory"
+        /// instead of probing for the fastest strategy available.
+        /// </summary>
+        public string VectorStrategy { get; set; }
     }
 
     // ─── Query Engine Interface ────────────────────────────────────────────────
@@ -29,6 +40,9 @@ public enum Dialect
         List<T> QueryRaw<T>(string sql, Dictionary<string, object> parameters) where T : new();
         int ExecuteRaw(string sql, Dictionary<string, object> parameters);
         An5TransactionBase BeginTransaction();
+
+        /// <summary>SQLite only: extension loading and distance-function registration.</summary>
+        SqliteVectorSupport VectorSupport { get; }
     }
 
     // ─── Transaction base ──────────────────────────────────────────────────────

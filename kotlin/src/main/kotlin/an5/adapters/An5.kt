@@ -32,6 +32,19 @@ class An5 internal constructor(
     /** The table client for a model. */
     fun table(model: String): TableClient = TableClient(delegate, model)
 
+    /**
+     * Pins one SQLite vector strategy instead of probing for the fastest one available:
+     * `sqlite-vec`, `udf`, `sql` or `memory`.
+     *
+     * SQLite has no vector type, so a `VECTOR(n)` column is ranked by the sqlite-vec
+     * extension, a distance function the driver registers, `json_each` in plain SQL, or
+     * in the client. `null` probes. Plain JDBC reaches `json_each` and the in-memory
+     * path; the first two need a driver built for them.
+     */
+    fun vectorStrategy(strategy: String?) {
+        delegate.setVectorStrategy(strategy ?: "")
+    }
+
     /** A read-only client for a database view. */
     fun view(name: String): ViewClient = ViewClient(delegate, name)
 

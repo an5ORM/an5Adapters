@@ -8,6 +8,15 @@ import CSQLite
 /// memory the moment the Swift value went out of scope.
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+/// What a registered distance function needs to remember about itself.
+private final class MetricContext {
+    let metric: DistanceMetric
+
+    init(metric: DistanceMetric) {
+        self.metric = metric
+    }
+}
+
 /// The SQL surface the AN5 runtime needs, so the runtime is not welded to one driver.
 ///
 /// A protocol rather than a direct call into SQLite so an app can put its own database
@@ -59,6 +68,74 @@ public final class SQLiteDriver: SQLDriver {
         // Foreign keys are off by default in SQLite, unlike every other dialect, so a schema
         // that relies on them would silently accept rows nothing points at.
         _ = try? execute("PRAGMA foreign_keys = ON", [])
+        if let path = Self.sqliteVecPath {
+            // An extension is optional: without it the search still ranks, through the
+            // distance functions registered below or `json_each`.
+            _ = sqlite3_enable_load_extension(handle, 1)
+            _ = sqlite3_load_extension(handle, path, nil, nil)
+            _ = sqlite3_enable_load_extension(handle, 0)
+        }
+        registerVectorFunctions()
+    }
+
+    /// Where to load sqlite-vec from, set before the first driver is opened.
+    ///
+    /// A process-wide setting on purpose: the extension belongs to the SQLite build rather
+    /// than to one connection, and every AN5 connection wants the same one.
+    public static var sqliteVecPath: String?
+
+    /// Registers `an5_vec_cosine` / `an5_vec_l2` / `an5_vec_ip` so SQLite can rank a
+    /// `VECTOR(n)` column without the client loading it.
+    ///
+    /// This runs per connection because a user function only exists for the connection that
+    /// declared it.
+    private func registerVectorFunctions() {
+        for (metric, name) in SqliteVectors.an5Functions {
+            registerVectorFunction(name, metric: metric)
+        }
+    }
+
+    /// The C callback SQLite calls; it reads its arguments as pointers on a context.
+    private func registerVectorFunction(_ name: String, metric: DistanceMetric) {
+        // SQLite keeps the context pointer, so the metric travels with the function.
+        let context = Unmanaged.passRetained(MetricContext(metric: metric)).toOpaque()
+        sqlite3_create_function_v2(
+            handle,
+            name,
+            2,
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+            context,
+            { pointer, count, values in
+                // A vector that cannot be scored leaves the result NULL, which the ranking
+                // query filters out rather than handing to the caller.
+                guard let pointer, count == 2, let values else { return }
+                let metric = Unmanaged<MetricContext>.fromOpaque(pointer).takeUnretainedValue().metric
+                guard let left = sqliteVecValue(values[0]),
+                      let right = sqliteVecValue(values[1]),
+                      left.count == right.count, !left.isEmpty else { return }
+                sqlite3_result_double(pointer, DistanceMetric.distance(metric, left, right))
+            },
+            nil, nil, nil,
+            { pointer in
+                Unmanaged<MetricContext>.fromOpaque(pointer).release()
+            }
+        )
+    }
+
+    /// Reads one bound argument: a BLOB of float32 or a legacy JSON text column.
+    private func sqliteVecValue(_ value: sqlite3_value?) -> [Double]? {
+        guard let value else { return nil }
+        switch sqlite3_value_type(value) {
+        case SQLITE_BLOB:
+            let count = Int(sqlite3_value_bytes(value))
+            guard count > 0, let bytes = sqlite3_value_blob(value) else { return nil }
+            return SqliteVectors.decodeBlob(Data(bytes: bytes, count: count))
+        case SQLITE_TEXT:
+            guard let text = sqlite3_value_text(value) else { return nil }
+            return SqliteVectors.decode(String(cString: text))
+        default:
+            return nil
+        }
     }
 
     deinit {

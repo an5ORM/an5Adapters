@@ -1,3 +1,5 @@
+import type { SqliteVectorSupport, VectorStrategyPreference } from '../sqlite/vector';
+
 export type Dialect = 'mssql' | 'postgres' | 'mysql' | 'sqlite' | 'googlesheets';
 
 export interface An5AdapterConfig {
@@ -8,6 +10,17 @@ export interface An5AdapterConfig {
    * run in NBase while the rows stay in `connectionString`'s database.
    */
   nbase?: string;
+  /**
+   * Path to the sqlite-vec extension binary. On SQLite it is loaded before the
+   * vector capabilities are probed, so `vectorSearch` ranks inside the database
+   * instead of loading the table into memory. Other providers ignore it.
+   */
+  sqliteVec?: string;
+  /**
+   * Pin the SQLite vector search strategy. `auto` (the default) probes for
+   * sqlite-vec, a driver function and JSON1, and uses the first that works.
+   */
+  vectorStrategy?: VectorStrategyPreference;
   engine?: QueryEngine;
   db?: any;
   driver?: any;
@@ -30,4 +43,6 @@ export interface QueryEngine {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   beginTransaction(): Promise<TransactionHandle>;
+  /** SQLite only: extension loading and distance-function registration. */
+  vectorSupport?: SqliteVectorSupport;
 }

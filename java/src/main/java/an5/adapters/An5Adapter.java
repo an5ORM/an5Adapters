@@ -37,6 +37,79 @@ public class An5Adapter implements AutoCloseable {
   private final String connectionString;
 
   /**
+   * Pins one SQLite vector strategy instead of probing for the fastest one available:
+   * {@code sqlite-vec}, {@code udf}, {@code sql} or {@code memory}. Empty probes.
+   */
+  private String vectorStrategy = "";
+
+  /**
+   * What this SQLite connection can do, probed once with cheap {@code SELECT}s.
+   *
+   * <p>JDBC has no API for registering a user function or loading an extension, so a stock
+   * adapter normally reports only JSON1. That is enough to rank with {@code json_each}; the
+   * sqlite-vec and UDF strategies need a driver built for them (the Xerial driver, for
+   * instance, loads an extension through a {@code _load_extension} connection property).
+   */
+  private an5.adapters.base.SqliteVectors.Capabilities sqliteCapabilities;
+
+  /** The SQLite vector strategy to pin, or {@code null} to probe. */
+  public String vectorStrategy() {
+    return vectorStrategy;
+  }
+
+  /** Pins one SQLite vector strategy instead of probing. */
+  public void setVectorStrategy(String strategy) {
+    this.vectorStrategy = strategy == null ? "" : strategy;
+  }
+
+  /** What this SQLite connection can do for vector search. */
+  public an5.adapters.base.SqliteVectors.Capabilities sqliteVectorCapabilities() {
+    if (dialect != Dialect.SQLITE) {
+      return new an5.adapters.base.SqliteVectors.Capabilities(false, false, false);
+    }
+    if (sqliteCapabilities == null) {
+      sqliteCapabilities =
+          new an5.adapters.base.SqliteVectors.Capabilities(
+              probe("SELECT vec_version()"),
+              // The probe has to reach a real distance: a driver that only knows the name
+              // would still fail on the arguments.
+              probe("SELECT an5_vec_cosine(zeroblob(4), zeroblob(4))"),
+              probe("SELECT json_valid('[1]')"));
+    }
+    return sqliteCapabilities;
+  }
+
+  /** A vector column's declared DDL type, or {@code null} when it cannot be read. */
+  public String sqliteColumnType(String table, String column) {
+    try {
+      List<Map<String, Object>> rows =
+          exec(
+              "SELECT type FROM pragma_table_info(?) WHERE name = ?",
+              java.util.Arrays.<Object>asList(table, column));
+      if (!rows.isEmpty()) {
+        Object type = rows.get(0).get("type");
+        if (type != null) {
+          return String.valueOf(type);
+        }
+      }
+    } catch (SQLException ignored) {
+      // An older SQLite without table-valued pragmas just means no declared type, and the
+      // caller then keeps every strategy in the plan.
+    }
+    return null;
+  }
+
+  /** True when a probe statement ran, whatever it returned. */
+  private boolean probe(String sql) {
+    try {
+      exec(sql);
+      return true;
+    } catch (SQLException ignored) {
+      return false;
+    }
+  }
+
+  /**
    * The open connection of {@link #transaction}, when there is one. Every statement in the
    * callback has to use this very connection, otherwise a rollback returns to a different,
    * already committed connection — that is "the error was raised but the data is still there".

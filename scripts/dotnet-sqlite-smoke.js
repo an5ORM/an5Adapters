@@ -36,6 +36,7 @@ try {
   copy('dotnet/Mssql/MssqlEngine.cs', 'Mssql/MssqlEngine.cs');
   copy('dotnet/Postgres/PostgresEngine.cs', 'Postgres/PostgresEngine.cs');
   copy('dotnet/Sqlite/SqliteEngine.cs', 'Sqlite/SqliteEngine.cs');
+  copy('dotnet/Sqlite/SqliteVectors.cs', 'Sqlite/SqliteVectors.cs');
   copy('test/dotnet/Program.cs', 'Program.cs');
   copy('test/fixtures/query-semantics.json', 'query-semantics.json');
 

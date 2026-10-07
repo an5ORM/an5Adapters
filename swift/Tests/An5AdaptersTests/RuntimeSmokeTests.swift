@@ -264,6 +264,150 @@ final class RuntimeSmokeTests: XCTestCase {
         XCTAssertNotNil(hits.first?["distance"] as Any?)
     }
 
+    // MARK: - SQLite vector search
+
+    /// The bundled driver registers the `an5_vec_*` functions and can load sqlite-vec, so a
+    /// `VECTOR(n)` column is ranked inside the database.
+    ///
+    /// The docstring in `SqliteVectors` is the shared specification every runtime implements;
+    /// test/sqlite-vector.test.js (TypeScript) is the mirror of this coverage.
+    func testSqliteVectorCodecAndPlan() {
+        let encoded = SqliteVectors.encode([1, -2, 0.5])
+        XCTAssertEqual(encoded.count, 12, "float32 per value")
+        XCTAssertEqual(Array(encoded.prefix(4)), [0x00, 0x00, 0x80, 0x3F], "little-endian 1.0")
+        XCTAssertEqual(SqliteVectors.decodeBlob(encoded) ?? [], [1, -2, 0.5])
+        XCTAssertEqual(SqliteVectors.decode("[1, 0, 0]") ?? [], [1, 0, 0], "legacy JSON text")
+        XCTAssertEqual(SqliteVectors.decode(encoded, expectedLength: 3) ?? [], [1, -2, 0.5])
+        XCTAssertNil(SqliteVectors.decode(encoded, expectedLength: 5), "another dimension")
+        XCTAssertNil(SqliteVectors.decodeBlob(Data([1, 2, 3])), "a partial blob")
+        XCTAssertNil(SqliteVectors.decode("nope"))
+        XCTAssertNil(SqliteVectors.decode(nil))
+
+        let all = SqliteVectors.Capabilities(vec: true, udf: true, json1: true)
+        XCTAssertEqual(
+            SqliteVectors.plan(capabilities: all, declaredType: "BLOB", preference: nil),
+            ["sqlite-vec", "udf"]
+        )
+        // A BLOB column has no JSON to read, so json_each could only produce NULLs.
+        XCTAssertEqual(
+            SqliteVectors.plan(
+                capabilities: SqliteVectors.Capabilities(json1: true), declaredType: "BLOB",
+                preference: nil
+            ),
+            []
+        )
+        XCTAssertEqual(
+            SqliteVectors.plan(
+                capabilities: SqliteVectors.Capabilities(json1: true), declaredType: "TEXT",
+                preference: nil
+            ),
+            ["sql"]
+        )
+        XCTAssertEqual(
+            SqliteVectors.plan(capabilities: all, declaredType: "BLOB", preference: "udf"), ["udf"]
+        )
+        XCTAssertEqual(
+            SqliteVectors.plan(capabilities: all, declaredType: "BLOB", preference: "memory"), [],
+            "memory is the caller's own path, not a query"
+        )
+
+        var bind: [SQLValue] = []
+        let udf = SqliteVectors.rankingQuery(
+            strategy: SqliteVectors.strategyUdf, metric: .cosine, table: "[documents]",
+            column: "[embedding]", vector: [1, 0, 0], take: 5, tail: " WHERE [id] = ?",
+            placeholder: "?", bind: &bind
+        )
+        XCTAssertNotNil(udf)
+        XCTAssertEqual(udf?.contains("WHERE distance IS NOT NULL"), true)
+        switch bind.first {
+        case .some(.blob): break
+        default: XCTFail("the query vector is bound as bytes")
+        }
+        bind = []
+        let json = SqliteVectors.rankingQuery(
+            strategy: SqliteVectors.strategySQL, metric: .cosine, table: "[documents]",
+            column: "[embedding]", vector: [1, 0, 0], take: 5, tail: "", placeholder: "?", bind: &bind
+        )
+        XCTAssertEqual(json?.contains("json_each"), true)
+        switch bind.first {
+        case .some(.text): break
+        default: XCTFail("json_each reads the vector as text")
+        }
+    }
+
+    func testSqliteVectorSearchAndRoundTrip() throws {
+        let adapter = try makeBlobAdapter()
+        let documents = adapter.table("Document")
+        let vectors: [(String, [Double])] = [
+            ("d1", [1, 0, 0]), ("d2", [0.8, 0.2, 0]), ("d3", [0, 1, 0]),
+        ]
+        for (id, vector) in vectors {
+            try adapter.execute(
+                "INSERT INTO documents (id, title, embedding) VALUES (?, ?, ?)",
+                [id, id, SqliteVectors.encode(vector)]
+            )
+        }
+        // A row with another dimension must never rank against a 3-dimension query, and one
+        // with no vector must not win by default.
+        try adapter.execute(
+            "INSERT INTO documents (id, title, embedding) VALUES ('d4', 'd4', ?)",
+            [SqliteVectors.encode([1, 0, 0, 1])]
+        )
+        try adapter.execute("INSERT INTO documents (id, title, embedding) VALUES ('d5', 'd5', NULL)")
+
+        for metric in [DistanceMetric.cosine, .euclidean, .dot] {
+            let hits = try documents.vectorSearch([1, 0, 0], take: 9, metric: metric)
+            XCTAssertEqual(hits.compactMap { $0["title"] as? String }, ["d1", "d2", "d3"],
+                           "\(metric.rawValue) row order")
+            XCTAssertNotNil(hits.first?["distance"] as Any?, "\(metric.rawValue) reports a distance")
+            XCTAssertTrue(hits.first?["embedding"] is [Double], "\(metric.rawValue) decodes the column")
+        }
+
+        // `memory` pins the client-side fallback, which ranks the same rows.
+        adapter.vectorStrategy = SqliteVectors.strategyMemory
+        let pinned = try documents.vectorSearch([1, 0, 0], take: 9)
+        XCTAssertEqual(pinned.compactMap { $0["title"] as? String }, ["d1", "d2", "d3"])
+        adapter.vectorStrategy = nil
+
+        let written = try documents.create(
+            ["id": "d9", "title": "written", "embedding": [0.25, 0.5, 1.0]]
+        )
+        let stored = try adapter.query("SELECT typeof(embedding) AS t FROM documents WHERE id = 'd9'")
+        XCTAssertEqual(stored.first?["t"] as? String, "blob", "an array is written as a float32 BLOB")
+        XCTAssertEqual(written["embedding"] as? [Double] ?? [], [0.25, 0.5, 1.0])
+
+        let found = try documents.findMany(filter: ["id": "d9"])
+        XCTAssertEqual(found.first?["embedding"] as? [Double] ?? [], [0.25, 0.5, 1.0])
+        try documents.update(filter: ["id": "d1"], data: ["embedding": [0.5, 0.5, 0]])
+        let updated = try documents.findMany(filter: ["id": "d1"])
+        XCTAssertEqual(updated.first?["embedding"] as? [Double] ?? [], [0.5, 0.5, 0])
+        XCTAssertEqual(updated.first?["title"] as? String, "d1", "a non-vector column is untouched")
+        try documents.updateMany(filter: ["id": "d2"], data: ["embedding": [0, 0, 1]])
+        let many = try documents.findMany(filter: ["id": "d2"])
+        XCTAssertEqual(many.first?["embedding"] as? [Double] ?? [], [0, 0, 1])
+    }
+
+    /// A database whose vector column holds float32 BLOBs, as `VECTOR(n)` now maps to.
+    private func makeBlobAdapter() throws -> An5Adapter {
+        let metadata = Metadata(
+            modelToTable: ["Document": "documents"],
+            modelFields: [
+                "Document": [
+                    FieldMeta(name: "id", type: "string", sqlType: "TEXT", isId: true),
+                    FieldMeta(name: "title", type: "string", sqlType: "TEXT"),
+                    FieldMeta(
+                        name: "embedding", type: "number[] | string", sqlType: "VECTOR(3)",
+                        isOptional: true
+                    ),
+                ]
+            ],
+            relationMap: [:]
+        )
+        let adapter = try An5Adapter(path: ":memory:", metadata: metadata)
+        try adapter.execute("CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT, embedding BLOB)")
+        return adapter
+    }
+
     // MARK: - Metadata
 
     func testMetadataAcceptsEitherSpelling() throws {

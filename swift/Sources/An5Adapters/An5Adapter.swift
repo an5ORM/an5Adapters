@@ -78,6 +78,44 @@ public final class An5Adapter {
         ViewClient(adapter: self, view: name)
     }
 
+    /// Pins one SQLite vector strategy instead of probing for the fastest one available:
+    /// `sqlite-vec`, `udf`, `sql` or `memory`. `nil` probes.
+    ///
+    /// SQLite has no vector type, so a `VECTOR(n)` column is ranked by the sqlite-vec
+    /// extension, a distance function the driver registers, `json_each` in plain SQL, or in
+    /// the client. The bundled `SQLiteDriver` registers the distance functions and loads
+    /// `SQLiteDriver.sqliteVecPath` when one is set.
+    public var vectorStrategy: String?
+
+    /// What this SQLite connection can do for vector search, probed once and cached.
+    ///
+    /// `nil` on the other dialects. The bundled driver registers the `an5_vec_*` functions
+    /// itself, so `udf` is reported whenever it is in use; a custom `SQLDriver` normally
+    /// reaches only `json_each` and the in-memory path.
+    public private(set) lazy var sqliteCapabilities: SqliteVectors.Capabilities = {
+        SqliteVectors.Capabilities(
+            vec: probe("SELECT vec_version()"),
+            udf: probe("SELECT an5_vec_cosine(zeroblob(4), zeroblob(4))"),
+            json1: probe("SELECT json_valid('[1]')")
+        )
+    }()
+
+    /// True when a probe statement ran, whatever it returned.
+    private func probe(_ sql: String) -> Bool {
+        (try? driver.query(sql, [])) != nil
+    }
+
+    /// A vector column's declared DDL type, or `nil` when it cannot be read.
+    ///
+    /// It is what decides whether the `json_each` strategy can reach the rows in the column:
+    /// a `BLOB` column has no JSON to walk.
+    public func queryColumnType(table: String, column: String) throws -> String? {
+        let rows = try driver.query(
+            "SELECT type FROM pragma_table_info(?) WHERE name = ?", [table, column]
+        )
+        return rows.first?["type"].flatMap { $0 as? String }
+    }
+
     /// Runs a query and returns its rows keyed by column name.
     public func query(_ sql: String, _ parameters: [Any?] = []) throws -> [Row] {
         try driver.query(sql, parameters.compactMap { SQLValue.encode($0) })

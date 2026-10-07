@@ -5,8 +5,10 @@ import uuid
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 try:
     from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
+    from .base.vectors import decode_vector, encode_vector, is_vector_field, needs_vector_encoding, run_sqlite_vector_search, vector_distance
 except ImportError:
     from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
+    from base.vectors import decode_vector, encode_vector, is_vector_field, needs_vector_encoding, run_sqlite_vector_search, vector_distance
 
 # ─── Select / Include helpers ────────────────────────────────────────────────────────
 
@@ -255,6 +257,50 @@ class AdapterTableClient(Generic[T]):
             )
         return fields or []
 
+    @property
+    def _vector_fields(self) -> List[str]:
+        """The `VECTOR(n)` columns of this model, from the generated metadata."""
+        return [f["name"] for f in self._fields if is_vector_field(f)]
+
+    def _encode_vector_fields(self, data: Dict) -> Dict:
+        """Encodes every `VECTOR(n)` value on its way into SQLite.
+
+        The column holds a float32 BLOB, which is a third of the size of the JSON
+        text it replaces and is what the in-database distance functions read.
+        Values that already arrived as text or bytes are left alone, so rows
+        written by an older version stay readable.
+        """
+        if self._dialect != DIALECT_SQLITE:
+            return data
+        out = dict(data)
+        for name in self._vector_fields:
+            value = out.get(name)
+            if needs_vector_encoding(value):
+                parsed = [float(v) for v in value]
+                if parsed:
+                    out[name] = encode_vector(parsed)
+        return out
+
+    def _decode_vector_fields(self, rows: List[Dict]) -> List[Dict]:
+        """Decodes `VECTOR(n)` columns back into lists of numbers after a read."""
+        if self._dialect != DIALECT_SQLITE or not rows:
+            return rows
+        names = self._vector_fields
+        if not names:
+            return rows
+        decoded = []
+        for row in rows:
+            changed = False
+            out = dict(row)
+            for name in names:
+                if name in out:
+                    values = decode_vector(out[name])
+                    if values:
+                        out[name] = values
+                        changed = True
+            decoded.append(out if changed else row)
+        return decoded
+
     def _pagination(self, take: Optional[int], skip: int, order_sql: str) -> str:
         if take is None:
             return ""
@@ -282,7 +328,7 @@ class AdapterTableClient(Generic[T]):
             query += f" {order_sql}"
         query += self._pagination(take, skip, order_sql)
 
-        rows = self._adapter.exec(query, list(params.values()))
+        rows = self._decode_vector_fields(self._adapter.exec(query, list(params.values())))
 
         if include:
             _resolve_includes(self._model, rows, include, self._adapter)
@@ -314,6 +360,7 @@ class AdapterTableClient(Generic[T]):
             data = {**data, id_field["name"]: str(uuid.uuid4())}
 
         data, relation_writes = _split_relation_writes(self._model, data)
+        data = self._encode_vector_fields(data)
 
         cols = [k for k, v in data.items() if v is not None]
         values = [data[c] for c in cols]
@@ -362,6 +409,7 @@ class AdapterTableClient(Generic[T]):
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect, "w_")
         data, relation_writes = _split_relation_writes(self._model, data)
+        data = self._encode_vector_fields(data)
         set_parts: List[str] = []
         set_values: List = []
         for col, val in data.items():
@@ -405,6 +453,7 @@ class AdapterTableClient(Generic[T]):
     def update_many(self, where: Optional[Dict], data: Dict) -> Dict:
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect, "w_")
+        data = self._encode_vector_fields(data)
         set_parts: List[str] = []
         set_values: List = []
         for col, val in data.items():
@@ -514,72 +563,93 @@ class AdapterTableClient(Generic[T]):
 
         return self._adapter.exec(query, list(params.values()))
 
-    def vector_search(self, vector: List[float], take: int = 10, where=None, vector_field: str = "embedding", distance_metric: str = "cosine") -> List[Dict]:
+    def vector_search(
+        self,
+        vector: List[float],
+        take: int = 10,
+        where=None,
+        vector_field: str = "embedding",
+        distance_metric: str = "cosine",
+    ) -> List[Dict]:
         dim = len(vector)
         vec_json = json.dumps(vector)
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect)
+        field_sql = _quote(vector_field, self._dialect)
 
-        # 1. Primary path: Native database SQL vector query execution (MSSQL VECTOR_DISTANCE / Postgres pgvector)
-        #    SQLite has no vector operators at all, so skip it entirely: building
-        #    the SQL and catching the error would cost work and still end up on the
-        #    in-memory path in step 2.
-        native_rows = None
-        if self._dialect != DIALECT_SQLITE:
-            try:
-                field_sql = _quote(vector_field, self._dialect)
-                if self._dialect == DIALECT_POSTGRES:
-                    op = "<=>" if distance_metric == "cosine" else ("<->" if distance_metric == "euclidean" else "<#>")
-                    query = f"SELECT *, ({field_sql} {op} %s::vector) AS distance FROM {self._table_sql}"
-                    query_params = [vec_json] + list(params.values())
-                    if where_sql:
-                        query += f" WHERE {field_sql} IS NOT NULL AND ({where_sql})"
-                    else:
-                        query += f" WHERE {field_sql} IS NOT NULL"
-                    query += f" ORDER BY distance ASC LIMIT {take}"
+        # 1. SQLite ranks through sqlite-vec, a driver function or json_each,
+        #    whichever this connection supports, so the table never leaves the
+        #    database unless it has to.
+        if self._dialect == DIALECT_SQLITE:
+            rows = run_sqlite_vector_search(
+                exec_fn=self._adapter.exec,
+                table=self._table_sql,
+                raw_table=self._table.strip("[]"),
+                column=field_sql,
+                raw_column=vector_field,
+                vector=vector,
+                metric=distance_metric,
+                take=take,
+                tail=f" WHERE {where_sql}" if where_sql else "",
+                params=list(params.values()),
+                support=self._adapter.vector_support(),
+                preference=getattr(self._adapter, "vector_strategy", None),
+            )
+            if rows is not None:
+                return self._decode_vector_fields(rows)
+            return self._score_vectors_in_memory(vector, take, where, vector_field, distance_metric)
+
+        # 2. Native dialect execution (PostgreSQL pgvector / MSSQL VECTOR_DISTANCE).
+        try:
+            if self._dialect == DIALECT_POSTGRES:
+                op = "<=>" if distance_metric == "cosine" else ("<->" if distance_metric == "euclidean" else "<#>")
+                query = f"SELECT *, ({field_sql} {op} %s::vector) AS distance FROM {self._table_sql}"
+                query_params = [vec_json] + list(params.values())
+                if where_sql:
+                    query += f" WHERE {field_sql} IS NOT NULL AND ({where_sql})"
                 else:
-                    placeholder = "?"
-                    query = f"SELECT TOP ({take}) *, VECTOR_DISTANCE('{distance_metric}', CAST({field_sql} AS VECTOR({dim}, float32)), CAST({placeholder} AS VECTOR({dim}, float32))) AS distance FROM {self._table_sql}{self._nolock}"
-                    query_params = [vec_json] + list(params.values())
-                    if where_sql:
-                        query += f" WHERE {field_sql} IS NOT NULL AND ({where_sql})"
-                    else:
-                        query += f" WHERE {field_sql} IS NOT NULL"
-                    query += " ORDER BY distance ASC"
+                    query += f" WHERE {field_sql} IS NOT NULL"
+                query += f" ORDER BY distance ASC LIMIT {take}"
+            else:
+                placeholder = "?"
+                query = f"SELECT TOP ({take}) *, VECTOR_DISTANCE('{distance_metric}', CAST({field_sql} AS VECTOR({dim}, float32)), CAST({placeholder} AS VECTOR({dim}, float32))) AS distance FROM {self._table_sql}{self._nolock}"
+                query_params = [vec_json] + list(params.values())
+                if where_sql:
+                    query += f" WHERE {field_sql} IS NOT NULL AND ({where_sql})"
+                else:
+                    query += f" WHERE {field_sql} IS NOT NULL"
+                query += " ORDER BY distance ASC"
 
-                native_rows = self._adapter.exec(query, query_params)
+            return self._adapter.exec(query, query_params)
+        except Exception:
+            pass
 
-                if native_rows is not None:
-                    return native_rows
-            except Exception:
-                pass
+        # 3. Fallback: score the column in Python.
+        return self._score_vectors_in_memory(vector, take, where, vector_field, distance_metric)
 
-        # 2. Secondary fallback: In-memory similarity computation if DB engine lacks native vector extension
-        rows = self.find_many(where=where)
+    def _score_vectors_in_memory(
+        self,
+        vector: List[float],
+        take: int,
+        where,
+        vector_field: str,
+        distance_metric: str,
+    ) -> List[Dict]:
+        """Ranks the vector column in Python.
+
+        The last resort for every provider, and the only option on a SQLite
+        connection that offers neither sqlite-vec, a driver function nor JSON1.
+        The whole table is loaded, so it is only reasonable for a table small
+        enough to fit in memory.
+        """
         scored = []
-        for row in rows:
-            raw = row.get(vector_field)
-            if raw is None:
-                continue
-            try:
-                vec = json.loads(raw) if isinstance(raw, str) else list(raw)
-            except Exception:
-                continue
+        for row in self.find_many(where=where):
+            vec = decode_vector(row.get(vector_field))
             if not vec or len(vec) != len(vector):
                 continue
-
-            dot = sum(a * b for a, b in zip(vector, vec))
-            m1 = sum(a ** 2 for a in vector) ** 0.5
-            m2 = sum(b ** 2 for b in vec) ** 0.5
-            cosine = dot / (m1 * m2) if m1 and m2 else 0.0
-
-            if distance_metric == "cosine":
-                dist = 1.0 - cosine
-            elif distance_metric == "dot":
-                dist = -dot
-            else:
-                dist = sum((a - b) ** 2 for a, b in zip(vector, vec)) ** 0.5
-
+            dist = vector_distance(vector, vec, distance_metric)
+            if dist is None:
+                continue
             scored.append((row, dist))
 
         scored.sort(key=lambda x: x[1])

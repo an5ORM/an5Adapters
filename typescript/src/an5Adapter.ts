@@ -28,6 +28,15 @@ import {
 } from './nbase';
 import { bindParam, buildOrderBy, parseWhere, quote } from './base/sql';
 import {
+  decodeVector,
+  isVectorField,
+  needsVectorEncoding,
+  runSqliteVectorSearch,
+  vectorDistance,
+  type SqliteVectorSupport,
+  type VectorStrategyPreference,
+} from './sqlite/vector';
+import {
   createAdapterProxy,
   getFieldsForModel,
   resolveIdField,
@@ -72,7 +81,10 @@ function isDuplicateKeyError(error: unknown, dialect: Dialect): boolean {
 function appendUpdateSet(sets: string[], params: Record<string, any>, col: string, val: any, dialect: Dialect): void {
   const quoted = quote(col, dialect);
   const safeCol = sanitizeParamName(col);
-  if (val && typeof val === 'object' && !(val instanceof Date)) {
+  // `TypedArray.prototype.set` is the copy method, not the update operator, so a
+  // vector written as a float32 BLOB must not be read as `{ set: ... }`.
+  const isLiteral = Array.isArray(val) || ArrayBuffer.isView(val) || val instanceof ArrayBuffer;
+  if (val && typeof val === 'object' && !(val instanceof Date) && !isLiteral) {
     if (val.increment !== undefined) {
       const p = bindParam(params, `s_${safeCol}_inc`, val.increment);
       sets.push(`${quoted} = ${quoted} + @${p}`);
@@ -384,6 +396,22 @@ export class An5Adapter {
   async exec<T = any>(query: string, params?: Record<string, any>): Promise<T[]> {
     if (this.sheetsAdapter) return this.sheetsAdapter.exec<T>(query, params);
     return (await this.requireEngine()).exec<T>(query, params);
+  }
+
+  /**
+   * The SQLite engine's vector hooks, or null when this is not a SQLite adapter.
+   * `vectorSearch` needs them to load sqlite-vec and register the distance
+   * functions; a connection with no hooks still searches in memory.
+   */
+  async sqliteVectorSupport(): Promise<SqliteVectorSupport | null> {
+    if (this.sheetsAdapter) return null;
+    const engine = await this.requireEngine();
+    return engine.dialect === 'sqlite' ? (engine.vectorSupport ?? null) : null;
+  }
+
+  /** `vectorStrategy` from the config, so a project can pin one strategy. */
+  get vectorStrategy(): VectorStrategyPreference | undefined {
+    return this._engineConfig?.vectorStrategy;
   }
 
   /** INTERNAL: used by AdapterTableClient for DML statements needing row count */
@@ -732,6 +760,14 @@ export class AdapterTableClient<T = any> {
   public get dialect(): Dialect { return this.adapter.dialect; }
 
   public get tableName(): string {
+    const t = this.mappedTableName;
+    if (t.startsWith('[') || t.startsWith('"') || t.startsWith('`')) return t;
+    if (t.includes('.')) return t.split('.').map(p => quote(p, this.dialect)).join('.');
+    return quote(t, this.dialect);
+  }
+
+  /** The table name this model maps to, before any quoting is applied. */
+  private get mappedTableName(): string {
     const name = this.modelName;
     let t = name;
     const modelToTable = getModelToTable();
@@ -744,9 +780,17 @@ export class AdapterTableClient<T = any> {
         if (modelToTable[lower]) t = modelToTable[lower];
       }
     }
-    if (t.startsWith('[') || t.startsWith('"') || t.startsWith('`')) return t;
-    if (t.includes('.')) return t.split('.').map(p => quote(p, this.dialect)).join('.');
-    return quote(t, this.dialect);
+    return t;
+  }
+
+  /**
+   * The bare table name, for helpers that take a string literal. `@@map` values
+   * may be pre-quoted or schema-qualified, neither of which `pragma_table_info`
+   * accepts, so the last segment is unwrapped here.
+   */
+  public get rawTableName(): string {
+    const last = this.mappedTableName.split('.').pop() ?? this.mappedTableName;
+    return last.replace(/^[\s]*[\[\]"`]+|[\[\]"`]+[\s]*$/g, '');
   }
 
   private get nolock(): string {
@@ -768,6 +812,53 @@ export class AdapterTableClient<T = any> {
 
   private async doExecuteRaw(query: string, params?: Record<string, any>): Promise<number> {
     return this.adapter._executeRaw(query, params);
+  }
+
+  /**
+   * Encode every `VECTOR(n)` value on its way into SQLite.
+   *
+   * The column holds a float32 BLOB, which is a third of the size of the JSON
+   * text it replaces and is what sqlite-vec reads. Values that already arrived
+   * as text or bytes are left alone, so rows written by an older version stay
+   * readable.
+   */
+  private encodeVectorFields(data: Record<string, any>): Record<string, any> {
+    if (this.dialect !== 'sqlite') return data;
+    const fields = getFieldsForModel(this.modelName);
+    const vectorFields = Object.keys(fields).filter((name) => isVectorField(fields[name]));
+    if (vectorFields.length === 0) return data;
+    const { encodeVector } = require('./sqlite/vector');
+    const out = { ...data };
+    for (const name of vectorFields) {
+      const value = out[name];
+      if (needsVectorEncoding(value)) {
+        const parsed = Array.from(value as ArrayLike<number>);
+        if (parsed.length > 0) out[name] = encodeVector(parsed);
+      }
+    }
+    return out;
+  }
+
+  /** Decode `VECTOR(n)` columns back into `number[]` after a read. */
+  private decodeVectorFields<T>(rows: T[]): T[] {
+    if (this.dialect !== 'sqlite' || !Array.isArray(rows) || rows.length === 0) return rows;
+    const fields = getFieldsForModel(this.modelName);
+    const vectorFields = Object.keys(fields).filter((name) => isVectorField(fields[name]));
+    if (vectorFields.length === 0) return rows;
+    return rows.map((row: any) => {
+      if (!row || typeof row !== 'object') return row;
+      let changed = false;
+      const out: any = { ...row };
+      for (const name of vectorFields) {
+        if (!(name in out)) continue;
+        const decoded = decodeVector(out[name]);
+        if (decoded) {
+          out[name] = decoded;
+          changed = true;
+        }
+      }
+      return changed ? out : row;
+    });
   }
 
   async findMany(args?: { where?: any; orderBy?: any; skip?: number; take?: number; select?: any; include?: any }): Promise<T[]> {
@@ -825,7 +916,7 @@ export class AdapterTableClient<T = any> {
       if (orderSql) query += ` ${orderSql}`;
     }
 
-    const rows = await this.doExec<T>(query, params);
+    const rows = this.decodeVectorFields(await this.doExec<T>(query, params));
 
     if (args?.include) {
       await resolveIncludes(this.modelName, rows, args.include, this.adapter);
@@ -875,7 +966,7 @@ export class AdapterTableClient<T = any> {
     const fields = getFieldsForModel(this.modelName);
     const idFieldName = resolveIdField(fields);
 
-    const data: any = { ...rawData };
+    const data: any = this.encodeVectorFields(rawData);
     if (idFieldName) {
       const fieldDef: any = fields[idFieldName];
       const rawType = typeof fieldDef === 'string' ? fieldDef : (fieldDef?.ts || fieldDef?.sql || fieldDef?.type || '');
@@ -954,9 +1045,10 @@ export class AdapterTableClient<T = any> {
 
       for (let r = 0; r < args.data.length; r++) {
         const row = args.data[r] as any;
+        const encoded = this.encodeVectorFields(row);
         const vals = firstCols.map(col => {
           const p = `r${r}_${col}`;
-          params[p] = row[col] ?? null;
+          params[p] = encoded[col] ?? null;
           return `@${p}`;
         });
         rowPlaceholders.push(`(${vals.join(', ')})`);
@@ -988,13 +1080,14 @@ export class AdapterTableClient<T = any> {
       }
     }
 
+    const data = this.encodeVectorFields(rawData);
     const setCols = Object.keys(rawData).filter(k => rawData[k] !== undefined);
     if (setCols.length > 0) {
       const params: Record<string, any> = {};
       const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, 'w_', this.whereContext());
       const sets: string[] = [];
       for (const col of setCols) {
-        appendUpdateSet(sets, params, col, rawData[col], this.dialect);
+        appendUpdateSet(sets, params, col, data[col], this.dialect);
       }
       if (sets.length > 0) {
         const query = `UPDATE ${this.tableName} SET ${sets.join(', ')}${whereSql ? ` WHERE ${whereSql}` : ''}`;
@@ -1050,11 +1143,12 @@ export class AdapterTableClient<T = any> {
   async updateMany(args: { where?: any; data: Partial<T> }): Promise<{ count: number }> {
     const params: Record<string, any> = {};
     const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, 'w_', this.whereContext());
+    const data = this.encodeVectorFields(args.data as Record<string, any>);
     const setCols = Object.keys(args.data).filter(k => (args.data as any)[k] !== undefined);
     const sets: string[] = [];
 
     for (const col of setCols) {
-      appendUpdateSet(sets, params, col, (args.data as any)[col], this.dialect);
+      appendUpdateSet(sets, params, col, data[col], this.dialect);
     }
 
     if (sets.length === 0) return { count: 0 };
@@ -1410,6 +1504,28 @@ export class AdapterTableClient<T = any> {
         const msg = String(err?.message || '').toLowerCase();
         if (!msg.includes('vector') && !msg.includes('operator does not exist')) throw err;
       }
+    } else if (this.dialect === 'sqlite') {
+      // SQLite has no vector type, so the ranking runs through sqlite-vec, a
+      // driver function, or json_each — whichever this connection supports.
+      const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, '', this.whereContext());
+      const support = await (this.adapter as any).sqliteVectorSupport?.() ?? null;
+      const ranked = await runSqliteVectorSearch({
+        exec: (sql, p) => this.doExec<any>(sql, p),
+        vectorSupport: support,
+        table: this.tableName,
+        rawTable: this.rawTableName,
+        column: col,
+        rawColumn: vectorField,
+        vector: args.vector,
+        metric,
+        take,
+        tail: whereSql ? ` WHERE ${whereSql}` : '',
+        params,
+        preference: (this.adapter as any).vectorStrategy,
+      });
+      if (ranked) return this.decodeVectorFields(ranked.rows) as (T & { distance: number })[];
+      // No in-database strategy: score the column in the client instead.
+      return this.scoreVectorsInMemory(args, metric, take, vectorField);
     } else if (this.dialect === 'mssql') {
       const distFn = metric === 'cosine' ? 'cosine' : metric === 'euclidean' ? 'euclidean' : 'dot';
       const whereSql = parseWhere(this.modelName, args.where, params, this.dialect, '', this.whereContext());
@@ -1436,30 +1552,31 @@ export class AdapterTableClient<T = any> {
     }
 
     // 2. Fallback: in-memory similarity computation when native vector support is unavailable
+    return this.scoreVectorsInMemory(args, metric, take, vectorField);
+  }
+
+  /**
+   * Rank the vector column in the client. This is the last resort for every
+   * provider, and the only option on SQLite connections that offer neither
+   * sqlite-vec, a driver function nor JSON1.
+   *
+   * The whole table is loaded, so it is only reasonable for a table small
+   * enough to fit in memory.
+   */
+  private async scoreVectorsInMemory(
+    args: { vector: number[]; where?: any },
+    metric: 'cosine' | 'euclidean' | 'dot',
+    take: number,
+    vectorField = 'embedding',
+  ): Promise<(T & { distance: number })[]> {
     const rows = await this.findMany({ where: args.where });
 
     const scored: { row: T; dist: number }[] = [];
     for (const row of rows) {
-      const raw = (row as any)[vectorField];
-      if (!raw) continue;
-      let vec: number[] = [];
-      try { vec = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { continue; }
-      if (!Array.isArray(vec) || vec.length !== args.vector.length) continue;
-
-      let dot = 0, m1 = 0, m2 = 0;
-      for (let i = 0; i < args.vector.length; i++) {
-        const av = args.vector[i] ?? 0;
-        const bv = vec[i] ?? 0;
-        dot += av * bv;
-        m1 += av ** 2;
-        m2 += bv ** 2;
-      }
-      const cosine = m1 && m2 ? dot / (Math.sqrt(m1) * Math.sqrt(m2)) : 0;
-      const dist = metric === 'cosine'
-        ? 1 - cosine
-        : metric === 'dot'
-          ? -dot
-          : Math.sqrt(args.vector.reduce((s, v, i) => s + (v - (vec[i] ?? 0)) ** 2, 0));
+      const vec = decodeVector((row as any)[vectorField]);
+      if (!vec) continue;
+      const dist = vectorDistance(args.vector, vec, metric);
+      if (dist === null) continue;
       scored.push({ row, dist });
     }
     scored.sort((a, b) => a.dist - b.dist);

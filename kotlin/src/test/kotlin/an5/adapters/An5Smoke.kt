@@ -20,6 +20,7 @@ object An5Smoke {
         relations()
         transactions()
         vectorFallback()
+        sqliteVectorSearch()
 
         if (failures > 0) {
             println("kotlin smoke: $failures check(s) failed")
@@ -185,6 +186,92 @@ object An5Smoke {
             check("nearest first") { hits.first().string("title") == "near" }
             check("distance reported") { hits.first().containsKey("distance") }
         }
+    }
+
+    /**
+     * SQLite ranks a `VECTOR(n)` column inside the database, and a `DoubleArray` written
+     * to one comes back as numbers.
+     *
+     * The docstring in the JVM adapter's `SqliteVectors` is the shared specification every
+     * runtime implements; test/sqlite-vector.test.js (TypeScript) is the mirror.
+     */
+    private fun sqliteVectorSearch() {
+        an5.adapters.base.Metadata.setAdapterMetadata(blobMetadata())
+        val db = An5(":memory:")
+        db.use {
+            it.executeRaw("CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT, embedding BLOB)")
+            val vectors = listOf(
+                "d1" to doubleArrayOf(1.0, 0.0, 0.0),
+                "d2" to doubleArrayOf(0.8, 0.2, 0.0),
+                "d3" to doubleArrayOf(0.0, 1.0, 0.0),
+            )
+            for ((id, vector) in vectors) {
+                it.executeRaw(
+                    "INSERT INTO documents (id, title, embedding) VALUES (?, ?, ?)",
+                    id, id, an5.adapters.base.SqliteVectors.encodeVector(vector),
+                )
+            }
+            // A row with another dimension must never rank against a 3-dimension query.
+            it.executeRaw(
+                "INSERT INTO documents (id, title, embedding) VALUES ('d4', 'd4', ?)",
+                an5.adapters.base.SqliteVectors.encodeVector(doubleArrayOf(1.0, 0.0, 0.0, 1.0)),
+            )
+
+            val docs = it.table("Document")
+            for (metric in DistanceMetric.entries) {
+                val hits = docs.vectorSearch(doubleArrayOf(1.0, 0.0, 0.0), take = 9, metric = metric)
+                check("${metric.sql}: row order") { hits.joinToString(",") { row -> row.string("title").orEmpty() } == "d1,d2,d3" }
+                check("${metric.sql}: the distance is a number") { hits.first()["distance"] is Double }
+                check("${metric.sql}: the vector decodes to numbers") { hits.first()["embedding"] is DoubleArray }
+            }
+
+            // `memory` pins the client-side fallback, which ranks the same rows.
+            it.vectorStrategy("memory")
+            val pinned = docs.vectorSearch(doubleArrayOf(1.0, 0.0, 0.0), take = 9)
+            check("the memory fallback ranks correctly") {
+                pinned.joinToString(",") { row -> row.string("title").orEmpty() } == "d1,d2,d3"
+            }
+
+            it.vectorStrategy(null)
+            val written = docs.create(
+                mapOf("id" to "d9", "title" to "written", "embedding" to doubleArrayOf(0.25, 0.5, 1.0)),
+            )
+            check("create writes a float32 BLOB") {
+                it.queryRaw("SELECT typeof(embedding) AS t FROM documents WHERE id = 'd9'")
+                    .first().string("t") == "blob"
+            }
+            check("create returns numbers") { written["embedding"] is DoubleArray }
+            check("findMany returns numbers") {
+                docs.findMany(where = mapOf("id" to "d9")).first()["embedding"] is DoubleArray
+            }
+            docs.update(mapOf("id" to "d1"), mapOf("embedding" to doubleArrayOf(0.5, 0.5, 0.0)))
+            check("update encodes") {
+                docs.findMany(where = mapOf("id" to "d1")).first()["embedding"] is DoubleArray
+            }
+            docs.updateMany(mapOf("id" to "d2"), mapOf("embedding" to doubleArrayOf(0.0, 0.0, 1.0)))
+            check("updateMany encodes") {
+                docs.findMany(where = mapOf("id" to "d2")).first()["embedding"] is DoubleArray
+            }
+        }
+    }
+
+    private fun blobMetadata(): MutableMap<String, Any?> {
+        val metadata = metadata()
+        @Suppress("UNCHECKED_CAST")
+        val fields = metadata["modelFields"] as MutableMap<String, Any?>
+        fields["Document"] = listOf(
+            field("id", true),
+            field("title", false),
+            mutableMapOf<String, Any?>(
+                "name" to "embedding",
+                "type" to "number[] | string",
+                "sql" to "VECTOR(3)",
+                "isOptional" to true,
+                "hasDefault" to false,
+                "isId" to false,
+            ),
+        )
+        return metadata
     }
 
     // ─── Harness ──────────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 import type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from '../base/types';
+import { SqliteVectorSupport } from './vector';
 
 // ─── SQLite Engine ─────────────────────────────────────────────────────────────────
 
@@ -7,6 +8,8 @@ try { BetterSqlite3 = require('better-sqlite3'); } catch { }
 
 export class SqliteEngine implements QueryEngine {
   dialect: Dialect = 'sqlite';
+  /** Registers `an5_vec_*` and loads sqlite-vec for in-database vector search. */
+  readonly vectorSupport: SqliteVectorSupport;
   private db: any = null;
   private readonly filePath: string;
 
@@ -16,6 +19,15 @@ export class SqliteEngine implements QueryEngine {
       .replace(/^sqlite:\/\/\//i, '/')
       .replace(/^sqlite:\/\//i, '')
       .replace(/^sqlite:/i, '');
+    this.vectorSupport = new SqliteVectorSupport({
+      native: () => this.getDb(),
+      registerFunction: (name, fn) => this.getDb().function(name, { deterministic: true }, fn),
+    }, { sqliteVec: adapterConfig.sqliteVec, vectorStrategy: adapterConfig.vectorStrategy });
+  }
+
+  /** The better-sqlite3 handle, needed for extension loading. */
+  native(): any {
+    return this.getDb();
   }
 
   private getDb(): any {

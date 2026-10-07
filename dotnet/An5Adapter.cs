@@ -19,20 +19,33 @@ namespace An5Orm
         private readonly int _commandTimeout;
 
         public An5Adapter(string connectionString, int commandTimeout = 60)
+            : this(connectionString, commandTimeout, null) { }
+
+        public An5Adapter(string connectionString, int commandTimeout, SqliteVectorSupport vectorSupport)
         {
             ConnectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
             _commandTimeout = commandTimeout;
             _engine = DialectDetector.Detect(connectionString) switch
             {
                 Dialect.Postgres => new PostgresEngine(connectionString, commandTimeout),
-                Dialect.Sqlite => new SqliteEngine(connectionString, commandTimeout),
+                Dialect.Sqlite => new SqliteEngine(connectionString, commandTimeout, vectorSupport),
                 _ => new MssqlEngine(connectionString, commandTimeout)
             };
         }
 
-        public An5Adapter(An5AdapterOptions options) : this(options.ConnectionString, options.CommandTimeout) { }
+        public An5Adapter(An5AdapterOptions options)
+            : this(options.ConnectionString, options.CommandTimeout,
+                   new SqliteVectorSupport { SqliteVecPath = options.SqliteVec, Preference = options.VectorStrategy })
+        { }
 
         // ── Raw query execution ────────────────────────────────────────────────
+
+        /// <summary>
+        /// SQLite only: the vector hooks of the configured connection, or null on
+        /// the other providers. `VectorSearch` needs them to rank a `VECTOR(n)`
+        /// column inside the database.
+        /// </summary>
+        public SqliteVectorSupport VectorSupport => _engine.VectorSupport;
 
         public List<Dictionary<string, object>> QueryRaw(string sql, Dictionary<string, object> parameters = null)
             => _engine.QueryRaw(sql, parameters);
@@ -1006,10 +1019,29 @@ namespace An5Orm
             string whereClause = null, Dictionary<string, object> parameters = null,
             string vectorField = "Embedding", string distanceMetric = "cosine")
         {
-            // 1. Primary path: Native database SQL vector query execution (MSSQL VECTOR_DISTANCE / Postgres pgvector)
-            //    SQLite has no vector operator, so it is skipped outright: building the
-            //    statement only to have it rejected costs a round trip and lands on the
-            //    in-memory path below anyway.
+            // 1. SQLite ranks through sqlite-vec, a driver function or json_each,
+            //    whichever this connection supports, so the table never has to
+            //    leave the database.
+            if (_dialect == Dialect.Sqlite)
+            {
+                var p = parameters != null ? new Dictionary<string, object>(parameters) : new Dictionary<string, object>();
+                var quotedVectorField = SqlQuote.QuoteName(vectorField, _dialect);
+                var ranked = SqliteVectors.RunSearch(
+                    _adapter.QueryRaw,
+                    _tableName,
+                    _rawTable.Trim('[', ']'),
+                    quotedVectorField,
+                    vectorField,
+                    vector,
+                    distanceMetric,
+                    take,
+                    string.IsNullOrWhiteSpace(whereClause) ? "" : $" WHERE {whereClause}",
+                    p,
+                    _adapter.VectorSupport);
+                if (ranked != null) return ToRanked(ranked, take);
+            }
+
+            // 2. Primary path: Native database SQL vector query execution (MSSQL VECTOR_DISTANCE / Postgres pgvector)
             if (_dialect != Dialect.Sqlite)
             try
             {
@@ -1063,7 +1095,7 @@ namespace An5Orm
                 // Secondary fallback: In-memory similarity computation if DB instance lacks native vector extension
             }
 
-            // 2. Secondary fallback: In-memory similarity computation
+            // 3. Secondary fallback: In-memory similarity computation
             var rows = FindMany(whereClause, parameters);
             var results = new List<(T, double)>();
             var vectorProp = typeof(T).GetProperty(vectorField, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
@@ -1071,31 +1103,57 @@ namespace An5Orm
 
             foreach (var row in rows)
             {
-                var rawVal = vectorProp.GetValue(row);
-                if (rawVal == null) continue;
-                List<double> vec = null;
-                try
-                {
-                    if (rawVal is string s) vec = JsonSerializer.Deserialize<List<double>>(s);
-                }
-                catch { continue; }
+                // A float32 BLOB, a legacy JSON text column or an already-decoded
+                // array all decode the same way.
+                var vec = SqliteVectors.DecodeVector(vectorProp.GetValue(row));
                 if (vec == null || vec.Count != vector.Count) continue;
-
-                double dot = 0, m1 = 0, m2 = 0;
-                for (int i = 0; i < vector.Count; i++)
-                {
-                    dot += vector[i] * vec[i];
-                    m1 += vector[i] * vector[i];
-                    m2 += vec[i] * vec[i];
-                }
-                double cosine = (m1 > 0 && m2 > 0) ? dot / (Math.Sqrt(m1) * Math.Sqrt(m2)) : 0;
-                double dist = distanceMetric.Equals("cosine", StringComparison.OrdinalIgnoreCase) ? 1.0 - cosine :
-                              distanceMetric.Equals("dot", StringComparison.OrdinalIgnoreCase) ? -dot : EuclideanDistance(vector, vec);
-                results.Add((row, dist));
+                var dist = SqliteVectors.VectorDistance(vector, vec, distanceMetric);
+                if (!dist.HasValue) continue;
+                results.Add((row, dist.Value));
             }
 
             results.Sort((a, b) => a.Item2.CompareTo(b.Item2));
             return results.GetRange(0, Math.Min(take, results.Count));
+        }
+
+        /// <summary>
+        /// Projects the ranked rows the in-database strategies return into the
+        /// caller's entity type, taking `distance` from the added column.
+        /// </summary>
+        private List<(T, double)> ToRanked(List<Dictionary<string, object>> rows, int take)
+        {
+            var results = new List<(T, double)>();
+            foreach (var row in rows)
+            {
+                var item = Activator.CreateInstance<T>();
+                foreach (var prop in typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if (!row.TryGetValue(prop.Name, out var value) || value == null) continue;
+                    if (prop.Name.Equals("Distance", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (value is double d) prop.SetValue(item, d);
+                        continue;
+                    }
+                    // A vector column arrives as float32 bytes; the entity declares
+                    // it as float[].
+                    if (prop.PropertyType == typeof(float[]))
+                    {
+                        var vec = SqliteVectors.DecodeVector(value);
+                        if (vec != null)
+                        {
+                            prop.SetValue(item, vec.Select(v => (float)v).ToArray());
+                            continue;
+                        }
+                    }
+                    try { prop.SetValue(item, Convert.ChangeType(value, prop.PropertyType)); } catch { }
+                }
+                double distance = row.TryGetValue("distance", out var raw) && raw != null
+                    ? Convert.ToDouble(raw)
+                    : 0;
+                results.Add((item, distance));
+                if (results.Count >= take) break;
+            }
+            return results;
         }
 
         private static double EuclideanDistance(List<double> left, List<double> right)

@@ -169,7 +169,7 @@ internal static class Program
 
     private static void VectorSearch(An5Adapter adapter)
     {
-        Console.WriteLine("\n[vector search -> in-memory fallback]");
+        Console.WriteLine("\n[vector search -> a TEXT column, ranked by the driver function]");
         adapter.ExecuteRaw("CREATE TABLE \"Doc\" (\"Id\" TEXT PRIMARY KEY, \"Embedding\" TEXT)");
         adapter.ExecuteRaw(
             "INSERT INTO \"Doc\" VALUES ('d1', '[1.0, 0.0]'), ('d2', '[0.0, 1.0]'), ('d3', '[0.9, 0.1]')");
@@ -181,10 +181,111 @@ internal static class Program
         Check("distance ordered", hits[0].Distance <= hits[1].Distance, true);
     }
 
+    // A `VECTOR(n)` column stores a float32 BLOB. These cases cover the codec, the
+    // strategy each column type selects, and the fallback when the connection
+    // offers no in-database strategy at all. The module docstring in
+    // Sqlite/SqliteVectors.cs is the shared specification for every runtime.
+    private static void SqliteVectorSearch()
+    {
+        Console.WriteLine("\n[sqlite vector codec]");
+        var encoded = SqliteVectors.EncodeVector(new List<double> { 1.0, -2.0, 0.5 });
+        Check("float32 blob length", encoded.Length, 12);
+        Check("little-endian 1.0", encoded[0] + "," + encoded[1] + "," + encoded[2] + "," + encoded[3], "0,0,128,63");
+        var decoded = SqliteVectors.DecodeVector(encoded);
+        Check("blob round trip", string.Join(",", decoded), "1,-2,0.5");
+        Check("legacy JSON text", string.Join(",", SqliteVectors.DecodeVector("[1, 0, 0]")), "1,0,0");
+        Check("already a list", SqliteVectors.DecodeVector(new List<double> { 1, 2 }).Count, 2);
+        Check("already a float array", SqliteVectors.DecodeVector(new float[] { 1, 2, 3 })[2], 3.0);
+        Check("rejects a partial blob", SqliteVectors.DecodeVector(new byte[3]) == null, true);
+        Check("rejects text that is not JSON", SqliteVectors.DecodeVector("nope") == null, true);
+        Check("cosine of a vector with itself", Math.Round(SqliteVectors.VectorDistance(new List<double> { 1, 0 }, new List<double> { 1, 0 }, "cosine").Value, 9), 0.0);
+        Check("cosine of orthogonal vectors", Math.Round(SqliteVectors.VectorDistance(new List<double> { 1, 0 }, new List<double> { 0, 1 }, "cosine").Value, 9), 1.0);
+        Check("euclidean distance", Math.Round(SqliteVectors.VectorDistance(new List<double> { 0, 3 }, new List<double> { 4, 0 }, "euclidean").Value, 9), 5.0);
+        Check("dot distance is negated", SqliteVectors.VectorDistance(new List<double> { 1, 2 }, new List<double> { 2, 4 }, "dot").Value, -10.0);
+        Check("mismatched dimensions", SqliteVectors.VectorDistance(new List<double> { 1, 2 }, new List<double> { 1, 2, 3 }, "cosine") == null, true);
+        Check("is a VECTOR column", SqliteVectors.IsVectorField(new Dictionary<string, object> { ["sql"] = "VECTOR(3)" }), true);
+        Check("is a TEXT column", SqliteVectors.IsVectorField(new Dictionary<string, object> { ["sql"] = "TEXT" }), false);
+
+        Console.WriteLine("\n[sqlite vector strategy plan]");
+        Check("a BLOB column drops the JSON strategy",
+            string.Join(",", SqliteVectors.PlanStrategies(true, true, true, "BLOB", null)), "sqlite-vec,udf");
+        Check("a TEXT column keeps the JSON strategy",
+            string.Join(",", SqliteVectors.PlanStrategies(false, false, true, "TEXT", null)), "sql");
+        Check("a pinned strategy wins",
+            string.Join(",", SqliteVectors.PlanStrategies(true, true, true, "BLOB", "udf")), "udf");
+        Check("memory is the caller's own path",
+            SqliteVectors.PlanStrategies(true, true, true, "BLOB", "memory").Count, 0);
+
+        Console.WriteLine("\n[sqlite vector search -> a BLOB column, ranked by the driver function]");
+        var dbPath = Path.Combine(Path.GetTempPath(), "an5_dotnet_vector.db");
+        if (File.Exists(dbPath)) File.Delete(dbPath);
+        try
+        {
+            var vecAdapter = new An5Adapter(new An5AdapterOptions { ConnectionString = dbPath });
+            vecAdapter.ExecuteRaw("CREATE TABLE \"Vec\" (\"Id\" TEXT PRIMARY KEY, \"Embedding\" BLOB)");
+            var insert = new Dictionary<string, object>();
+            foreach (var pair in new[]
+            {
+                ("d1", new List<double> { 1, 0, 0 }),
+                ("d2", new List<double> { 0.8, 0.2, 0 }),
+                ("d3", new List<double> { 0, 1, 0 }),
+            })
+            {
+                insert["Id"] = pair.Item1;
+                insert["Embedding"] = SqliteVectors.EncodeVector(pair.Item2);
+                vecAdapter.ExecuteRaw("INSERT INTO \"Vec\" (\"Id\", \"Embedding\") VALUES (@Id, @Embedding)", insert);
+            }
+            // A row with another dimension must never rank against a 3-dimension query.
+            vecAdapter.ExecuteRaw(
+                "INSERT INTO \"Vec\" (\"Id\", \"Embedding\") VALUES ('d4', @Embedding)",
+                new Dictionary<string, object> { ["Embedding"] = SqliteVectors.EncodeVector(new List<double> { 1, 0, 0, 1 }) });
+
+            var vecDocs = vecAdapter.Table<VecDoc>("Vec");
+            foreach (var metric in new[] { "cosine", "euclidean", "dot" })
+            {
+                var hits = vecDocs.VectorSearch(new List<double> { 1, 0, 0 }, take: 9, vectorField: "Embedding", distanceMetric: metric);
+                Check($"{metric}: row order", string.Join(",", hits.Select(h => h.Item.Id)), "d1,d2,d3");
+                Check($"{metric}: distance is a number", hits.All(h => !double.IsNaN(h.Distance)), true);
+                Check($"{metric}: the vector decodes to numbers", hits[0].Item.Embedding.Length, 3);
+                // Dot product ranks by -dot, so an exact match sits at -1 there.
+                Check($"{metric}: closest distance", Math.Round(hits[0].Distance, 6),
+                    metric == "dot" ? -1.0 : 0.0);
+            }
+
+            var whereHits = vecDocs.VectorSearch(
+                new List<double> { 1, 0, 0 }, take: 5, vectorField: "Embedding",
+                whereClause: "[Id] = @id",
+                parameters: new Dictionary<string, object> { ["id"] = "d3" });
+            Check("a where filter applies", string.Join(",", whereHits.Select(h => h.Item.Id)), "d3");
+
+            vecAdapter.Dispose();
+
+            // `VectorStrategy` pins the plan, so a project can force the in-process
+            // fallback even on a connection that could rank in the database.
+            var memoryAdapter = new An5Adapter(new An5AdapterOptions { ConnectionString = dbPath, VectorStrategy = "memory" });
+            var memoryHits = memoryAdapter.Table<VecDoc>("Vec")
+                .VectorSearch(new List<double> { 1, 0, 0 }, take: 9, vectorField: "Embedding");
+            Check("the memory fallback ranks correctly", string.Join(",", memoryHits.Select(h => h.Item.Id)), "d1,d2,d3");
+            Check("the memory fallback decodes the BLOB", memoryHits[0].Item.Embedding[0], 1.0f);
+            memoryAdapter.Dispose();
+        }
+        finally
+        {
+            foreach (var suffix in new[] { "", "-wal", "-shm" })
+                if (File.Exists(dbPath + suffix)) File.Delete(dbPath + suffix);
+        }
+    }
+
     public class Doc
     {
         public string Id { get; set; }
         public string Embedding { get; set; }
+    }
+
+    public class VecDoc
+    {
+        public string Id { get; set; }
+        public float[] Embedding { get; set; }
     }
 
     private static object FromJson(System.Text.Json.JsonElement element)
@@ -244,6 +345,7 @@ internal static class Program
             Transactions(adapter);
             StoredProcedures(adapter);
             VectorSearch(adapter);
+            SqliteVectorSearch();
         }
         finally
         {

@@ -31,9 +31,9 @@ pub mod adapter;
 pub mod base;
 
 pub use adapter::{
-    AggregateArgs, An5Adapter, CountArgs, CreateArgs, CreateManyArgs, DeleteManyArgs, FindManyArgs,
-    GroupByArgs, Result, RowMap, TableClient, UpdateArgs, UpdateManyArgs, UpsertArgs,
-    VectorSearchArgs, ViewClient,
+    blob_bytes, blob_value, AggregateArgs, An5Adapter, CountArgs, CreateArgs, CreateManyArgs,
+    DeleteManyArgs, FindManyArgs, GroupByArgs, Result, RowMap, TableClient, UpdateArgs,
+    UpdateManyArgs, UpsertArgs, VectorSearchArgs, ViewClient,
 };
 pub use base::{
     add_table_override, build_order_by, build_where, cosine_similarity, dot_product,

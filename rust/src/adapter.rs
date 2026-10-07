@@ -10,8 +10,12 @@ use sqlx::{Any, AnyConnection, AnyPool, Row};
 use std::collections::HashMap;
 
 use crate::base::{
-    build_order_by, build_where, get_fields_for_model, resolve_table, set_adapter_metadata,
-    vector_distance, AdapterMetadata, Dialect, RelationDef, Where,
+    build_order_by, build_where, decode_vector, encode_vector, get_fields_for_model, is_vector_field,
+    needs_vector_encoding, resolve_table, set_adapter_metadata, vector_distance, AdapterMetadata,
+    Dialect, RelationDef, Where,
+};
+use crate::base::vectors::{
+    distance_function, normalize_metric, plan_vector_strategies, STRATEGY_SQLITE_VEC, STRATEGY_UDF,
 };
 
 /// A database row as a plain JSON object.
@@ -213,6 +217,9 @@ pub struct An5Adapter {
     pool: AnyPool,
     dialect: Dialect,
     connection_string: String,
+    /// SQLite only: pins one of `sqlite-vec`, `udf`, `sql` or `memory` instead of
+    /// probing for the fastest strategy available. Empty probes.
+    pub vector_strategy: Option<String>,
 }
 
 impl An5Adapter {
@@ -227,6 +234,7 @@ impl An5Adapter {
             dialect: Dialect::detect(connection_string),
             pool,
             connection_string: connection_string.to_string(),
+            vector_strategy: None,
         })
     }
 
@@ -237,6 +245,7 @@ impl An5Adapter {
             dialect: Dialect::detect(connection_string),
             pool,
             connection_string: connection_string.to_string(),
+            vector_strategy: None,
         }
     }
 
@@ -307,6 +316,45 @@ impl An5Adapter {
         rows_to_maps(&rows)
     }
 
+    /// What this SQLite connection can do for vector search, probed with cheap
+    /// `SELECT`s.
+    ///
+    /// `sqlx` connects through a pooled `AnyPool` and exposes no way to register a
+    /// SQL function or load an extension, so a stock adapter normally reports only
+    /// JSON1. That is enough to rank with `json_each`; the sqlite-vec and UDF
+    /// strategies need a driver built for them.
+    pub async fn sqlite_capabilities(&self) -> HashMap<&'static str, bool> {
+        let mut capabilities = HashMap::from([
+            ("vec", self.probe("SELECT vec_version()").await),
+            ("udf", self.probe("SELECT an5_vec_cosine(zeroblob(4), zeroblob(4))").await),
+            ("json1", self.probe("SELECT json_valid('[1]')").await),
+        ]);
+        // The keys are static strings, so the map can be handed out directly.
+        capabilities.shrink_to_fit();
+        capabilities
+    }
+
+    /// A vector column's declared DDL type, which is what decides whether the
+    /// `json_each` strategy can reach the rows in it.
+    pub async fn sqlite_column_type(&self, table: &str, column: &str) -> Option<String> {
+        let rows = self
+            .query_raw(
+                "SELECT type FROM pragma_table_info(?) WHERE name = ?",
+                &[Value::from(table), Value::from(column)],
+            )
+            .await
+            .ok()?;
+        rows.first()
+            .and_then(|row| row.get("type"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// True when a probe statement ran, whatever it returned.
+    async fn probe(&self, sql: &str) -> bool {
+        self.query_raw(sql, &[]).await.is_ok()
+    }
+
     /// Execute a non-SELECT statement and return the affected row count.
     pub async fn execute_raw(&self, sql: &str, args: &[Value]) -> Result<u64> {
         let mut q = sqlx::query(sql);
@@ -360,6 +408,13 @@ fn bind_value<'q>(
             }
         }
         Value::String(s) => q.bind(s.clone()),
+        // A vector is bound as the float32 BLOB a `VECTOR(n)` column stores; any
+        // other structure has no SQLite representation.
+        Value::Array(_) => match crate::base::parse_vector(v) {
+            Some(values) => q.bind(encode_vector(&values)),
+            None => q.bind(v.to_string()),
+        },
+        Value::Object(_) if blob_bytes(v).is_some() => q.bind(blob_bytes(v)),
         other => q.bind(other.to_string()),
     }
 }
@@ -384,13 +439,61 @@ fn column_to_value(row: &sqlx::any::AnyRow, idx: usize) -> Result<Value> {
     probe!(i64, Value::from);
     probe!(f64, Value::from);
     probe!(String, Value::String);
-    probe!(Vec<u8>, |b: Vec<u8>| {
-        Value::String(String::from_utf8_lossy(&b).into_owned())
-    });
+    probe!(Vec<u8>, |b: Vec<u8>| bytes_to_value(&b));
 
     // An undecodable column (driver-specific type) becomes null rather than
     // failing the whole query.
     Ok(Value::Null)
+}
+
+/// The member name marking a value as raw bytes rather than text.
+const BLOB_KEY: &str = "__an5Blob";
+
+/// Prefix kept for rows written before the marker object, so they still read back.
+const BLOB_PREFIX: &str = "\u{0}an5:blob:";
+
+/// Carries bytes through the JSON row model.
+///
+/// SQLite has no vector type, so a `VECTOR(n)` column is a BLOB of float32 values,
+/// and the row model is a JSON object with no byte type. A value from `blob_value`
+/// is bound and read as raw bytes; text columns stay plain strings.
+pub fn blob_value(bytes: &[u8]) -> Value {
+    let mut map = RowMap::new();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push_str(&format!("{:02x}", byte));
+    }
+    map.insert(BLOB_KEY.to_string(), Value::String(hex));
+    Value::Object(map)
+}
+
+/// Recovers the bytes behind a value from [`blob_value`].
+pub fn blob_bytes(value: &Value) -> Option<Vec<u8>> {
+    let hex = match value {
+        Value::Object(map) => map.get(BLOB_KEY)?.as_str()?.to_string(),
+        Value::String(text) => text.strip_prefix(BLOB_PREFIX)?.to_string(),
+        _ => return None,
+    };
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// A text BLOB stays text; anything binary becomes a [`blob_value`].
+fn bytes_to_value(bytes: &[u8]) -> Value {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        let has_control = text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'));
+        if !has_control {
+            return Value::String(text.to_string());
+        }
+    }
+    blob_value(bytes)
 }
 
 fn rows_to_maps(rows: &[sqlx::any::AnyRow]) -> Result<Vec<RowMap>> {
@@ -525,7 +628,7 @@ impl TableClient {
         if let Some(inc) = &args.include {
             self.resolve_includes(&mut rows, inc).await?;
         }
-        Ok(rows)
+        Ok(self.decode_vector_rows(rows))
     }
 
     /// First row matching the args, or `None`.
@@ -571,7 +674,7 @@ impl TableClient {
         }
         let mut data = data.clone();
         apply_generated_primary_key(&self.table_name, &mut data);
-        let data = &data;
+        let data = &self.encode_vector_fields(&data);
         let (scalars, _relations) = split_relation_writes(&self.table_name, data);
 
         let mut cols: Vec<String> = Vec::new();
@@ -814,6 +917,192 @@ impl TableClient {
         self.adapter.query_raw(&sql, &w.args).await
     }
 
+    /// The `VECTOR(n)` columns of this model, from the generated metadata.
+    fn vector_fields(&self) -> Vec<String> {
+        match get_fields_for_model(&self.table_name) {
+            Some(Value::Object(fields)) => fields
+                .iter()
+                .filter(|(_, definition)| is_vector_field(definition))
+                .map(|(name, _)| name.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Encodes every `VECTOR(n)` value on its way into SQLite.
+    ///
+    /// The column holds a float32 BLOB, which is a third of the size of the JSON
+    /// text it replaces. Values that already arrived as text or bytes are left
+    /// alone, so rows written by an older version stay readable.
+    fn encode_vector_fields(&self, data: &RowMap) -> RowMap {
+        if self.adapter.dialect != Dialect::Sqlite {
+            return data.clone();
+        }
+        let names = self.vector_fields();
+        if names.is_empty() {
+            return data.clone();
+        }
+        let mut out = data.clone();
+        for name in names {
+            if let Some(value) = out.get(&name) {
+                if needs_vector_encoding(value) {
+                    if let Some(values) = decode_vector(value) {
+                        out.insert(name, blob_value(&encode_vector(&values)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Decodes `VECTOR(n)` columns back into arrays of numbers after a read.
+    fn decode_vector_rows(&self, rows: Vec<RowMap>) -> Vec<RowMap> {
+        if self.adapter.dialect != Dialect::Sqlite || rows.is_empty() {
+            return rows;
+        }
+        let names = self.vector_fields();
+        if names.is_empty() {
+            return rows;
+        }
+        let mut out = rows;
+        for row in &mut out {
+            for name in &names {
+                if let Some(value) = row.get(name) {
+                    if let Some(values) = decode_vector(value) {
+                        row.insert(name.clone(), Value::from(values));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// SQLite ranks a `VECTOR(n)` column inside the database.
+    ///
+    /// Returns `None` when the connection offers no strategy, so the caller falls
+    /// back to scoring in Rust.
+    async fn sqlite_vector_search(
+        &self,
+        args: &VectorSearchArgs,
+        field: &str,
+        metric: &str,
+        take: i64,
+        w: &Where,
+    ) -> Result<Option<Vec<RowMap>>> {
+        if args.vector.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let metric = normalize_metric(metric);
+        let column = self.adapter.dialect.quote_identifier(field);
+        let table = self.quoted_table();
+
+        let capabilities = self.adapter.sqlite_capabilities().await;
+        let declared = self
+            .adapter
+            .sqlite_column_type(&self.physical_table, field)
+            .await;
+        let tail = if w.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", w.clause)
+        };
+
+        for strategy in plan_vector_strategies(
+            &capabilities,
+            declared.as_deref(),
+            self.adapter.vector_strategy.as_deref(),
+        ) {
+            let mut bind: Vec<Value> = w.args.clone();
+            let sql = match strategy {
+                STRATEGY_SQLITE_VEC | STRATEGY_UDF => {
+                    let Some(function) = distance_function(strategy, metric) else {
+                        continue;
+                    };
+                    bind.push(blob_value(&encode_vector(&args.vector)));
+                    let guard = match strategy {
+                        // sqlite-vec only understands float32 BLOB operands, so rows
+                        // stored any other way are excluded rather than aborting the
+                        // query.
+                        STRATEGY_SQLITE_VEC => format!(
+                            "typeof({column}) = 'blob' AND length({column}) = ?"
+                        ),
+                        _ => String::new(),
+                    };
+                    let distance = format!("{function}({column}, ?)");
+                    // The guard and the caller's WHERE are one clause: appending the
+                    // tail after it would produce a second WHERE.
+                    let clause = match (guard.is_empty(), tail.is_empty()) {
+                        (true, _) => tail.clone(),
+                        (false, true) => format!(" WHERE {guard}"),
+                        (false, false) => {
+                            format!(" WHERE {guard} AND{}", tail.replacen(" WHERE ", " ", 1))
+                        }
+                    };
+                    format!("SELECT *, {distance} AS distance FROM {table}{clause}")
+                }
+                _ => {
+                    // json_each reads the query vector as JSON text.
+                    bind.push(Value::from(
+                        serde_json::to_string(&args.vector).unwrap_or_else(|_| "[]".to_string()),
+                    ));
+                    format!(
+                        "WITH q AS (SELECT je.key AS k, CAST(je.value AS REAL) AS v FROM json_each(?) je) SELECT *, {} AS distance FROM {table}{tail}",
+                        json_distance_expr(metric, &column)
+                    )
+                }
+            };
+
+            // A row whose stored vector cannot be scored yields a NULL distance;
+            // those rows are dropped rather than handed to the caller.
+            let sql = format!(
+                "SELECT * FROM ({sql}) AS an5_ranked WHERE distance IS NOT NULL ORDER BY distance ASC LIMIT {take}"
+            );
+            if let Ok(rows) = self.adapter.query_raw(&sql, &bind).await {
+                return Ok(Some(self.decode_vector_rows(rows)));
+            }
+            // The connection advertised the capability but the query failed, e.g.
+            // an extension that did not really load. The next strategy is cheaper
+            // than reporting the failure.
+        }
+        Ok(None)
+    }
+
+    /// Ranks the vector column in Rust.
+    ///
+    /// The last resort for every provider, and the only option on a SQLite
+    /// connection that offers no in-database strategy. The whole table is loaded,
+    /// so it is only reasonable for a table small enough to fit in memory.
+    async fn score_vectors_in_memory(
+        &self,
+        args: &VectorSearchArgs,
+        field: &str,
+        metric: &str,
+        take: i64,
+    ) -> Result<Vec<RowMap>> {
+        let rows = self
+            .find_many(&FindManyArgs {
+                r#where: args.r#where.clone(),
+                ..Default::default()
+            })
+            .await?;
+
+        let mut scored: Vec<(RowMap, f64)> = Vec::new();
+        for mut row in rows {
+            let Some(row_vec) = row.get(field).and_then(decode_vector) else {
+                continue;
+            };
+            if row_vec.len() != args.vector.len() {
+                continue;
+            }
+            let distance = vector_distance(&args.vector, &row_vec, metric);
+            row.insert("distance".to_string(), Value::from(distance));
+            scored.push((row, distance));
+        }
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(take.max(0) as usize);
+        Ok(scored.into_iter().map(|(row, _)| row).collect())
+    }
+
     /// Vector similarity search.
     ///
     /// Tries the database's native distance function first and falls back to
@@ -859,6 +1148,20 @@ impl TableClient {
             Dialect::Sqlite => None,
         };
 
+        // SQLite has no vector operator, so the ranking is built from the
+        // strategies this connection supports: sqlite-vec, a registered distance
+        // function, or json_each in plain SQL. `sqlx` reaches none of the first two
+        // through an `AnyPool`, so json_each is normally the one that runs.
+        if self.adapter.dialect == Dialect::Sqlite {
+            if let Some(rows) = self
+                .sqlite_vector_search(args, field, metric, take, &w)
+                .await?
+            {
+                return Ok(rows);
+            }
+            return self.score_vectors_in_memory(args, field, metric, take).await;
+        }
+
         if let Some(sql) = native_sql {
             let mut bind: Vec<Value> = Vec::new();
             if !w.is_empty() {
@@ -888,23 +1191,13 @@ impl TableClient {
 
         let mut scored: Vec<(RowMap, f64)> = Vec::new();
         for mut row in rows {
-            let raw = row.get(field).cloned();
-            let row_vec = match raw {
-                Some(Value::String(s)) => parse_vector(&s),
-                Some(Value::Array(items)) => Some(
-                    items
-                        .iter()
-                        .filter_map(|v| v.as_f64())
-                        .collect::<Vec<f64>>(),
-                ),
-                _ => None,
+            let Some(rv) = row.get(field).and_then(decode_vector) else {
+                continue;
             };
-            if let Some(rv) = row_vec {
-                if rv.len() == args.vector.len() {
-                    let d = vector_distance(&args.vector, &rv, metric);
-                    row.insert("distance".to_string(), Value::from(d));
-                    scored.push((row, d));
-                }
+            if rv.len() == args.vector.len() {
+                let d = vector_distance(&args.vector, &rv, metric);
+                row.insert("distance".to_string(), Value::from(d));
+                scored.push((row, d));
             }
         }
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1185,6 +1478,30 @@ fn build_set_clause(data: &Value, ph: &dyn Fn(usize) -> String) -> Result<(Strin
 }
 
 /// Parses a JSON array string into a vector.
+/// The distance expression for the `json_each` strategy.
+///
+/// `json_valid` fails on a float32 BLOB, so the column is guarded before it is
+/// walked, and a row whose stored vector has another dimension yields NULL.
+fn json_distance_expr(metric: &str, column: &str) -> String {
+    let row = format!(
+        "CASE WHEN json_valid({column}) THEN {column} ELSE '[]' END"
+    );
+    let same_length =
+        format!("(SELECT COUNT(*) FROM json_each({row})) = (SELECT COUNT(*) FROM q)");
+    let terms = match normalize_metric(metric) {
+        "euclidean" => format!(
+            "sqrt((SELECT SUM((je.value - q.v) * (je.value - q.v)) FROM json_each({row}) je JOIN q ON q.k = je.key))"
+        ),
+        "dot" => format!(
+            "-(SELECT SUM(je.value * q.v) FROM json_each({row}) je JOIN q ON q.k = je.key)"
+        ),
+        _ => format!(
+            "1.0 - (SELECT SUM(je.value * q.v) FROM json_each({row}) je JOIN q ON q.k = je.key) / NULLIF(sqrt((SELECT SUM(q.v * q.v) FROM q)) * sqrt((SELECT SUM(je.value * je.value) FROM json_each({row}) je)), 0)"
+        ),
+    };
+    format!("CASE WHEN {same_length} THEN {terms} END")
+}
+
 fn parse_vector(raw: &str) -> Option<Vec<f64>> {
     let trimmed = raw.trim().trim_start_matches('[').trim_end_matches(']');
     if trimmed.trim().is_empty() {

@@ -72,9 +72,25 @@ try {
   skip('no JDK installed');
 }
 
-// The Java sibling is resolved from ~/.m2 by `mavenLocal()`; install it when it is not
-// there yet, and let an unreachable repository degrade the gate instead of failing it.
-const installed = fs.existsSync(path.join(os.homedir(), '.m2', 'repository', 'org', 'an5orm'));
+// The Java sibling is resolved from ~/.m2 by `mavenLocal()`; install it when that version is
+// not there yet, and let an unreachable repository degrade the gate instead of failing it.
+// The path follows the published coordinates `io.github.an5orm:an5-adapters-java`; the
+// pre-release `org.an5orm` directory never existed locally, so the check below was always
+// false and every run paid for a fresh `mvn install`.
+const version = require(path.join(root, 'package.json')).version;
+const installed = fs.existsSync(
+  path.join(
+    os.homedir(),
+    '.m2',
+    'repository',
+    'io',
+    'github',
+    'an5orm',
+    'an5-adapters-java',
+    version,
+    `an5-adapters-java-${version}.pom`,
+  ),
+);
 if (!installed) {
   try {
     command('mvn', ['-q', '-B', '-f', path.join(javaDir, 'pom.xml'), 'install', '-DskipTests'], {

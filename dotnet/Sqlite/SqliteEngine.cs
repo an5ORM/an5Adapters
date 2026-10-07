@@ -18,13 +18,15 @@ namespace An5Orm
     internal class SqliteEngine : IQueryEngine
     {
         public Dialect Dialect => Dialect.Sqlite;
+        public SqliteVectorSupport VectorSupport { get; }
         private readonly string _connectionString;
         private readonly int _commandTimeout;
 
-        public SqliteEngine(string connectionString, int commandTimeout)
+        public SqliteEngine(string connectionString, int commandTimeout, SqliteVectorSupport vectorSupport = null)
         {
             _connectionString = SqliteConnectionString.Normalize(connectionString);
             _commandTimeout = commandTimeout;
+            VectorSupport = vectorSupport ?? new SqliteVectorSupport();
         }
 
         // Set while a transaction is open; statements then join it instead of
@@ -40,7 +42,62 @@ namespace An5Orm
             using var pragma = conn.CreateCommand();
             pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;";
             pragma.ExecuteNonQuery();
+            PrepareVectorSearch(conn);
             return conn;
+        }
+
+        /// <summary>
+        /// Registers the distance functions and loads sqlite-vec so a `VECTOR(n)`
+        /// column is ranked by SQLite instead of by the client. Neither is
+        /// required: a connection that refuses both falls back to `json_each`, or
+        /// to scoring in C#.
+        ///
+        /// This runs per connection because the engine opens one per statement,
+        /// and a user function only exists for the connection that declared it.
+        /// </summary>
+        private void PrepareVectorSearch(Microsoft.Data.Sqlite.SqliteConnection conn)
+        {
+            var support = VectorSupport;
+            if (support == null) return;
+
+            var hasVec = false;
+            if (!string.IsNullOrWhiteSpace(support.SqliteVecPath))
+            {
+                try { conn.LoadExtension(support.SqliteVecPath); hasVec = true; }
+                catch { /* the extension is optional */ }
+            }
+            if (!hasVec)
+            {
+                try
+                {
+                    using var probe = conn.CreateCommand();
+                    probe.CommandText = "SELECT vec_version()";
+                    probe.ExecuteScalar();
+                    hasVec = true;
+                }
+                catch { /* not loaded */ }
+            }
+
+            var hasUdf = false;
+            try
+            {
+                foreach (var metric in SqliteVectors.An5Functions.Keys)
+                {
+                    var name = SqliteVectors.An5Functions[metric];
+                    var distance = SqliteVectors.MakeDistanceFunction(metric);
+                    // The metric is baked into `distance`; the empty state is
+                    // only there to satisfy the delegate shape.
+                    conn.CreateFunction<object[], object>(
+                        name,
+                        Array.Empty<object>(),
+                        (_state, args) => distance(args),
+                        true);
+                }
+                hasUdf = true;
+            }
+            catch { /* the bundle may not allow user functions */ }
+
+            support.Report(hasVec, hasUdf, true);
         }
 
         private ConnectionScope<Microsoft.Data.Sqlite.SqliteConnection> Acquire()
@@ -108,6 +165,20 @@ namespace An5Orm
                     if (!HasColumn(reader, prop.Name)) continue;
                     var val = reader[prop.Name];
                     if (val == DBNull.Value) continue;
+                    // A `VECTOR(n)` column stores a float32 BLOB (and older ones a
+                    // JSON text column) while the entity declares it as float[],
+                    // which no converter bridges.
+                    if (prop.PropertyType == typeof(float[]))
+                    {
+                        var vector = SqliteVectors.DecodeVector(val);
+                        if (vector != null)
+                        {
+                            var floats = new float[vector.Count];
+                            for (int i = 0; i < vector.Count; i++) floats[i] = (float)vector[i];
+                            prop.SetValue(item, floats);
+                            continue;
+                        }
+                    }
                     try { prop.SetValue(item, Convert.ChangeType(val, prop.PropertyType)); } catch { }
                 }
                 results.Add(item);

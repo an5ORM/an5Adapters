@@ -12,7 +12,12 @@ statement) would leave transactions dangling. `None` means autocommit, matching 
 """
 
 import sqlite3
-from typing import Tuple
+from typing import Optional, Tuple
+
+try:  # package import
+    from ..base.vectors import SqliteVectorSupport
+except ImportError:  # flat layout, when the folder itself is on sys.path
+    from base.vectors import SqliteVectorSupport
 
 # Strip the `sqlite:`/`sqlite://`/`sqlite:///` wrapper first, only then look for
 # `file:`. Two steps are required because `sqlite:file::memory:?cache=shared` only
@@ -77,6 +82,21 @@ def connect(connection_string: str):
     if not is_memory(connection_string) and not is_uri:
         conn.execute("PRAGMA journal_mode = WAL")
     return conn
+
+
+def register_vector_functions(conn, sqlite_vec: Optional[str] = None) -> SqliteVectorSupport:
+    """Prepares the connection for in-database vector search.
+
+    Registers `an5_vec_cosine` / `an5_vec_l2` / `an5_vec_ip` so SQLite can rank
+    a `VECTOR(n)` column without the client loading it, and loads the sqlite-vec
+    extension when a path was given. A driver that refuses either is not an
+    error: the search then falls back to `json_each` or to Python.
+    """
+    return SqliteVectorSupport(
+        native=lambda: conn,
+        register_function=lambda name, fn: conn.create_function(name, 2, fn),
+        sqlite_vec=sqlite_vec,
+    )
 
 
 def placeholder() -> str:
