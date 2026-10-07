@@ -23,3 +23,8 @@ env/
 .vscode/
 .idea/
 swift/.build/
+
+# Java / Gradle
+java/target/
+kotlin/.gradle/
+kotlin/build/
