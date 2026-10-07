@@ -50,6 +50,9 @@
   ],
   "files": [
     "dist/**/*.{js,d.ts}",
+    "native/sqlite/**/*",
+    "!native/sqlite/build/**/*",
+    "scripts/sqlite-native-build.js",
     "typescript/src/**/*.ts",
     "typescript/src/nbase/**/*.ts",
     "python/**/*.py",
@@ -84,7 +87,10 @@
     "test:java": "node scripts/java-compile-check.js && node scripts/java-sqlite-smoke.js",
     "test:kotlin": "node scripts/kotlin-compile-check.js",
     "test:gradle": "node scripts/kotlin-gradle-build.js",
-    "test:swift": "node scripts/swift-test.js"
+    "test:swift": "node scripts/swift-test.js",
+    "build:sqlite:native": "node scripts/sqlite-native-build.js",
+    "test:sqlite:native": "node scripts/sqlite-native-test.js",
+    "bench:sqlite:native": "node scripts/sqlite-native-test.js --benchmark"
   },
   "dependencies": {
     "googleapis": "^183.0.0",

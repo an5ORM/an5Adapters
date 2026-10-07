@@ -528,6 +528,14 @@ public class An5TableClient {
     for (String strategy :
         SqliteVectors.planStrategies(capabilities, declared, adapter.vectorStrategy())) {
       List<Object> bind = new ArrayList<Object>();
+      if (SqliteVectors.STRATEGY_SQL.equals(strategy)) {
+        try {
+          List<Map<String, Object>> binary = adapter.exec("SELECT 1 FROM " + tableSql()
+              + (tail.isEmpty() ? " WHERE " : tail + " AND ")
+              + "typeof(" + column + ") = 'blob' LIMIT 1", where.params);
+          if (!binary.isEmpty()) continue;
+        } catch (SQLException ignored) { continue; }
+      }
       String sql =
           SqliteVectors.buildRankingQuery(
               strategy, metric, tableSql(), column, vector, limit, tail,

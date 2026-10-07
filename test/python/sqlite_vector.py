@@ -227,6 +227,21 @@ def main():
     test_search_strategies()
     test_metrics_and_filters()
     test_round_trip()
+    native_path = os.environ.get("AN5_NATIVE_VECTOR_PATH")
+    if native_path:
+        path = make_db()
+        try:
+            db = create_an5_adapter(f"sqlite:///{path}", sqlite_vec=native_path)
+            check("native C extension is loaded", db.exec("SELECT an5_vector_version() AS v")[0]["v"], "an5-vector/1")
+            single = struct.unpack("<f", struct.pack("<f", 0.1))[0]
+            measured = db.exec("SELECT an5_vec_ip('[0.1]', '[0.1]') AS d")[0]["d"]
+            check_true("Python preserves the C function instead of replacing it", abs(measured + single * single) < 1e-12)
+            for metric in ("cosine", "euclidean", "dot"):
+                rows = db.document.vector_search([1, 0, 0], take=2, where={"id": {"in": ["d1", "d2"]}}, distance_metric=metric)
+                check(f"native {metric}: row order", [r["id"] for r in rows], ["d1", "d2"])
+            db.close()
+        finally:
+            cleanup(path)
     print()
     if failures:
         print(f"{len(failures)} CHECK FAIL:")

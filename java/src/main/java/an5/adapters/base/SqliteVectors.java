@@ -17,8 +17,7 @@ import java.util.Map;
  * this order:
  *
  * <ol>
- *   <li>{@code sqlite-vec} — the extension, when it loads. Fastest, and the only option that
- *       can use an ANN index.
+ *   <li>{@code sqlite-vec} — native scalar distances, when the extension loads.
  *   <li>{@code udf} — {@code an5_vec_cosine} / {@code an5_vec_l2} / {@code an5_vec_ip}
  *       registered with the driver. Reads the BLOB and the legacy JSON text.
  *   <li>{@code sql} — {@code json_each} brute force in plain SQL. Needs no user function, so
@@ -332,9 +331,10 @@ public final class SqliteVectors {
         // sqlite-vec only understands float32 BLOB operands, so rows stored any other way are
         // excluded instead of aborting the query. The guard joins the caller's WHERE with AND,
         // since appending the tail after it would produce a second WHERE.
-        guard = "typeof(" + column + ") = 'blob' AND length(" + column + ") = " + placeholder;
+        guard = column + " IS NOT NULL";
+        distance = "CASE WHEN vec_length(vec_f32(" + column + ")) = " + vector.length
+            + " THEN " + function + "(vec_f32(" + column + "), " + placeholder + ") END";
         bind.add(encodeVector(vector));
-        bind.add(Integer.valueOf(vector.length * BYTES_PER_FLOAT));
       } else {
         bind.add(encodeVector(vector));
       }

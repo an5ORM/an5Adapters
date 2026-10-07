@@ -54,6 +54,7 @@ export class SqliteEngine implements QueryEngine {
 
   async disconnect(): Promise<void> {
     if (this.db) { this.db.close(); this.db = null; }
+    this.vectorSupport.reset();
   }
 
   async beginTransaction(): Promise<TransactionHandle> {

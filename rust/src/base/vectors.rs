@@ -121,8 +121,11 @@ pub fn decode_vector(value: &Value) -> Option<Vec<f64>> {
 /// A column written by an older version holds JSON text instead, which is not a
 /// multiple of four bytes once encoded, so the length check tells them apart.
 pub fn decode_vector_bytes(bytes: &[u8]) -> Option<Vec<f64>> {
-    if bytes.is_empty() || bytes.len() % BYTES_PER_VECTOR_FLOAT != 0 || bytes[0] == b'[' {
-        return parse_vector_text(&String::from_utf8_lossy(bytes));
+    if let Some(values) = parse_vector_text(&String::from_utf8_lossy(bytes)) {
+        return Some(values);
+    }
+    if bytes.is_empty() || bytes.len() % BYTES_PER_VECTOR_FLOAT != 0 {
+        return None;
     }
     Some(
         bytes
@@ -134,7 +137,7 @@ pub fn decode_vector_bytes(bytes: &[u8]) -> Option<Vec<f64>> {
 
 /// True when the value still has to become bytes on its way into a column.
 pub fn needs_vector_encoding(value: &Value) -> bool {
-    value.is_array() || value.is_string()
+    value.is_array()
 }
 
 /// True when generated metadata describes a `VECTOR(n)` column.

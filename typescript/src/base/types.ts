@@ -11,7 +11,7 @@ export interface An5AdapterConfig {
    */
   nbase?: string;
   /**
-   * Path to the sqlite-vec extension binary. On SQLite it is loaded before the
+   * Path to sqlite-vec or the AN5 native vector extension. On SQLite it is loaded before the
    * vector capabilities are probed, so `vectorSearch` ranks inside the database
    * instead of loading the table into memory. Other providers ignore it.
    */

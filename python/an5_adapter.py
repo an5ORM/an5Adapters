@@ -48,7 +48,9 @@ class An5Adapter:
             return connect_postgres(self._conn_str)
         if self._dialect == DIALECT_SQLITE:
             conn = connect_sqlite(self._conn_str)
-            self._vector_supports[id(conn)] = register_sqlite_vector_functions(conn, self._sqlite_vec)
+            support = register_sqlite_vector_functions(conn, self._sqlite_vec)
+            support.capabilities()
+            self._sqlite_vector_support = support
             return conn
         return connect_mssql(self._conn_str)
 
@@ -61,8 +63,12 @@ class An5Adapter:
         """
         if self._dialect != DIALECT_SQLITE:
             return None
-        conn, _owned = self._acquire()
-        return self._vector_supports.get(id(conn))
+        conn, owned = self._acquire()
+        try:
+            return self._sqlite_vector_support
+        finally:
+            if owned:
+                conn.close()
 
     def _acquire(self):
         """Returns (connection, whether we opened it and must close it)."""

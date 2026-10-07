@@ -221,7 +221,14 @@ internal static class Program
         if (File.Exists(dbPath)) File.Delete(dbPath);
         try
         {
-            var vecAdapter = new An5Adapter(new An5AdapterOptions { ConnectionString = dbPath });
+            var nativePath = Environment.GetEnvironmentVariable("AN5_NATIVE_VECTOR_PATH");
+            var vecAdapter = new An5Adapter(new An5AdapterOptions { ConnectionString = dbPath, SqliteVec = nativePath });
+            if (!string.IsNullOrWhiteSpace(nativePath)) {
+                Check("native C extension is loaded", vecAdapter.QueryRaw("SELECT an5_vector_version() AS v")[0]["v"], "an5-vector/1");
+                var single = (double)(float)0.1;
+                var measured = Convert.ToDouble(vecAdapter.QueryRaw("SELECT an5_vec_ip('[0.1]', '[0.1]') AS d")[0]["d"]);
+                Check(".NET preserves the C function instead of replacing it", Math.Abs(measured + single * single) < 1e-12, true);
+            }
             vecAdapter.ExecuteRaw("CREATE TABLE \"Vec\" (\"Id\" TEXT PRIMARY KEY, \"Embedding\" BLOB)");
             var insert = new Dictionary<string, object>();
             foreach (var pair in new[]
@@ -241,6 +248,9 @@ internal static class Program
                 new Dictionary<string, object> { ["Embedding"] = SqliteVectors.EncodeVector(new List<double> { 1, 0, 0, 1 }) });
 
             var vecDocs = vecAdapter.Table<VecDoc>("Vec");
+            var direct = vecAdapter.QueryRaw("SELECT an5_vec_cosine(Embedding, @q) AS distance FROM Vec WHERE Id = 'd1'",
+                new Dictionary<string, object> { ["q"] = SqliteVectors.EncodeVector(new List<double> { 1, 0, 0 }) });
+            Check("the registered SQL function runs", Convert.ToDouble(direct[0]["distance"]), 0.0);
             foreach (var metric in new[] { "cosine", "euclidean", "dot" })
             {
                 var hits = vecDocs.VectorSearch(new List<double> { 1, 0, 0 }, take: 9, vectorField: "Embedding", distanceMetric: metric);

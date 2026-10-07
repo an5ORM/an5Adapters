@@ -4,8 +4,7 @@ SQLite has no vector type, so a `VECTOR(n)` column stores a BLOB of little-endia
 float32 values (see `encode_vector`) and is ranked in one of four ways, in this
 order:
 
-   1. ``sqlite-vec``  the extension, when it loads. Fastest, and the only option
-      that can use an ANN index.
+   1. ``sqlite-vec``  native scalar distance functions, when the extension loads.
    2. ``udf``         ``an5_vec_cosine`` / ``an5_vec_l2`` / ``an5_vec_ip``
       registered with the driver. Reads the BLOB and the legacy JSON text.
    3. ``sql``         ``json_each`` brute force in plain SQL. Needs no user
@@ -202,7 +201,7 @@ def build_sqlite_vector_query(
     `sqlite-vec` and `udf` bind the query vector as a float32 BLOB; `sql` binds
     it as JSON text because `json_each` reads text.
     """
-    bound = list(params or [])
+    bound = []
     metric = normalize_metric(metric)
 
     def rank(inner: str) -> str:
@@ -215,27 +214,26 @@ def build_sqlite_vector_query(
 
     if strategy == STRATEGY_SQLITE_VEC:
         bound.append(encode_vector(vector))
-        bound.append(len(vector) * _BYTES_PER_FLOAT)
-        distance = f"{SQLITE_VEC_FUNCTIONS[metric]}({column}, ?)"
-        # sqlite-vec only understands float32 BLOB operands, so rows stored any
-        # other way are excluded instead of aborting the query.
+        distance = f"CASE WHEN vec_length(vec_f32({column})) = {len(vector)} THEN {SQLITE_VEC_FUNCTIONS[metric]}(vec_f32({column}), ?) END"
+        # vec_f32 accepts both JSON text and float32 BLOBs.
         query = rank(
             f"SELECT *, {distance} AS distance FROM {table}"
-            f" WHERE typeof({column}) = 'blob' AND length({column}) = ?{tail}"
+            + (tail + " AND " if tail else " WHERE ")
+            + f"{column} IS NOT NULL"
         )
-        return query, bound
+        return query, bound + list(params or [])
 
     if strategy == STRATEGY_UDF:
         bound.append(encode_vector(vector))
         distance = f"{AN5_VECTOR_FUNCTIONS[metric]}({column}, ?)"
-        return rank(f"SELECT *, {distance} AS distance FROM {table}{tail}"), bound
+        return rank(f"SELECT *, {distance} AS distance FROM {table}{tail}"), bound + list(params or [])
 
     bound.append(json.dumps(list(vector)))
     query = (
         "WITH q AS (SELECT je.key AS k, CAST(je.value AS REAL) AS v FROM json_each(?) je) "
         + rank(f"SELECT *, {_json_distance_expr(metric, column)} AS distance FROM {table}{tail}")
     )
-    return query, bound
+    return query, bound + list(params or [])
 
 
 # ─── Capabilities ──────────────────────────────────────────────────────────────────
@@ -295,6 +293,37 @@ class SqliteVectorSupport:
         self._register_function = register_function
         self._sqlite_vec = sqlite_vec
         self._capabilities: Optional[Dict[str, bool]] = None
+        # Declared column types and the "any binary row" probe, keyed by column.
+        # Both cost a query and neither changes while a schema is in use; a stale
+        # answer is still safe, because a strategy that fails falls through to the
+        # next one rather than reporting a wrong result.
+        self._column_types: Dict[str, Optional[str]] = {}
+        self._has_binary_rows: Dict[str, bool] = {}
+
+    def column_type(self, exec_fn, table: str, column: str) -> Optional[str]:
+        """The column's declared DDL type, remembered per column."""
+        key = f"{table}.{column}"
+        if key not in self._column_types:
+            self._column_types[key] = read_sqlite_column_type(exec_fn, table, column)
+        return self._column_types[key]
+
+    def has_binary_rows(self, exec_fn, table: str, column: str, tail: str, params: List) -> bool:
+        """Whether any row stores raw bytes, which `json_each` cannot read.
+
+        Checked only for the `sql` strategy, where a legacy JSON column that has
+        since taken new float32 rows would otherwise rank just the old ones.
+        """
+        key = f"{table}.{column}"
+        if key not in self._has_binary_rows:
+            clause = (tail + " AND ") if tail else " WHERE "
+            try:
+                rows = exec_fn(
+                    f"SELECT 1 FROM {table}{clause}typeof({column}) = 'blob' LIMIT 1",
+                    list(params))
+                self._has_binary_rows[key] = bool(rows)
+            except Exception:
+                self._has_binary_rows[key] = False
+        return self._has_binary_rows[key]
 
     def capabilities(self) -> Dict[str, bool]:
         """Probes once and caches the answer."""
@@ -320,8 +349,14 @@ class SqliteVectorSupport:
                 caps["vec"] = True
             except Exception:
                 caps["vec"] = False
+            try:
+                native.execute("SELECT an5_vector_version()").fetchone()
+                caps["udf"] = True
+                caps["vec"] = False
+            except Exception:
+                pass
 
-        if self._register_function:
+        if self._register_function and not caps["udf"]:
             try:
                 for metric, name in AN5_VECTOR_FUNCTIONS.items():
                     self._register_function(name, make_distance_function(metric))
@@ -375,8 +410,17 @@ def run_sqlite_vector_search(
         except Exception:
             caps = {"vec": False, "udf": False, "json1": False}
 
-    declared = read_sqlite_column_type(exec_fn, raw_table, raw_column)
+    declared = (support.column_type(exec_fn, raw_table, raw_column)
+                if support is not None
+                else read_sqlite_column_type(exec_fn, raw_table, raw_column))
     for strategy in plan_sqlite_vector_strategies(caps, declared, preference):
+        if strategy == STRATEGY_SQL:
+            binary = (support.has_binary_rows(exec_fn, raw_table, raw_column, tail, list(params or []))
+                      if support is not None
+                      else bool(exec_fn("SELECT 1 FROM " + table + (tail + " AND " if tail else " WHERE ")
+                                        + f"typeof({column}) = 'blob' LIMIT 1", list(params or []))))
+            if binary:
+                continue
         query, bound = build_sqlite_vector_query(
             strategy, metric, table, column, vector, take, tail, list(params or [])
         )

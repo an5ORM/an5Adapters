@@ -257,6 +257,9 @@ func (a *An5Adapter) vectorSearchInMemory(ctx context.Context, tableName string,
 func DecodeVectorRows(rows []map[string]interface{}, vectorField string) []map[string]interface{} {
 	for _, row := range rows {
 		for key, value := range row {
+			if key != vectorField {
+				continue
+			}
 			decoded := base.DecodeVector(value)
 			if decoded == nil {
 				continue

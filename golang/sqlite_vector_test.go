@@ -1,6 +1,7 @@
 package an5adapters_test
 
 import (
+	"context"
 	"database/sql"
 	"math"
 	"strings"
@@ -158,11 +159,10 @@ func TestRankingQuery(t *testing.T) {
 	}{
 		{"sqlite-vec", []string{
 			"vec_distance_cosine(",
-			"typeof([embedding]) = 'blob'",
-			"length([embedding]) = ?",
+            "vec_length(vec_f32([embedding])) = 3",
 			// The guard carries the caller's WHERE, joined with AND rather than
 			// appended as a second WHERE.
-			"length([embedding]) = ? AND " + tail[len(" WHERE "):],
+            "[embedding] IS NOT NULL AND " + tail[len(" WHERE "):],
 			"an5_ranked",
 			"WHERE distance IS NOT NULL",
 		}},
@@ -281,7 +281,7 @@ func TestCapabilitiesNeedsADatabase(t *testing.T) {
 			t.Fatalf("Capabilities panicked on a closed handle: %v", recovered)
 		}
 	}()
-	caps := sqlite.Capabilities(t.Context(), (*sql.DB)(nil))
+	caps := sqlite.Capabilities(context.Background(), (*sql.DB)(nil))
 	if caps["vec"] || caps["udf"] || caps["json1"] {
 		t.Errorf("Capabilities on no database = %v, want all false", caps)
 	}

@@ -166,6 +166,22 @@ async function main() {
     );
   });
 
+  await test('the native C extension replaces the callback strategy', () => {
+    // `native` implies the C functions exist, so the plan must not also offer
+    // sqlite-vec: the C code covers dot product, which sqlite-vec 0.1.9 lacks.
+    assert.deepStrictEqual(
+      planSqliteVectorStrategies({ native: true, vec: false, udf: true, json1: true }, 'BLOB'),
+      ['udf'],
+    );
+  });
+
+  await test('the native C extension wins over sqlite-vec when both load', () => {
+    assert.deepStrictEqual(
+      planSqliteVectorStrategies({ native: true, vec: true, udf: true, json1: true }, 'BLOB'),
+      ['udf', 'sqlite-vec'],
+    );
+  });
+
   await test('the registered and extension function names are stable', () => {
     assert.deepStrictEqual(AN5_VECTOR_FUNCTIONS, {
       cosine: 'an5_vec_cosine',
@@ -182,7 +198,7 @@ async function main() {
   console.log('SQLite vector search');
 
   await test('the driver function ranks a float32 BLOB column', async () => {
-    const db = adapter(makeDb());
+    const db = adapter(makeDb(), { vectorStrategy: 'udf' });
     try {
       const rows = await db.document.vectorSearch({ vector: [1, 0, 0], take: 3, vectorStrategy: 'udf' });
       assert.deepStrictEqual(rows.map((r) => r.id), ['d1', 'd2', 'd3']);
@@ -194,7 +210,7 @@ async function main() {
   });
 
   await test('the JSON strategy ranks a legacy TEXT column', async () => {
-    const db = adapter(makeDb({ declared: 'TEXT', store: 'json' }));
+    const db = adapter(makeDb({ declared: 'TEXT', store: 'json' }), { vectorStrategy: 'sql' });
     try {
       const rows = await db.document.vectorSearch({ vector: [1, 0, 0], take: 3, vectorStrategy: 'sql' });
       assert.deepStrictEqual(rows.map((r) => r.id), ['d1', 'd2', 'd3']);
@@ -205,7 +221,7 @@ async function main() {
   });
 
   await test('the in-memory fallback reads BLOB columns too', async () => {
-    const db = adapter(makeDb());
+    const db = adapter(makeDb(), { vectorStrategy: 'memory' });
     try {
       const rows = await db.document.vectorSearch({ vector: [1, 0, 0], take: 2, vectorStrategy: 'memory' });
       assert.deepStrictEqual(rows.map((r) => r.id), ['d1', 'd2']);
@@ -297,6 +313,63 @@ async function main() {
   });
 
   console.log('SQLite vector column round-trip');
+
+  await test('mixed legacy TEXT and new BLOB values all participate in search', async () => {
+    const file = makeDb({ declared: 'TEXT', store: 'json' });
+    const db = adapter(file, { vectorStrategy: 'sql' });
+    try {
+      await db.document.create({ data: { id: 'new', title: 'new', embedding: [1, 0, 0] } });
+      const rows = await db.document.vectorSearch({ vector: [1, 0, 0], take: 10 });
+      assert.deepStrictEqual(rows.map(r => r.id).sort(), ['d1', 'd2', 'd3', 'new']);
+    } finally {
+      await db.$disconnect();
+    }
+  });
+
+  await test('browser SQLite round-trips and ranks BLOBs without a Buffer global', async () => {
+    const init = require('sql.js');
+    const SQL = await init();
+    const raw = new SQL.Database();
+    raw.run('CREATE TABLE documents(id TEXT PRIMARY KEY, title TEXT, embedding BLOB)');
+    const { createBrowserSqliteAdapter } = require(path.join(dist, 'sqlite', 'browserEngine.js'));
+    setAdapterMetadata(METADATA);
+    const db = createBrowserSqliteAdapter({ db: raw });
+    const savedBuffer = global.Buffer;
+    try {
+      global.Buffer = undefined;
+      await db.document.create({ data: { id: 'browser', title: 'browser', embedding: [1, 0, 0] } });
+      const rows = await db.document.vectorSearch({ vector: [1, 0, 0] });
+      assert.deepStrictEqual(rows.map(r => r.id), ['browser']);
+      assert.deepStrictEqual(rows[0].embedding, [1, 0, 0]);
+      assert.equal(rows[0].distance, 0);
+    } finally {
+      global.Buffer = savedBuffer;
+      await db.$disconnect();
+    }
+  });
+
+  if (process.env.AN5_SQLITE_VEC_PATH) {
+    await test('sqlite-vec ranks mixed JSON/BLOB rows with a WHERE filter', async () => {
+      const file = makeDb();
+      const raw = new betterSqlite3(file);
+      raw.prepare('UPDATE documents SET embedding = ? WHERE id = ?').run('[0.8,0.2,0]', 'd2');
+      raw.close();
+      const db = adapter(file, { sqliteVec: process.env.AN5_SQLITE_VEC_PATH, vectorStrategy: 'sqlite-vec' });
+      try {
+        const support = await db.sqliteVectorSupport();
+        assert.equal((await support.probe((q, p) => db.exec(q, p))).vec, true);
+        for (const metric of ['cosine', 'euclidean']) {
+          const { buildSqliteVectorQuery } = require(path.join(dist, 'sqlite', 'vector.js'));
+          const native = buildSqliteVectorQuery({ strategy: 'sqlite-vec', metric, table: '[documents]', column: '[embedding]', vector: [1, 0, 0], take: 10, tail: ' WHERE id IN (@first, @second)', params: { first: 'd1', second: 'd2' } });
+          assert.deepStrictEqual((await db.exec(native.sql, native.params)).map(r => r.id), ['d1', 'd2']);
+          const rows = await db.document.vectorSearch({ vector: [1, 0, 0], distanceMetric: metric, where: { id: { in: ['d1', 'd2'] } } });
+          assert.deepStrictEqual(rows.map(r => r.id), ['d1', 'd2']);
+        }
+      } finally {
+        await db.$disconnect();
+      }
+    });
+  }
 
   await test('create stores float32 bytes and findMany returns number[]', async () => {
     const file = makeDb({ declared: 'BLOB' });

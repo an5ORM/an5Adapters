@@ -63,7 +63,7 @@ namespace An5Orm
             var hasVec = false;
             if (!string.IsNullOrWhiteSpace(support.SqliteVecPath))
             {
-                try { conn.LoadExtension(support.SqliteVecPath); hasVec = true; }
+                try { conn.LoadExtension(support.SqliteVecPath); }
                 catch { /* the extension is optional */ }
             }
             if (!hasVec)
@@ -79,6 +79,13 @@ namespace An5Orm
             }
 
             var hasUdf = false;
+            try {
+                using var native = conn.CreateCommand();
+                native.CommandText = "SELECT an5_vector_version()";
+                native.ExecuteScalar();
+                support.Report(false, true, true);
+                return;
+            } catch { /* no AN5 native extension */ }
             try
             {
                 foreach (var metric in SqliteVectors.An5Functions.Keys)
@@ -124,7 +131,9 @@ namespace An5Orm
                     param.ParameterName = paramName;
                     // A JSON vector or a bool needs a type SQLite will store in a
                     // column rather than coerce to an integer.
-                    if (value is bool flag) param.Value = flag ? 1 : 0;
+                    if (value is float[] || value is double[] || value is List<double>)
+                        param.Value = SqliteVectors.EncodeVector(SqliteVectors.DecodeVector(value));
+                    else if (value is bool flag) param.Value = flag ? 1 : 0;
                     else param.Value = value;
                     cmd.Parameters.Add(param);
                 }

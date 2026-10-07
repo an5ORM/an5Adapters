@@ -387,6 +387,32 @@ final class RuntimeSmokeTests: XCTestCase {
         XCTAssertEqual(many.first?["embedding"] as? [Double] ?? [], [0, 0, 1])
     }
 
+    /// A loaded AN5 C extension must not be shadowed by the Swift callbacks.
+///
+/// SQLite lets a later `sqlite3_create_function` replace an earlier one, so registering
+/// callbacks over a loaded extension would silently swap native code for the slower path.
+///
+/// Skipped unless `AN5_NATIVE_VECTOR_PATH` points at a built extension; the Swift gate
+/// builds one with `build:sqlite:native`, like the Python and .NET gates do.
+    func testNativeExtensionIsPreserved() throws {
+        guard let path = ProcessInfo.processInfo.environment["AN5_NATIVE_VECTOR_PATH"],
+              FileManager.default.fileExists(atPath: path) else {
+            throw XCTSkip("AN5_NATIVE_VECTOR_PATH is not set; run build:sqlite:native first")
+        }
+        SQLiteDriver.sqliteVecPath = path
+        defer { SQLiteDriver.sqliteVecPath = nil }
+        let driver = try SQLiteDriver(path: ":memory:")
+
+        let loaded = try driver.query("SELECT an5_vector_version() AS v", [])
+        XCTAssertEqual(loaded.first?["v"] as? String, "an5-vector/1")
+
+        // `0.1` is not representable in float32, so this result proves the C function is
+        // in use: a Swift callback would compute it in Double.
+        let rows = try driver.query("SELECT an5_vec_ip('[0.1]', '[0.1]') AS d", [])
+        let expected = -(Double(Float(0.1)) * Double(Float(0.1)))
+        XCTAssertEqual(try XCTUnwrap(rows.first?["d"] as? Double), expected, accuracy: 1e-12)
+    }
+
     /// A database whose vector column holds float32 BLOBs, as `VECTOR(n)` now maps to.
     private func makeBlobAdapter() throws -> An5Adapter {
         let metadata = Metadata(

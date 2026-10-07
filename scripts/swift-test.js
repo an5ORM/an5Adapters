@@ -15,6 +15,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { buildNative } = require('./sqlite-native-build');
 
 const swiftDir = path.join(__dirname, '..', 'swift');
 function swift() {
@@ -72,11 +73,29 @@ if (!hasSQLiteHeaders()) {
   process.exit(0);
 }
 
+// The native vector extension test needs a built binary. Building it is optional, so a
+// missing compiler leaves that one case skipped rather than failing the gate.
+let nativePath = process.env.AN5_NATIVE_VECTOR_PATH;
+if (!nativePath && process.platform !== 'win32') {
+  try {
+    nativePath = buildNative(path.join(os.tmpdir(), 'an5-swift-vector'));
+  } catch (error) {
+    console.log(`swift-test: native vector extension not built (${error.message})`);
+  }
+}
+const environment = nativePath
+  ? { ...process.env, AN5_NATIVE_VECTOR_PATH: nativePath }
+  : { ...process.env };
+
 const scratch = process.env.SWIFT_SCRATCH_PATH || path.join(os.tmpdir(), 'an5-swift-build');
 fs.mkdirSync(scratch, { recursive: true });
 try {
-  execFileSync(tool, ['build', '--scratch-path', scratch], { cwd: swiftDir, stdio: 'inherit' });
-  execFileSync(tool, ['test', '--scratch-path', scratch], { cwd: swiftDir, stdio: 'inherit' });
+  execFileSync(tool, ['build', '--scratch-path', scratch], {
+    cwd: swiftDir, stdio: 'inherit', env: environment,
+  });
+  execFileSync(tool, ['test', '--scratch-path', scratch], {
+    cwd: swiftDir, stdio: 'inherit', env: environment,
+  });
   console.log('an5Adapters Swift package built and tested');
 } catch (error) {
   const message = String((error && error.message) || error);

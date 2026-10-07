@@ -111,7 +111,8 @@ func DecodeVector(value interface{}) []float64 {
 			return ParseVector(string(bytes))
 		}
 		if len(bytes) > 0 && bytes[0] == '[' {
-			return nil
+			var parsed []float64
+			if json.Unmarshal(bytes, &parsed) == nil { return parsed }
 		}
 		out := make([]float64, len(bytes)/BytesPerVectorFloat)
 		for i := range out {

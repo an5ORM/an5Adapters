@@ -3,8 +3,7 @@
 // SQLite has no vector type, so a `VECTOR(n)` column stores a BLOB of little-endian
 // float32 values and is ranked in one of four ways, in this order:
 //
-//  1. sqlite-vec  the extension, when the driver loaded it. Fastest, and the only
-//     option that can use an ANN index.
+//  1. sqlite-vec  native scalar distances, when the driver loaded the extension.
 //  2. udf         an5_vec_cosine / an5_vec_l2 / an5_vec_ip registered with the
 //     driver. Reads the BLOB and the legacy JSON text.
 //  3. sql         json_each brute force in plain SQL. Needs no user function, so it
@@ -55,12 +54,14 @@ type VectorSupport struct {
 //	        return sqlite.RegisterVectorFunctions(c.RegisterFunc)
 //	    },
 //	})
-func RegisterVectorFunctions(register func(name string, fn func(a, b []float64) (float64, bool)) error) error {
+func RegisterVectorFunctions(register func(name string, impl interface{}, pure bool) error) error {
 	for metric, name := range base.An5VectorFunctions {
 		captured := metric
-		if err := register(name, func(a, b []float64) (float64, bool) {
-			return base.VectorDistance(a, b, captured)
-		}); err != nil {
+		if err := register(name, func(a, b interface{}) interface{} {
+			distance, ok := base.VectorDistance(base.DecodeVector(a), base.DecodeVector(b), captured)
+			if !ok { return nil }
+			return distance
+		}, true); err != nil {
 			return err
 		}
 	}
@@ -160,14 +161,14 @@ func BuildRankingQuery(strategy, metric, table, column string, vector []float64,
 		// sqlite-vec only understands float32 BLOB operands, so rows stored any
 		// other way are excluded instead of aborting the query. The guard joins the
 		// caller's WHERE with AND, since the ranking query is where both apply.
-		guard := fmt.Sprintf("typeof(%s) = 'blob' AND length(%s) = ?", column, column)
+		guard := fmt.Sprintf("%s IS NOT NULL", column)
 		// `tail` carries its own leading " WHERE", so it is appended after AND.
 		if tail != "" {
 			guard += " AND" + strings.Replace(tail, " WHERE ", " ", 1)
 		}
-		inner := fmt.Sprintf("SELECT *, %s(%s, ?) AS distance FROM %s WHERE %s",
-			fn, column, table, guard)
-		return rank(inner), append(args, base.EncodeVector(vector), len(vector)*base.BytesPerVectorFloat)
+		inner := fmt.Sprintf("SELECT *, CASE WHEN vec_length(vec_f32(%s)) = %d THEN %s(vec_f32(%s), ?) END AS distance FROM %s WHERE %s",
+			column, len(vector), fn, column, table, guard)
+		return rank(inner), append([]interface{}{base.EncodeVector(vector)}, args...)
 	}
 
 	if strategy == base.VectorStrategyUdf {
@@ -176,7 +177,7 @@ func BuildRankingQuery(strategy, metric, table, column string, vector []float64,
 			return "", args
 		}
 		inner := fmt.Sprintf("SELECT *, %s(%s, ?) AS distance FROM %s%s", fn, column, table, tail)
-		return rank(inner), append(args, base.EncodeVector(vector))
+		return rank(inner), append([]interface{}{base.EncodeVector(vector)}, args...)
 	}
 
 	payload, err := json.Marshal(vector)
@@ -185,7 +186,7 @@ func BuildRankingQuery(strategy, metric, table, column string, vector []float64,
 	}
 	inner := fmt.Sprintf("SELECT *, %s AS distance FROM %s%s", jsonDistanceExpr(metric, column), table, tail)
 	prefix := "WITH q AS (SELECT je.key AS k, CAST(je.value AS REAL) AS v FROM json_each(?) je) "
-	return prefix + rank(inner), append(args, string(payload))
+	return prefix + rank(inner), append([]interface{}{string(payload)}, args...)
 }
 
 // RunVectorSearch ranks a SQLite table inside the database, trying each available
@@ -214,6 +215,12 @@ func RunVectorSearch(
 	declared := ReadColumnType(ctx, db, rawTable, rawColumn)
 
 	for _, strategy := range base.PlanVectorStrategies(caps, declared, support.VectorStrategy) {
+		if strategy == base.VectorStrategySQL {
+			clause := " WHERE "
+			if tail != "" { clause = tail + " AND " }
+			binary, err := exec(ctx, "SELECT 1 FROM " + table + clause + "typeof(" + column + ") = 'blob' LIMIT 1", args...)
+			if err != nil || len(binary) > 0 { continue }
+		}
 		query, queryArgs := BuildRankingQuery(strategy, metric, table, column, vector, take, tail, args)
 		if query == "" {
 			continue

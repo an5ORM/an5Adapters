@@ -94,9 +94,9 @@ public final class An5Adapter {
     /// reaches only `json_each` and the in-memory path.
     public private(set) lazy var sqliteCapabilities: SqliteVectors.Capabilities = {
         SqliteVectors.Capabilities(
-            vec: probe("SELECT vec_version()"),
-            udf: probe("SELECT an5_vec_cosine(zeroblob(4), zeroblob(4))"),
-            json1: probe("SELECT json_valid('[1]')")
+            vec: self.probe("SELECT vec_version()"),
+            udf: self.probe("SELECT an5_vec_cosine(zeroblob(4), zeroblob(4))"),
+            json1: self.probe("SELECT json_valid('[1]')")
         )
     }()
 
@@ -111,7 +111,7 @@ public final class An5Adapter {
     /// a `BLOB` column has no JSON to walk.
     public func queryColumnType(table: String, column: String) throws -> String? {
         let rows = try driver.query(
-            "SELECT type FROM pragma_table_info(?) WHERE name = ?", [table, column]
+            "SELECT type FROM pragma_table_info(?) WHERE name = ?", [.text(table), .text(column)]
         )
         return rows.first?["type"].flatMap { $0 as? String }
     }

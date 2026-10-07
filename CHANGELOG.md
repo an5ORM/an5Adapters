@@ -37,6 +37,13 @@
   returned with a null distance on some providers.
 
 ### Fixed
+- Swift vector search no longer breaks the build. The registered distance callback called an
+  instance method, which Swift rejects because a C function pointer cannot capture `Self`; it
+  also read the metric from the callback context instead of the user-data pointer, and read
+  arguments through a `sqlite3_value` type the importer does not provide. `update` and
+  `updateMany` also skipped vector encoding, so a `VECTOR(n)` column stored Swift array
+  syntax instead of float32 bytes. The Swift gate now runs on Linux CI instead of skipping,
+  and asserts a loaded native extension is not replaced by the Swift callbacks.
 - `test:gradle` looks for the Java runtime under the coordinates that are actually published,
   `io.github.an5orm:an5-adapters-java`, and checks the version the manifest asks for. The
   gate still probed the rejected `org.an5orm` group, so it reinstalled the artifact on every

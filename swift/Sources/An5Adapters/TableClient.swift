@@ -167,7 +167,7 @@ public struct TableClient {
 
         var setParts: [String] = []
         var setValues: [SQLValue] = []
-        for (column, value) in scalars {
+        for (column, value) in encodeVectorFields(scalars) {
             guard let value, !(value is NSNull) else { continue }
             SQLBuilder.appendUpdateSet(&setParts, &setValues, column: column, value: value, dialect: dialect)
         }
@@ -349,7 +349,7 @@ public struct TableClient {
         take: Int,
         field: String,
         metric: DistanceMetric,
-        clause: SQLBuilder.WhereClause
+        clause: WhereClause
     ) throws -> [Row]? {
         guard !vector.isEmpty else { return [] }
         let capabilities = adapter.sqliteCapabilities
@@ -360,6 +360,12 @@ public struct TableClient {
         for strategy in SqliteVectors.plan(
             capabilities: capabilities, declaredType: declared, preference: adapter.vectorStrategy
         ) {
+            if strategy == SqliteVectors.strategySQL {
+                let binary = try adapter.query("SELECT 1 FROM \(tableSQL)"
+                    + (tail.isEmpty ? " WHERE " : tail + " AND ")
+                    + "typeof(\(column)) = 'blob' LIMIT 1", parameters(clause.parameters))
+                if !binary.isEmpty { continue }
+            }
             var bind: [SQLValue] = []
             guard let sql = SqliteVectors.rankingQuery(
                 strategy: strategy, metric: metric, table: tableSQL, column: column,

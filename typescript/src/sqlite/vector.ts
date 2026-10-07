@@ -4,8 +4,7 @@
 // little-endian float32 values (see `encodeVector`) and searched in one of four
 // ways. The order is fixed so every runtime that speaks SQLite can implement it:
 //
-//   1. sqlite-vec   the extension, if it loads. Fastest, and the only option
-//                   that can use an ANN index.
+//   1. sqlite-vec   native scalar distance functions, if the extension loads.
 //   2. udf          `an5_vec_cosine` / `an5_vec_l2` / `an5_vec_ip` registered by
 //                   the driver. Reads the BLOB and the legacy JSON text.
 //   3. sql          `json_each` brute force in plain SQL. No UDF needed, so it
@@ -88,20 +87,32 @@ export function decodeVector(value: unknown): number[] | null {
   if (!bytes || bytes.length === 0 || bytes.length % BYTES_PER_FLOAT !== 0) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const out = new Array<number>(bytes.length / BYTES_PER_FLOAT);
-  for (let i = 0; i < out.length; i++) out[i] = view.getFloat32(i * BYTES_PER_FLOAT, true);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = view.getFloat32(i * BYTES_PER_FLOAT, true);
+    if (!Number.isFinite(out[i])) return null;
+  }
   return out;
 }
 
 /** Encode a vector as the little-endian float32 BLOB `VECTOR(n)` columns store. */
-export function encodeVector(values: readonly number[]): Buffer {
-  const buf = Buffer.alloc(values.length * BYTES_PER_FLOAT);
-  for (let i = 0; i < values.length; i++) buf.writeFloatLE(Number(values[i]) || 0, i * BYTES_PER_FLOAT);
+export function encodeVector(values: readonly number[]): Uint8Array {
+  const buf = typeof Buffer !== 'undefined'
+    ? Buffer.alloc(values.length * BYTES_PER_FLOAT)
+    : new Uint8Array(values.length * BYTES_PER_FLOAT);
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  for (let i = 0; i < values.length; i++) {
+    if (!Number.isFinite(values[i])) throw new TypeError('Vector elements must be finite numbers');
+    view.setFloat32(i * BYTES_PER_FLOAT, values[i]!, true);
+    if (!Number.isFinite(view.getFloat32(i * BYTES_PER_FLOAT, true))) {
+      throw new RangeError('Vector element exceeds float32 range');
+    }
+  }
   return buf;
 }
 
 /** True when the value still needs encoding on its way into a `VECTOR(n)` column. */
 export function needsVectorEncoding(value: unknown): boolean {
-  return Array.isArray(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer;
+  return Array.isArray(value) || value instanceof Float32Array || value instanceof Float64Array;
 }
 
 /** True when a generated metadata entry describes a `VECTOR(n)` column. */
@@ -206,12 +217,11 @@ export function buildSqliteVectorQuery(args: BuildArgs): SqliteVectorQuery {
     params.an5_vector = encodeVector(queryVector);
     params.an5_vector_bytes = queryVector.length * BYTES_PER_FLOAT;
     const fn = SQLITE_VEC_FUNCTIONS[metric];
-    const distance = `${fn}(${column}, @an5_vector)`;
-    // sqlite-vec only understands float32 BLOB operands, so the rows stored any
-    // other way are excluded instead of aborting the query.
+    const stored = `vec_f32(${column})`;
+    const distance = `CASE WHEN vec_length(${stored}) = ${queryVector.length} THEN ${fn}(${stored}, @an5_vector) END`;
+    // vec_f32 accepts JSON text and float32 BLOBs, preserving legacy rows.
     return {
-      sql: rank(`SELECT *, ${distance} AS distance FROM ${table}`
-        + ` WHERE typeof(${column}) = 'blob' AND length(${column}) = @an5_vector_bytes${tail}`),
+      sql: rank(`SELECT *, ${distance} AS distance FROM ${table}${tail ? `${tail} AND` : ' WHERE'} ${column} IS NOT NULL`),
       params,
     };
   }
@@ -234,6 +244,8 @@ export function buildSqliteVectorQuery(args: BuildArgs): SqliteVectorQuery {
 // ─── Capabilities ──────────────────────────────────────────────────────────────────
 
 export interface SqliteVectorCapabilities {
+  /** AN5's C extension is loaded; keep its functions instead of driver callbacks. */
+  native?: boolean;
   /** `vec_version()` answered, so the sqlite-vec extension is loaded. */
   vec: boolean;
   /** The adapter's own distance functions are registered with the driver. */
@@ -291,8 +303,9 @@ export function planSqliteVectorStrategies(
 ): SqliteVectorStrategy[] {
   const wanted = preference && preference !== 'auto' ? [preference] : [];
   const available: SqliteVectorStrategy[] = [];
+  if (caps.native && caps.udf) available.push('udf');
   if (caps.vec) available.push('sqlite-vec');
-  if (caps.udf) available.push('udf');
+  if (caps.udf && !caps.native) available.push('udf');
   if (caps.json1) available.push('sql');
   if (wanted.length > 0) return wanted.filter((s) => s !== 'memory');
   const plan = available;
@@ -310,6 +323,16 @@ export function planSqliteVectorStrategies(
  */
 export class SqliteVectorSupport {
   private caps: SqliteVectorCapabilities | null = null;
+  /**
+   * Declared column types and the "any binary row" probe, keyed by column.
+   *
+   * Both cost a query, and neither changes while a schema is in use. A stale
+   * answer is still safe: the probe only decides which strategy to try first, and
+   * a strategy that fails falls through to the next one rather than reporting a
+   * wrong result.
+   */
+  private readonly columnTypes = new Map<string, string | null>();
+  private readonly binaryRows = new Map<string, boolean>();
 
   constructor(
     private readonly hooks: SqliteVectorHooks,
@@ -326,10 +349,14 @@ export class SqliteVectorSupport {
         probed(() => native.loadExtension(this.options.sqliteVec));
       }
       if (probed(() => native.prepare('SELECT vec_version()').get()) !== null) caps.vec = true;
+      if (probed(() => native.prepare('SELECT an5_vector_version()').get()) !== null) {
+        caps.native = true;
+        caps.udf = true;
+      }
     }
 
     const register = this.hooks.registerFunction;
-    if (register) {
+    if (register && !caps.native) {
       // better-sqlite3 takes an options object where every other driver takes a
       // plain function, so both shapes are offered and the driver picks.
       const names = Object.values(AN5_VECTOR_FUNCTIONS);
@@ -366,6 +393,50 @@ export class SqliteVectorSupport {
       }
     }
     return caps;
+  }
+
+  /** The column's declared DDL type, remembered per column. */
+  async columnType(
+    exec: (sql: string, params?: Record<string, any>) => Promise<any[]>,
+    table: string,
+    column: string,
+  ): Promise<string | null> {
+    const key = `${table}.${column}`;
+    if (!this.columnTypes.has(key)) {
+      const found = await readSqliteColumnType(exec, table, column).catch(() => null);
+      this.columnTypes.set(key, found);
+    }
+    return this.columnTypes.get(key) ?? null;
+  }
+
+  /**
+   * Whether any row stores raw bytes, which `json_each` cannot read.
+   *
+   * Checked only for the `sql` strategy, where a legacy JSON column that has
+   * since taken new float32 rows would otherwise rank just the old ones.
+   */
+  async hasBinaryRows(
+    exec: (sql: string, params?: Record<string, any>) => Promise<any[]>,
+    table: string,
+    column: string,
+    tail: string,
+    params: Record<string, any>,
+  ): Promise<boolean> {
+    const key = `${table}.${column}`;
+    if (!this.binaryRows.has(key)) {
+      const rows = await exec(
+        `SELECT 1 FROM ${table}${tail ? `${tail} AND` : ' WHERE'} typeof(${column}) = 'blob' LIMIT 1`,
+        params,
+      ).catch(() => []);
+      this.binaryRows.set(key, rows.length > 0);
+    }
+    return this.binaryRows.get(key) === true;
+  }
+
+  reset(): void {
+    this.caps = null;
+    this.columnTypes.clear();
+    this.binaryRows.clear();
   }
 }
 
@@ -429,12 +500,23 @@ export async function runSqliteVectorSearch(
 
   let declaredType: string | null = null;
   try {
-    declaredType = await readSqliteColumnType(args.exec, args.rawTable, args.rawColumn);
+    declaredType = args.vectorSupport
+      ? await args.vectorSupport.columnType(args.exec, args.rawTable, args.rawColumn)
+      : await readSqliteColumnType(args.exec, args.rawTable, args.rawColumn);
   } catch {
     declaredType = null;
   }
 
   for (const strategy of planSqliteVectorStrategies(caps, declaredType, args.preference)) {
+    if (strategy === 'sql') {
+      const binary = args.vectorSupport
+        ? await args.vectorSupport.hasBinaryRows(args.exec, args.rawTable, args.rawColumn, args.tail ?? '', args.params)
+        : (await args.exec(
+            `SELECT 1 FROM ${args.table}${args.tail ? `${args.tail} AND` : ' WHERE'} typeof(${args.column}) = 'blob' LIMIT 1`,
+            args.params,
+          )).length > 0;
+      if (binary) continue;
+    }
     const params: Record<string, any> = { ...args.params };
     const query = buildSqliteVectorQuery({
       strategy,

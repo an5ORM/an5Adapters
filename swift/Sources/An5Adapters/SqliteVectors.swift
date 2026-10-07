@@ -6,8 +6,7 @@ import Foundation
 /// float32 values (see ``SqliteVectors/encode(_:)``) and is ranked in one of four ways, in
 /// this order:
 ///
-/// 1. `sqlite-vec` — the extension, when it loads. Fastest, and the only option that can
-///    use an ANN index.
+/// 1. `sqlite-vec` — native scalar distances, when the extension loads.
 /// 2. `udf` — `an5_vec_cosine` / `an5_vec_l2` / `an5_vec_ip` registered with the driver.
 ///    Reads the BLOB and the legacy JSON text.
 /// 3. `sql` — `json_each` brute force in plain SQL. Needs no user function, but only
@@ -88,7 +87,8 @@ public enum SqliteVectors {
         var values: [Double] = []
         values.reserveCapacity(bytes.count / bytesPerFloat)
         for offset in stride(from: 0, to: bytes.count, by: bytesPerFloat) {
-            let raw = bytes[offset..<(offset + bytesPerFloat)].reduce(UInt32(0)) { $0 | (UInt32($1) << (8 * $0)) }
+            let raw = UInt32(bytes[offset]) | (UInt32(bytes[offset + 1]) << 8)
+                | (UInt32(bytes[offset + 2]) << 16) | (UInt32(bytes[offset + 3]) << 24)
             values.append(Double(Float(bitPattern: raw)))
         }
         guard expectedLength == 0 || values.count == expectedLength else { return nil }
@@ -203,16 +203,16 @@ public enum SqliteVectors {
         var inner: String
         if strategy == strategySqliteVec || strategy == strategyUdf {
             guard let function = functions[metric.rawValue] else { return nil }
-            let distance = "\(function)(\(column), \(placeholder))"
+            var distance = "\(function)(\(column), \(placeholder))"
             var guardClause = ""
             if strategy == strategySqliteVec {
-                // sqlite-vec only understands float32 BLOB operands, so rows stored any other
-                // way are excluded instead of aborting the query. The guard joins the caller's
-                // WHERE with AND, since appending the tail after it would produce a second
-                // WHERE.
-                guardClause = "typeof(\(column)) = 'blob' AND length(\(column)) = \(placeholder)"
+                // `vec_f32` also accepts legacy JSON text, so the guard is only a
+                // dimension check. It joins the caller's WHERE with AND, because
+                // appending the tail after it would produce a second WHERE.
+                guardClause = "\(column) IS NOT NULL"
+                distance = "CASE WHEN vec_length(vec_f32(\(column))) = \(vector.count)"
+                    + " THEN \(function)(vec_f32(\(column)), \(placeholder)) END"
                 bind.append(.blob(encode(vector)))
-                bind.append(.integer(Int64(vector.count * bytesPerFloat)))
             } else {
                 bind.append(.blob(encode(vector)))
             }
@@ -221,7 +221,12 @@ public enum SqliteVectors {
             } else if tail.isEmpty {
                 inner = "SELECT *, \(distance) AS distance FROM \(table) WHERE \(guardClause)"
             } else {
-                let trimmed = tail.drop(while: { $0 == " " })
+                // `tail` starts with " WHERE "; drop that keyword and keep the condition,
+                // which then combines with the guard through a single WHERE.
+                let condition = tail.trimmingCharacters(in: .whitespacesAndNewlines)
+                let trimmed = condition.hasPrefix("WHERE")
+                    ? String(condition.dropFirst("WHERE".count).drop(while: { $0 == " " }))
+                    : condition
                 inner = "SELECT *, \(distance) AS distance FROM \(table)"
                     + " WHERE \(guardClause) AND \(trimmed)"
             }

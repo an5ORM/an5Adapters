@@ -410,10 +410,6 @@ fn bind_value<'q>(
         Value::String(s) => q.bind(s.clone()),
         // A vector is bound as the float32 BLOB a `VECTOR(n)` column stores; any
         // other structure has no SQLite representation.
-        Value::Array(_) => match crate::base::parse_vector(v) {
-            Some(values) => q.bind(encode_vector(&values)),
-            None => q.bind(v.to_string()),
-        },
         Value::Object(_) if blob_bytes(v).is_some() => q.bind(blob_bytes(v)),
         other => q.bind(other.to_string()),
     }
@@ -485,14 +481,6 @@ pub fn blob_bytes(value: &Value) -> Option<Vec<u8>> {
 
 /// A text BLOB stays text; anything binary becomes a [`blob_value`].
 fn bytes_to_value(bytes: &[u8]) -> Value {
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        let has_control = text
-            .chars()
-            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'));
-        if !has_control {
-            return Value::String(text.to_string());
-        }
-    }
     blob_value(bytes)
 }
 
@@ -1012,7 +1000,12 @@ impl TableClient {
             declared.as_deref(),
             self.adapter.vector_strategy.as_deref(),
         ) {
-            let mut bind: Vec<Value> = w.args.clone();
+            if strategy == crate::base::STRATEGY_SQL {
+                let clause = if tail.is_empty() { " WHERE ".to_string() } else { format!("{tail} AND ") };
+                let binary = self.adapter.query_raw(&format!("SELECT 1 FROM {table}{clause}typeof({column}) = 'blob' LIMIT 1"), &w.args).await?;
+                if !binary.is_empty() { continue; }
+            }
+            let mut bind: Vec<Value> = Vec::new();
             let sql = match strategy {
                 STRATEGY_SQLITE_VEC | STRATEGY_UDF => {
                     let Some(function) = distance_function(strategy, metric) else {
@@ -1023,12 +1016,12 @@ impl TableClient {
                         // sqlite-vec only understands float32 BLOB operands, so rows
                         // stored any other way are excluded rather than aborting the
                         // query.
-                        STRATEGY_SQLITE_VEC => format!(
-                            "typeof({column}) = 'blob' AND length({column}) = ?"
-                        ),
+                        STRATEGY_SQLITE_VEC => format!("{column} IS NOT NULL"),
                         _ => String::new(),
                     };
-                    let distance = format!("{function}({column}, ?)");
+                    let distance = if strategy == STRATEGY_SQLITE_VEC {
+                        format!("CASE WHEN vec_length(vec_f32({column})) = {} THEN {function}(vec_f32({column}), ?) END", args.vector.len())
+                    } else { format!("{function}({column}, ?)") };
                     // The guard and the caller's WHERE are one clause: appending the
                     // tail after it would produce a second WHERE.
                     let clause = match (guard.is_empty(), tail.is_empty()) {
@@ -1057,6 +1050,7 @@ impl TableClient {
             let sql = format!(
                 "SELECT * FROM ({sql}) AS an5_ranked WHERE distance IS NOT NULL ORDER BY distance ASC LIMIT {take}"
             );
+            bind.extend(w.args.clone());
             if let Ok(rows) = self.adapter.query_raw(&sql, &bind).await {
                 return Ok(Some(self.decode_vector_rows(rows)));
             }

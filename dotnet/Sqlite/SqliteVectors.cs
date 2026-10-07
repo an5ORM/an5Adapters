@@ -11,8 +11,7 @@ namespace An5Orm
     // little-endian float32 values (see `EncodeVector`) and is ranked in one of
     // four ways, in this order:
     //
-    //   1. sqlite-vec  the extension, when it loads. Fastest, and the only
-    //                  option that can use an ANN index.
+    //   1. sqlite-vec  native scalar distances, when the extension loads.
     //   2. udf         an5_vec_cosine / an5_vec_l2 / an5_vec_ip registered with
     //                  the connection. Reads the BLOB and the legacy JSON text.
     //   3. sql         json_each brute force in plain SQL. Needs no user
@@ -245,8 +244,10 @@ namespace An5Orm
                 parameters["an5_vector_bytes"] = vector.Count * BytesPerFloat;
                 // sqlite-vec only understands float32 BLOB operands, so rows stored
                 // any other way are excluded instead of aborting the query.
-                return Rank($"SELECT *, {SqliteVecFunctions[metric]}({column}, @an5_vector) AS distance FROM {table}"
-                          + $" WHERE typeof({column}) = 'blob' AND length({column}) = @an5_vector_bytes{tail}");
+                return Rank($"SELECT *, CASE WHEN vec_length(vec_f32({column})) = {vector.Count}"
+                          + $" THEN {SqliteVecFunctions[metric]}(vec_f32({column}), @an5_vector) END AS distance FROM {table}"
+                          + (string.IsNullOrWhiteSpace(tail) ? " WHERE " : tail + " AND ")
+                          + $"{column} IS NOT NULL");
             }
 
             if (strategy == StrategyUdf)
@@ -323,6 +324,11 @@ namespace An5Orm
             var declaredType = ReadColumnType(exec, rawTable, rawColumn);
             foreach (var strategy in PlanStrategies(caps.Vec, caps.Udf, caps.Json1, declaredType, support?.Preference))
             {
+                if (strategy == StrategySql) {
+                    var binary = exec($"SELECT 1 FROM {table}" + (string.IsNullOrWhiteSpace(tail) ? " WHERE " : tail + " AND ")
+                        + $"typeof({column}) = 'blob' LIMIT 1", parameters);
+                    if (binary.Count > 0) continue;
+                }
                 var bound = new Dictionary<string, object>();
                 foreach (var kv in parameters) bound[kv.Key] = kv.Value;
                 var sql = BuildQuery(strategy, metric, table, column, vector, take, tail, bound);

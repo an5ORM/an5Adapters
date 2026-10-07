@@ -114,7 +114,7 @@ async fn documents(declared: &str, store: &str) -> (An5Adapter, TempDb) {
     // and one with no vector at all must not win by default.
     db.execute_raw(
         "INSERT INTO documents (id, title, embedding) VALUES ('d4', 'wrong size', ?)",
-        &[Value::from(encode_blob(&[1.0, 0.0, 0.0, 1.0]))],
+        &[if store == "blob" { encode_blob(&[1.0, 0.0, 0.0, 1.0]) } else { Value::from("[1,0,0,1]") }],
     )
     .await
     .expect("insert the wrong-size row");

@@ -68,6 +68,9 @@ public final class SQLiteDriver: SQLDriver {
         // Foreign keys are off by default in SQLite, unlike every other dialect, so a schema
         // that relies on them would silently accept rows nothing points at.
         _ = try? execute("PRAGMA foreign_keys = ON", [])
+        // `sqlite3_enable_load_extension` is unavailable on Apple mobile platforms, where an
+        // application links SQLite statically and supplies its own extension instead.
+        #if os(Linux) || os(macOS) || os(Windows)
         if let path = Self.sqliteVecPath {
             // An extension is optional: without it the search still ranks, through the
             // distance functions registered below or `json_each`.
@@ -75,6 +78,7 @@ public final class SQLiteDriver: SQLDriver {
             _ = sqlite3_load_extension(handle, path, nil, nil)
             _ = sqlite3_enable_load_extension(handle, 0)
         }
+        #endif
         registerVectorFunctions()
     }
 
@@ -90,40 +94,65 @@ public final class SQLiteDriver: SQLDriver {
     /// This runs per connection because a user function only exists for the connection that
     /// declared it.
     private func registerVectorFunctions() {
+        // AN5's native extension or sqlite-vec already provide these names. Registering a
+        // Swift callback over them would silently replace native code with a slower path.
+        if (try? query("SELECT an5_vector_version()", [])) != nil { return }
         for (metric, name) in SqliteVectors.an5Functions {
-            registerVectorFunction(name, metric: metric)
+            guard let resolved = DistanceMetric(rawValue: metric) else { continue }
+            registerVectorFunction(name, metric: resolved)
         }
     }
 
-    /// The C callback SQLite calls; it reads its arguments as pointers on a context.
+    /// Registers one distance function.
+    ///
+    /// The metric travels in the function's user-data pointer rather than the callback
+    /// context: a C function pointer cannot capture anything, so the callback reads what it
+    /// needs back out of SQLite.
     private func registerVectorFunction(_ name: String, metric: DistanceMetric) {
-        // SQLite keeps the context pointer, so the metric travels with the function.
-        let context = Unmanaged.passRetained(MetricContext(metric: metric)).toOpaque()
+        let userData = Unmanaged.passRetained(MetricContext(metric: metric)).toOpaque()
         sqlite3_create_function_v2(
             handle,
             name,
             2,
             SQLITE_UTF8 | SQLITE_DETERMINISTIC,
-            context,
-            { pointer, count, values in
-                // A vector that cannot be scored leaves the result NULL, which the ranking
-                // query filters out rather than handing to the caller.
-                guard let pointer, count == 2, let values else { return }
-                let metric = Unmanaged<MetricContext>.fromOpaque(pointer).takeUnretainedValue().metric
-                guard let left = sqliteVecValue(values[0]),
-                      let right = sqliteVecValue(values[1]),
-                      left.count == right.count, !left.isEmpty else { return }
-                sqlite3_result_double(pointer, DistanceMetric.distance(metric, left, right))
-            },
-            nil, nil, nil,
-            { pointer in
-                Unmanaged<MetricContext>.fromOpaque(pointer).release()
-            }
+            userData,
+            SQLiteDriver.vectorCallback,
+            nil, nil,
+            SQLiteDriver.vectorDestructor
         )
     }
 
+    /// The distance callback, at file scope for the C ABI.
+    ///
+    /// A `@convention(c)` function pointer cannot capture anything, not even `Self`, so
+    /// this is a free function rather than a method. Everything it needs arrives through
+    /// SQLite: the metric in the user-data pointer, the arguments in `values`.
+    private static let vectorCallback: @convention(c) (
+        OpaquePointer?, Int32, UnsafeMutablePointer<OpaquePointer?>?
+    ) -> Void = { context, count, values in
+        // A vector that cannot be scored leaves the result NULL, which the ranking query
+        // filters out rather than handing to the caller.
+        guard let context, count == 2, let values else { return }
+        guard let raw = sqlite3_user_data(context) else { return }
+        let metric = Unmanaged<MetricContext>.fromOpaque(raw).takeUnretainedValue().metric
+        guard let left = SQLiteDriver.sqliteVectorArgument(values[0]),
+              let right = SQLiteDriver.sqliteVectorArgument(values[1]),
+              left.count == right.count, !left.isEmpty else { return }
+        sqlite3_result_double(context, DistanceMetric.distance(metric, left, right))
+    }
+
+    /// Releases the metric box allocated for one registered function.
+    private static let vectorDestructor: @convention(c) (UnsafeMutableRawPointer?) -> Void = { pointer in
+        if let pointer { Unmanaged<MetricContext>.fromOpaque(pointer).release() }
+    }
+
     /// Reads one bound argument: a BLOB of float32 or a legacy JSON text column.
-    private func sqliteVecValue(_ value: sqlite3_value?) -> [Double]? {
+    ///
+    /// Static because the C callback above cannot capture `self`.
+    ///
+    /// `sqlite3_value` is an incomplete C type, so Swift imports it as
+    /// `OpaquePointer`.
+    private static func sqliteVectorArgument(_ value: OpaquePointer?) -> [Double]? {
         guard let value else { return nil }
         switch sqlite3_value_type(value) {
         case SQLITE_BLOB:
