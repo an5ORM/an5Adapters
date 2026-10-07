@@ -16,6 +16,11 @@ const dist = path.join(root, 'dist');
 let betterSqlite3 = null;
 try { betterSqlite3 = require('better-sqlite3'); } catch { }
 
+// The browser-engine case needs sql.js, which the workspace only has through an5example.
+// A standalone checkout of this package skips it the same way betterSqlite3 is skipped.
+let sqlJs = null;
+try { sqlJs = require('sql.js'); } catch { }
+
 const { createAn5Adapter, setAdapterMetadata } = require(path.join(dist, 'index.js'));
 const {
   encodeVector,
@@ -326,9 +331,10 @@ async function main() {
     }
   });
 
-  await test('browser SQLite round-trips and ranks BLOBs without a Buffer global', async () => {
-    const init = require('sql.js');
-    const SQL = await init();
+  if (!sqlJs) {
+    console.log('  - skipped: sql.js is not installed');
+  } else await test('browser SQLite round-trips and ranks BLOBs without a Buffer global', async () => {
+    const SQL = await sqlJs();
     const raw = new SQL.Database();
     raw.run('CREATE TABLE documents(id TEXT PRIMARY KEY, title TEXT, embedding BLOB)');
     const { createBrowserSqliteAdapter } = require(path.join(dist, 'sqlite', 'browserEngine.js'));
