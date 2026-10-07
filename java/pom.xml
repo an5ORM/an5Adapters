@@ -17,7 +17,7 @@
 
   <groupId>io.github.an5orm</groupId>
   <artifactId>an5-adapters-java</artifactId>
-  <version>0.2.11</version>
+  <version>0.2.12</version>
   <packaging>jar</packaging>
 
   <name>AN5 ORM Java adapter</name>

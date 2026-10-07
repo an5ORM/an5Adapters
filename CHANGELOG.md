@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.12] - 2026-10-07
+
+### Changed
+- Publish the Java and Kotlin adapters to Maven Central as `io.github.an5orm:an5-adapters-java` and `io.github.an5orm:an5-adapters-kotlin`.
+  The first deployment used `org.an5orm`, which the Portal rejects unless the `an5orm.org`
+  domain is proven; `io.github.an5orm` is granted from the GitHub identity that owns the
+  repository. `0.2.11` of the Java adapter was published under the new coordinates before the
+  Kotlin runtime could follow, so the pair ships as `0.2.12`.
+
+### Fixed
+- Write the `central` server entry with `${env.…}` rather than letting `setup-java` copy the
+  variable name into `settings.xml`. The publishing plugin sends the server username as a
+  `userId` query parameter, so the Portal received `userId=MAVEN_CENTRAL_USERNAME`, read the
+  deployment as belonging to an unknown organization and refused it with `Bundle has content
+  that does NOT have a .pom file` — a complaint about the bundle while the bundle was fine.
+
 ## [0.2.11] - 2026-10-04
 
 ### Added

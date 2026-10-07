@@ -1,6 +1,6 @@
 {
   "name": "@an5/adapters",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "description": "Standalone language adapters for AN5 ORM - TypeScript, Python, .NET, Go, Rust, Java, Kotlin, Swift, and Google Sheets query execution.",
   "license": "MIT",
   "main": "dist/index.js",
@@ -74,7 +74,7 @@
     "pretest": "npm run build",
     "prepack": "npm run build",
     "build:python": "(python -m build --outdir dist-py || python3 -m build --outdir dist-py)",
-    "test": "node test/unit.test.js && node test/package.test.js && node test/nbase.test.js && node --test test/version-sync.test.js && node --test test/query-semantics.test.js && node test/query-relations.integration.test.js && node --test test/sheets-oauth.test.js",
+    "test": "node test/unit.test.js && node test/package.test.js && node test/nbase.test.js && node test/sqlite-vector.test.js && node --test test/version-sync.test.js && node --test test/query-semantics.test.js && node test/query-relations.integration.test.js && node --test test/sheets-oauth.test.js",
     "test:package:smoke": "node scripts/package-smoke.js",
     "test:integration:live": "node test/live-db.integration.test.js && node test/query-relations.integration.test.js",
     "test:python": "node scripts/python-tests.js",

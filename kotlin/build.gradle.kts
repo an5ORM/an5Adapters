@@ -9,7 +9,7 @@ plugins {
 // phone app cannot resolve is not a mobile runtime. Maven consumers can still use the
 // published Maven coordinates; this module publishes both.
 group = "io.github.an5orm"
-version = "0.2.11"
+version = "0.2.12"
 
 repositories {
     // The Java runtime is a sibling checkout, not a published artifact during development:

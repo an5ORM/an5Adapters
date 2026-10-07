@@ -68,7 +68,7 @@ dragged in three drivers would not fit.
 <dependency>
   <groupId>io.github.an5orm</groupId>
   <artifactId>an5-adapters-java</artifactId>
-  <version>0.2.11</version>
+  <version>0.2.12</version>
 </dependency>
 ```
 
@@ -91,7 +91,7 @@ rather than reimplementing it, so the dialect rules and the where builder exist 
 
 ```kotlin
 dependencies {
-    implementation("io.github.an5orm:an5-adapters-kotlin:0.2.11")
+    implementation("io.github.an5orm:an5-adapters-kotlin:0.2.12")
 }
 ```
 
@@ -113,7 +113,7 @@ secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTRAL_TOKEN` (a Central Portal tok
 ### Swift
 
 ```swift
-.package(url: "https://github.com/an5ORM/an5Adapters.git", from: "0.2.11")
+.package(url: "https://github.com/an5ORM/an5Adapters.git", from: "0.2.12")
 ```
 
 A SwiftPM package that links the **system** SQLite — the database every Apple platform
