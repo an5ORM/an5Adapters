@@ -206,6 +206,20 @@ def test_round_trip():
         rows = db.document.find_many(where={"id": {"in": ["m1", "m2"]}}, order_by={"id": "asc"})
         check("create_many encodes", [r["embedding"] for r in rows], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
         check("a non-vector column is untouched", rows[0]["title"], "a")
+
+        # `upsert` reaches create and update, so both halves have to encode.
+        db.document.upsert(
+            where={"id": "u1"},
+            create={"id": "u1", "title": "upsert", "embedding": [0.0, 1.0, 1.0]},
+            update={"embedding": [1.0, 1.0, 0.0]},
+        )
+        check("upsert create encodes", db.document.find_first(where={"id": "u1"})["embedding"], [0.0, 1.0, 1.0])
+        db.document.upsert(
+            where={"id": "u1"},
+            create={"id": "u1", "title": "upsert", "embedding": [0.0, 1.0, 1.0]},
+            update={"embedding": [1.0, 1.0, 0.0]},
+        )
+        check("upsert update encodes", db.document.find_first(where={"id": "u1"})["embedding"], [1.0, 1.0, 0.0])
         db.close()
     finally:
         cleanup(path)
