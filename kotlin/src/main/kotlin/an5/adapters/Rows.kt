@@ -147,6 +147,17 @@ fun Row.uuidOrNull(column: String): UUID? = stringOrNull(column)?.let { text ->
 /** The column's value as a [ByteArray], or `null`. */
 fun Row.bytesOrNull(column: String): ByteArray? = this[column] as? ByteArray
 
+/**
+ * The column's value as a vector, or `null` for `NULL`.
+ *
+ * A `VECTOR(n)` column holds float32 bytes, but a column written before that encoding held
+ * JSON text, so both are accepted; so is an array a driver has already decoded. Decoding is
+ * the same code the ranking query uses, which is what keeps a column readable as the vector
+ * it is stored as.
+ */
+fun Row.vectorOrNull(column: String): DoubleArray? =
+    an5.adapters.base.SqliteVectors.decodeVector(this[column], 0)
+
 private fun Row.asNumber(column: String): Number? = when (val value = this[column]) {
     null -> null
     is Number -> value

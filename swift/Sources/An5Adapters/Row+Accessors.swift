@@ -102,6 +102,16 @@ extension Row {
         return nil
     }
 
+    /// The column's value as a vector, or `nil` for `NULL`.
+    ///
+    /// A `VECTOR(n)` column holds float32 bytes, but a column written before that
+    /// encoding held JSON text, so both are accepted; so is an array a driver has
+    /// already decoded. Decoding is the same code the ranking query uses, which is
+    /// what keeps a column readable as the vector it is stored as.
+    public func vector(_ column: String) -> [Double]? {
+        SqliteVectors.decode(self[column] ?? nil)
+    }
+
     /// The eager-loaded relation rows under `relation`, or an empty list.
     public func related(_ relation: String) -> [Row] {
         (self[relation] ?? nil) as? [Row] ?? []

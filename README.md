@@ -68,7 +68,7 @@ dragged in three drivers would not fit.
 <dependency>
   <groupId>io.github.an5orm</groupId>
   <artifactId>an5-adapters-java</artifactId>
-  <version>0.2.11</version>
+  <version>0.2.13</version>
 </dependency>
 ```
 
@@ -91,7 +91,7 @@ rather than reimplementing it, so the dialect rules and the where builder exist 
 
 ```kotlin
 dependencies {
-    implementation("io.github.an5orm:an5-adapters-kotlin:0.2.11")
+    implementation("io.github.an5orm:an5-adapters-kotlin:0.2.13")
 }
 ```
 
@@ -104,8 +104,9 @@ mvn -f java/pom.xml install
 gradle -p kotlin build
 ```
 
-Both JVM modules publish to Maven Central, and `io.github.an5orm:an5-adapters-java:0.2.11`
-and `io.github.an5orm:an5-adapters-kotlin:0.2.11` are live: a `v*` tag runs the
+Both JVM modules publish to Maven Central, and each release ships both
+`io.github.an5orm:an5-adapters-java:<version>` and
+`io.github.an5orm:an5-adapters-kotlin:<version>`: a `v*` tag runs the
 `publish-maven` job in `.github/workflows/publish.yml` (`mvn -Prelease deploy` and
 `gradle publish`), and a manual run is available through the workflow's `publish-maven`
 input. It needs the repository secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTRAL_TOKEN`
@@ -114,7 +115,7 @@ input. It needs the repository secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTR
 ### Swift
 
 ```swift
-.package(url: "https://github.com/an5ORM/an5Adapters.git", from: "0.2.12")
+.package(url: "https://github.com/an5ORM/an5Adapters.git", from: "0.2.13")
 ```
 
 A SwiftPM package that links the **system** SQLite — the database every Apple platform

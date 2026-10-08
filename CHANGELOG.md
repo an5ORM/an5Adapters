@@ -1,8 +1,9 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.13] - 2026-10-08
 
 ### Added
+- ship the native vector extension and fix the Swift runtime compile (30ad5dd)
 - Ship a portable C SQLite extension under `native/sqlite` for cosine, Euclidean
   and negative-dot-product distances over float32 BLOBs or legacy JSON text.
   It uses SSE2 on x86-64, double-precision accumulation and SQLite auxdata to cache
@@ -28,15 +29,70 @@
   Rust), `SqliteVectors.EncodeVector` / `DecodeVector` (.NET), `EncodeVector` / `DecodeVector`
   (Go), `SqliteVectors.encodeVector` / `decodeVector` (Java, and Kotlin over the same JVM
   runtime) and `SqliteVectors.encode` / `decode` (Swift).
+- Publish the Java and Kotlin adapters to Maven Central: a `publish-maven` job on `v*` tags
+  (and through the workflow's dispatch input) builds both manifests first, then uploads the
+  Java module with `-Prelease` — sources, javadoc, detached signatures, `central-publishing` —
+  and the Kotlin module with `maven-publish` and in-memory signing. A tag that does not match
+  the module versions fails before anything is uploaded.
+- Build a checkout with Gradle: `build.gradle.kts` now declares `mavenLocal()`, so the Java
+  sibling resolves from `~/.m2` after `mvn -f java/pom.xml install` instead of being looked
+  up on a repository that does not have it yet.
+- Run the Kotlin manifest through Gradle in CI (`test:gradle`), because `useJUnitPlatform()`
+  without an engine and a broken repository block compile fine under `kotlinc` and fail on a
+  Gradle consumer's machine.
+- Extend the version sync test to `java/pom.xml` and `kotlin/build.gradle.kts`, which are
+  maintained by hand and now publish: a stale one would ask Central for a version that
+  already exists.
+- **A shared query-semantics contract.** One 12-case fixture
+  (`test/fixtures/query-semantics.json`) is now executed by the TypeScript SQL builder,
+  the Google Sheets matcher, Python, Go, Rust and .NET — the first cross-language parity
+  contract for query semantics rather than five separate interpretations.
+- Real SQLite runtime tests for Python, Go, Rust and .NET. `test:python` ran
+  `compileall` only and now executes the query-semantics and smoke suites; the Rust gate
+  runs `cargo test` instead of `cargo check`; `golang/base/where_test.go` runs the shared
+  fixture through `BuildWhere`, executing the SQL with Python's stdlib SQLite to stay
+  driver-neutral. It therefore requires `python3` on `PATH`.
+- `test/query-relations.integration.test.js` covers `some`+`none` combined, `every`, two
+  relations to the same model, a nullable to-one, and transaction rollback — against
+  SQLite, and against PostgreSQL, SQL Server and MySQL when their URLs are set.
+- A `TEST_METADATA_LOCK` in the Rust unit tests, which mutate process-global metadata and
+  were racing.
 
 ### Changed
+- Update `dotnet/Mssql/MssqlEngine.cs`.
+- Update `rust/src/adapter.rs`.
+- Update `java/pom.xml`.
+- Update `kotlin/build.gradle.kts`.
+- Update `kotlin/src/main/kotlin/an5/adapters/Rows.kt`.
+- Update `pyproject.toml`.
+- Update `README.md`.
+- Update `rust/tests/sqlite_vector.rs`.
+- Update `swift/Sources/An5Adapters/Row+Accessors.swift`.
+- skip the sql.js browser case when the workspace does not ship it (6083660)
 - A `number[]` written to a `VECTOR(n)` column is encoded to the float32 BLOB, which is about
   a third of the JSON text it replaces, and read back as numbers. A column that already holds
   JSON text is still decoded, so an existing database needs no migration.
 - `vectorSearch` on a row that cannot be scored leaves it out of the result. It was previously
   returned with a null distance on some providers.
+- **`mysql2` is now a declared optional peer dependency.** Consumers of the MySQL engine
+  must install it themselves; the engine already failed with a clear error. `googleapis`
+  moves to 183.x.
+- SQLite connection-string detection is consistent across TypeScript, Go, Rust and Python.
 
 ### Fixed
+- A vector written and read through the Rust `create` came back in its stored form, so a
+  generated model typed `Option<Vec<f32>>` failed to deserialize with `invalid type: map,
+  expected a sequence`. The inserted row now goes through the same decoding a `find` applies.
+- The Kotlin runtime had no accessor for a `VECTOR(n)` column, so a generated client read it
+  as text. `Row.vectorOrNull` decodes a float32 BLOB or the older JSON text into a
+  `DoubleArray`, using the same code the ranking query uses.
+- The Swift runtime had no accessor either. `Row.vector` reads a float32 BLOB, a legacy JSON
+  column or an array the driver already decoded, so a column is readable as the vector it is
+  stored as.
+- The SQL Server engine bound a `float[]` verbatim and the provider has no mapping for it,
+  which failed with `No mapping exists from object type System.Single[]`. A vector is now bound
+  as the JSON array SQL Server transmits over TDS, and a `VECTOR` column is decoded into
+  `float[]` on read instead of being left null.
 - Swift vector search no longer breaks the build. The registered distance callback called an
   instance method, which Swift rejects because a C function pointer cannot capture `Self`; it
   also read the metric from the callback context instead of the user-data pointer, and read
@@ -51,6 +107,33 @@
 - An `update`/`updateMany` whose value is a `Buffer` or `Uint8Array` no longer reads it as a
   Prisma-style `{ set: … }` operator. `TypedArray.prototype.set` is the copy method, so the
   value became an unbound parameter and SQLite rejected the statement.
+- **Query composition behaved differently from what it said, identically in all five
+  runtimes.** `OR: []` silently dropped the clause and returned every row; it now matches
+  no rows. An empty branch inside an `OR` was dropped; it is a true disjunct and now
+  matches every row. `NOT` over an array was built as `NOT (a AND b)`, matching only rows
+  that fail *every* condition; it now excludes each branch, `NOT (a OR b)`. `NOT: {}` now
+  matches no rows. A filter value of `undefined` is skipped instead of corrupting the
+  clause. `AND` accepts a bare object, not only an array.
+  **This changes results.** Queries relying on `OR: []` returning every row, or on the old
+  `NOT`-over-an-array behaviour, will return different rows.
+- **Relation filters overwrote each other's bound parameters** — every quantifier
+  (`some`, `none`, `every`, `is`, `isNot`) now gets its own parameter prefix, so two
+  relations pointing at the same model no longer clobber each other's values.
+- **`is: null` and `isNot: null` were inverted for to-one relations** — `is: null` now
+  means *no related row* (`NOT EXISTS`) and `isNot: null` means *a related row exists*
+  (`EXISTS`).
+- **A relation whose name contains an underscore was treated as a compound key** — the
+  key was destructured into the parent clause. TypeScript now checks the relation map
+  first, and the Google Sheets matcher uses the full operator list instead of a partial
+  one, which also preserves falsy operands such as `{ total_score: { equals: 0 } }`.
+- **Google Sheets string operators skipped empty cells** — `contains`, `startsWith` and
+  `endsWith` no longer match a `null`/empty cell, `''` matches an empty cell, and nested
+  `not`, bare-object `AND` and `notIn` are supported.
+- **Rust and Python kept the SQL Server `dbo.` prefix under SQLite** — both strip it now.
+  Rust additionally parses dots inside quoted identifiers instead of splitting on every
+  dot, so `[dot.name]` survives.
+- **`sqlite:` and `:memory:` connection strings were not detected as SQLite** in
+  TypeScript; both are recognised now.
 
 ## [0.2.12] - 2026-10-07
 
@@ -101,76 +184,6 @@
 
 
 - Align query composition across TypeScript, Python, .NET, Go and Rust.
-
-## [Unreleased]
-
-### Added
-- Publish the Java and Kotlin adapters to Maven Central: a `publish-maven` job on `v*` tags
-  (and through the workflow's dispatch input) builds both manifests first, then uploads the
-  Java module with `-Prelease` — sources, javadoc, detached signatures, `central-publishing` —
-  and the Kotlin module with `maven-publish` and in-memory signing. A tag that does not match
-  the module versions fails before anything is uploaded.
-- Build a checkout with Gradle: `build.gradle.kts` now declares `mavenLocal()`, so the Java
-  sibling resolves from `~/.m2` after `mvn -f java/pom.xml install` instead of being looked
-  up on a repository that does not have it yet.
-- Run the Kotlin manifest through Gradle in CI (`test:gradle`), because `useJUnitPlatform()`
-  without an engine and a broken repository block compile fine under `kotlinc` and fail on a
-  Gradle consumer's machine.
-- Extend the version sync test to `java/pom.xml` and `kotlin/build.gradle.kts`, which are
-  maintained by hand and now publish: a stale one would ask Central for a version that
-  already exists.
-
-### Fixed
-- **Query composition behaved differently from what it said, identically in all five
-  runtimes.** `OR: []` silently dropped the clause and returned every row; it now matches
-  no rows. An empty branch inside an `OR` was dropped; it is a true disjunct and now
-  matches every row. `NOT` over an array was built as `NOT (a AND b)`, matching only rows
-  that fail *every* condition; it now excludes each branch, `NOT (a OR b)`. `NOT: {}` now
-  matches no rows. A filter value of `undefined` is skipped instead of corrupting the
-  clause. `AND` accepts a bare object, not only an array.
-
-  **This changes results.** Queries relying on `OR: []` returning every row, or on the old
-  `NOT`-over-an-array behaviour, will return different rows.
-- **Relation filters overwrote each other's bound parameters** — every quantifier
-  (`some`, `none`, `every`, `is`, `isNot`) now gets its own parameter prefix, so two
-  relations pointing at the same model no longer clobber each other's values.
-- **`is: null` and `isNot: null` were inverted for to-one relations** — `is: null` now
-  means *no related row* (`NOT EXISTS`) and `isNot: null` means *a related row exists*
-  (`EXISTS`).
-- **A relation whose name contains an underscore was treated as a compound key** — the
-  key was destructured into the parent clause. TypeScript now checks the relation map
-  first, and the Google Sheets matcher uses the full operator list instead of a partial
-  one, which also preserves falsy operands such as `{ total_score: { equals: 0 } }`.
-- **Google Sheets string operators skipped empty cells** — `contains`, `startsWith` and
-  `endsWith` no longer match a `null`/empty cell, `''` matches an empty cell, and nested
-  `not`, bare-object `AND` and `notIn` are supported.
-- **Rust and Python kept the SQL Server `dbo.` prefix under SQLite** — both strip it now.
-  Rust additionally parses dots inside quoted identifiers instead of splitting on every
-  dot, so `[dot.name]` survives.
-- **`sqlite:` and `:memory:` connection strings were not detected as SQLite** in
-  TypeScript; both are recognised now.
-
-### Added
-- **A shared query-semantics contract.** One 12-case fixture
-  (`test/fixtures/query-semantics.json`) is now executed by the TypeScript SQL builder,
-  the Google Sheets matcher, Python, Go, Rust and .NET — the first cross-language parity
-  contract for query semantics rather than five separate interpretations.
-- Real SQLite runtime tests for Python, Go, Rust and .NET. `test:python` ran
-  `compileall` only and now executes the query-semantics and smoke suites; the Rust gate
-  runs `cargo test` instead of `cargo check`; `golang/base/where_test.go` runs the shared
-  fixture through `BuildWhere`, executing the SQL with Python's stdlib SQLite to stay
-  driver-neutral. It therefore requires `python3` on `PATH`.
-- `test/query-relations.integration.test.js` covers `some`+`none` combined, `every`, two
-  relations to the same model, a nullable to-one, and transaction rollback — against
-  SQLite, and against PostgreSQL, SQL Server and MySQL when their URLs are set.
-- A `TEST_METADATA_LOCK` in the Rust unit tests, which mutate process-global metadata and
-  were racing.
-
-### Changed
-- **`mysql2` is now a declared optional peer dependency.** Consumers of the MySQL engine
-  must install it themselves; the engine already failed with a clear error. `googleapis`
-  moves to 183.x.
-- SQLite connection-string detection is consistent across TypeScript, Go, Rust and Python.
 
 ## [0.2.9] - 2026-10-02
 

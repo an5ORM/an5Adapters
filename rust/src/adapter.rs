@@ -687,7 +687,14 @@ impl TableClient {
         );
 
         match self.adapter.query_raw(&sql, &args).await {
-            Ok(rows) if !rows.is_empty() => Ok(rows.into_iter().next().unwrap()),
+            Ok(rows) if !rows.is_empty() => {
+                // The inserted row comes back with the vector still in its stored form,
+                // so it needs the same decoding a `find` would apply. Without it the
+                // caller receives the internal blob envelope where the vector should be.
+                Ok(self
+                    .decode_vector_rows(vec![rows.into_iter().next().unwrap()])
+                    .remove(0))
+            }
             // The engine rejected the returning clause; insert without it.
             _ => {
                 let sql = format!(

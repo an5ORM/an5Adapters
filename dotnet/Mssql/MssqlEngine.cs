@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Globalization;
 using System.Reflection;
 using Microsoft.Data.SqlClient;
 
@@ -34,6 +35,33 @@ namespace An5Orm
             return conn;
         }
 
+        /// <summary>
+        /// Converts a value into something SqlClient can bind.
+        /// </summary>
+        /// <remarks>
+        /// A <c>VECTOR</c> column is transmitted as a JSON array over TDS, so a float or
+        /// double array is written in that form. Binding the array itself is not an option:
+        /// SqlClient has no mapping for it, and the failure names the array rather than the
+        /// column. Driver versions before 6.1 have no <c>SqlVector</c> either, so the JSON
+        /// form is what every version accepts.
+        /// </remarks>
+        private static object BindableValue(object value)
+        {
+            if (value is float[] floats)
+            {
+                var parts = new string[floats.Length];
+                for (int i = 0; i < floats.Length; i++) parts[i] = floats[i].ToString("R", CultureInfo.InvariantCulture);
+                return "[" + string.Join(", ", parts) + "]";
+            }
+            if (value is double[] doubles)
+            {
+                var parts = new string[doubles.Length];
+                for (int i = 0; i < doubles.Length; i++) parts[i] = doubles[i].ToString("R", CultureInfo.InvariantCulture);
+                return "[" + string.Join(", ", parts) + "]";
+            }
+            return value;
+        }
+
         private SqlCommand BuildCommand(
             SqlConnection conn, string sql, Dictionary<string, object> parameters)
         {
@@ -44,7 +72,7 @@ namespace An5Orm
                 foreach (var kv in parameters)
                 {
                     var paramName = kv.Key.StartsWith("@") ? kv.Key : "@" + kv.Key;
-                    cmd.Parameters.AddWithValue(paramName, kv.Value ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue(paramName, BindableValue(kv.Value) ?? DBNull.Value);
                 }
             }
             return cmd;
@@ -89,6 +117,19 @@ namespace An5Orm
                         if (!HasColumn(reader, prop.Name)) continue;
                         var val = reader[prop.Name];
                         if (val == DBNull.Value) continue;
+                        // A `VECTOR` column arrives as a JSON array, which no converter
+                        // bridges to the `float[]` the entity declares.
+                        if (prop.PropertyType == typeof(float[]))
+                        {
+                            var vector = SqliteVectors.DecodeVector(val);
+                            if (vector != null)
+                            {
+                                var floats = new float[vector.Count];
+                                for (int i = 0; i < vector.Count; i++) floats[i] = (float)vector[i];
+                                prop.SetValue(item, floats);
+                                continue;
+                            }
+                        }
                         try { prop.SetValue(item, Convert.ChangeType(val, prop.PropertyType)); } catch { }
                     }
                     results.Add(item);

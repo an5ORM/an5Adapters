@@ -237,7 +237,17 @@ async fn a_vector_column_round_trips() {
     data.insert("id".to_string(), Value::from("d9"));
     data.insert("title".to_string(), Value::from("written"));
     data.insert("embedding".to_string(), json!([0.25, 0.5, 1.0]));
-    client.create(&data).await.expect("create");
+    let inserted = client.create(&data).await.expect("create");
+
+    // The inserted row has to come back decoded, not as the blob envelope the
+    // database stores: a generated model typed `Option<Vec<f32>>` fails to
+    // deserialize a map.
+    let returned = inserted
+        .get("embedding")
+        .and_then(Value::as_array)
+        .expect("the created row returns the vector as an array of numbers");
+    assert_eq!(returned.len(), 3);
+    assert!((returned[0].as_f64().unwrap() - 0.25).abs() < 1e-6);
 
     // A float64 array is written as a BLOB, so the column stays compact.
     let stored: Vec<RowMap> = db
