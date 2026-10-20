@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- Use standard ORM model delegate properties (`db.article.*` and `db.document.*`) instead of `db.table('...')` in the NBase and SQLite vector search documentation examples in `README.md` and `native/sqlite/README.md`.
+
 ## [0.2.13] - 2026-10-08
 
 ### Added

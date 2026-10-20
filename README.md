@@ -169,7 +169,7 @@ returns the NBase hits — id, metadata and `distance` — instead of table rows
 With an `nbase://` connection string, search returns the hits themselves:
 
 ```ts
-const hits = await db.table('Article').vectorSearch({ vector: queryEmbedding, take: 5 });
+const hits = await db.article.vectorSearch({ vector: queryEmbedding, take: 5 });
 // hits[0] = { id: 'Article:42', an5Id: '42', an5Model: 'Article', distance: 0.11 }
 ```
 
@@ -185,10 +185,10 @@ const db = createAn5Adapter({
   nbase: 'nbase://localhost:1307',
 });
 
-await db.table('Article').indexVectorsInNBase({ vectorField: 'embedding' });
+await db.article.indexVectorsInNBase({ vectorField: 'embedding' });
 // → { indexed: 1200 }
 
-const hits = await db.table('Article').vectorSearch({ vector: queryEmbedding, take: 5 });
+const hits = await db.article.vectorSearch({ vector: queryEmbedding, take: 5 });
 // hits[0] = { id, title, ..., distance }
 ```
 
@@ -229,9 +229,9 @@ that already holds JSON text (`'[0.1, 0.2]'`) keeps working, so nothing has to
 be migrated.
 
 ```ts
-await db.table('Article').create({ data: { title: '…', embedding: queryEmbedding } });
+await db.article.create({ data: { title: '…', embedding: queryEmbedding } });
 
-const row = await db.table('Article').findFirst({ where: { title: '…' } });
+const row = await db.article.findFirst({ where: { title: '…' } });
 row.embedding; // number[]
 ```
 

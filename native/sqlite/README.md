@@ -63,7 +63,7 @@ const db = createAn5Adapter({
   connectionString: 'sqlite:///app.db',
   sqliteVec: '/absolute/path/an5_vector.so', // .dylib / .dll on other platforms
 });
-await db.table('Document').vectorSearch({ vector: query, take: 10 });
+await db.document.vectorSearch({ vector: query, take: 10 });
 ```
 
 ```python
