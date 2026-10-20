@@ -28,3 +28,4 @@ swift/.build/
 java/target/
 kotlin/.gradle/
 kotlin/build/
+kotlin/.kotlin/
