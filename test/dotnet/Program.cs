@@ -268,6 +268,15 @@ internal static class Program
                 parameters: new Dictionary<string, object> { ["id"] = "d3" });
             Check("a where filter applies", string.Join(",", whereHits.Select(h => h.Item.Id)), "d3");
 
+            var argsWhereHits = vecDocs.VectorSearch(new VectorSearchArgs
+            {
+                Vector = new List<double> { 1, 0, 0 },
+                Take = 5,
+                VectorField = "Embedding",
+                Where = new Dictionary<string, object> { ["Id"] = "d2" },
+            });
+            Check("VectorSearchArgs Where filter applies", string.Join(",", argsWhereHits.Select(h => h.Item.Id)), "d2");
+
             vecAdapter.Dispose();
 
             // `VectorStrategy` pins the plan, so a project can force the in-process

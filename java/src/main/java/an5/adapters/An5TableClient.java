@@ -486,7 +486,6 @@ public class An5TableClient {
     int limit = take == null ? 10 : take;
     String field = vectorField == null || vectorField.isEmpty() ? "embedding" : vectorField;
     String distanceMetric = metric == null || metric.isEmpty() ? "cosine" : metric;
-    int dimension = vector.length;
 
     Map<String, Object> params = new LinkedHashMap<String, Object>();
     SqlBuilder.Where clause = SqlBuilder.parseWhere(where, dialect, params, "");

@@ -313,17 +313,14 @@ class SqliteVectorSupport:
         Checked only for the `sql` strategy, where a legacy JSON column that has
         since taken new float32 rows would otherwise rank just the old ones.
         """
-        key = f"{table}.{column}"
-        if key not in self._has_binary_rows:
-            clause = (tail + " AND ") if tail else " WHERE "
-            try:
-                rows = exec_fn(
-                    f"SELECT 1 FROM {table}{clause}typeof({column}) = 'blob' LIMIT 1",
-                    list(params))
-                self._has_binary_rows[key] = bool(rows)
-            except Exception:
-                self._has_binary_rows[key] = False
-        return self._has_binary_rows[key]
+        clause = (tail + " AND ") if tail else " WHERE "
+        try:
+            rows = exec_fn(
+                f"SELECT 1 FROM {table}{clause}typeof({column}) = 'blob' LIMIT 1",
+                list(params))
+            return bool(rows)
+        except Exception:
+            return False
 
     def capabilities(self) -> Dict[str, bool]:
         """Probes once and caches the answer."""
@@ -415,7 +412,7 @@ def run_sqlite_vector_search(
                 else read_sqlite_column_type(exec_fn, raw_table, raw_column))
     for strategy in plan_sqlite_vector_strategies(caps, declared, preference):
         if strategy == STRATEGY_SQL:
-            binary = (support.has_binary_rows(exec_fn, raw_table, raw_column, tail, list(params or []))
+            binary = (support.has_binary_rows(exec_fn, table, column, tail, list(params or []))
                       if support is not None
                       else bool(exec_fn("SELECT 1 FROM " + table + (tail + " AND " if tail else " WHERE ")
                                         + f"typeof({column}) = 'blob' LIMIT 1", list(params or []))))

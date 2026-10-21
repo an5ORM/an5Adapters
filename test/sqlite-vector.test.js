@@ -323,9 +323,26 @@ async function main() {
     const file = makeDb({ declared: 'TEXT', store: 'json' });
     const db = adapter(file, { vectorStrategy: 'sql' });
     try {
+      const initial = await db.document.vectorSearch({ vector: [1, 0, 0], take: 10 });
+      assert.deepStrictEqual(initial.map(r => r.id), ['d1', 'd2', 'd3']);
       await db.document.create({ data: { id: 'new', title: 'new', embedding: [1, 0, 0] } });
       const rows = await db.document.vectorSearch({ vector: [1, 0, 0], take: 10 });
       assert.deepStrictEqual(rows.map(r => r.id).sort(), ['d1', 'd2', 'd3', 'new']);
+    } finally {
+      await db.$disconnect();
+    }
+  });
+
+  await test('per-query vectorStrategy and transactions preserve vector search support', async () => {
+    const file = makeDb();
+    const db = adapter(file);
+    try {
+      const memRows = await db.document.vectorSearch({ vector: [1, 0, 0], take: 2, vectorStrategy: 'memory' });
+      assert.deepStrictEqual(memRows.map(r => r.id), ['d1', 'd2']);
+      await db.$transaction(async (tx) => {
+        const txRows = await tx.document.vectorSearch({ vector: [1, 0, 0], take: 2 });
+        assert.deepStrictEqual(txRows.map(r => r.id), ['d1', 'd2']);
+      });
     } finally {
       await db.$disconnect();
     }

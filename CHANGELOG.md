@@ -5,6 +5,14 @@
 ### Changed
 - Use standard ORM model delegate properties (`db.article.*` and `db.document.*`) instead of `db.table('...')` in the NBase and SQLite vector search documentation examples in `README.md` and `native/sqlite/README.md`.
 
+## [0.2.14] - 2026-10-21
+
+### Fixed
+- **TypeScript `vectorSearch` per-query strategy, browser config, and transaction support** — `AdapterTableClient.vectorSearch` now honors a per-query `args.vectorStrategy` override ahead of the adapter-level `vectorStrategy` and falls back to `support.options.vectorStrategy` when opened through `createBrowserSqliteAdapter`. `An5AdapterTx` now forwards `sqliteVectorSupport()` and `vectorStrategy` from the parent adapter so `tx.<model>.vectorSearch(...)` inside `$transaction` or `$begin` continues to rank in-database through `udf`, `native` or `sqlite-vec` instead of falling back to in-memory scoring.
+- **TypeScript and Python `hasBinaryRows` / `has_binary_rows` quoting and cache invalidation** — `runSqliteVectorSearch` and `run_sqlite_vector_search` now pass the quoted table and column identifiers to `hasBinaryRows` / `has_binary_rows` instead of the raw names, and check for `blob` rows per query rather than caching an initial `false` forever. Inserting a float32 `BLOB` row into a legacy `TEXT` column after an earlier `sql` (`json_each`) search now switches strategies instead of missing the new binary row.
+- **.NET `VectorSearch(VectorSearchArgs)` `Where` filter** — `AdapterTableClient<T>.VectorSearch(VectorSearchArgs)` now parses `args.Where` with `SqlBuilder.ParseWhere` and forwards the resulting predicate and parameters instead of passing `null`.
+- Remove an unused `dimension` local variable in Java `An5TableClient.vectorSearch`.
+
 ## [0.2.13] - 2026-10-08
 
 ### Added

@@ -411,7 +411,7 @@ export class An5Adapter {
 
   /** `vectorStrategy` from the config, so a project can pin one strategy. */
   get vectorStrategy(): VectorStrategyPreference | undefined {
-    return this._engineConfig?.vectorStrategy;
+    return this._engineConfig?.vectorStrategy ?? (this.engine as any)?.vectorSupport?.options?.vectorStrategy;
   }
 
   /** INTERNAL: used by AdapterTableClient for DML statements needing row count */
@@ -500,7 +500,7 @@ export class An5Adapter {
     if (Array.isArray(fn)) return Promise.all(fn);
     const engine = await this.requireEngine();
     const handle = await engine.beginTransaction();
-    const txAdapter = new An5AdapterTx(handle, this.dialect);
+    const txAdapter = new An5AdapterTx(handle, this.dialect, engine.vectorSupport ?? null, this.vectorStrategy);
     try {
       const result = await fn(txAdapter);
       await handle.commit();
@@ -516,7 +516,7 @@ export class An5Adapter {
       throw new Error('Interactive transactions are not supported by the Google Sheets adapter');
     }
     const engine = await this.requireEngine();
-    return new An5AdapterTx(await engine.beginTransaction(), this.dialect);
+    return new An5AdapterTx(await engine.beginTransaction(), this.dialect, engine.vectorSupport ?? null, this.vectorStrategy);
   }
 
   table<T = any>(modelName: string): AdapterTableClient<T> | SheetsTableClient<T> {
@@ -714,8 +714,14 @@ export class An5AdapterTx {
   constructor(
     private readonly handle: TransactionHandle,
     public readonly dialect: Dialect,
+    private readonly parentVectorSupport: SqliteVectorSupport | null = null,
+    public readonly vectorStrategy?: VectorStrategyPreference | undefined,
   ) {
     return createAdapterProxy(this, (name) => this.table(name));
+  }
+
+  async sqliteVectorSupport(): Promise<SqliteVectorSupport | null> {
+    return this.dialect === 'sqlite' ? this.parentVectorSupport : null;
   }
 
   async exec<T = any>(query: string, params?: Record<string, any>): Promise<T[]> {
@@ -1462,6 +1468,7 @@ export class AdapterTableClient<T = any> {
     vectorField?: string;
     distanceMetric?: 'cosine' | 'euclidean' | 'dot';
     vectorElementType?: 'float32' | 'float16' | 'uint8';
+    vectorStrategy?: VectorStrategyPreference;
   }): Promise<(T & { distance: number })[]> {
     const vectorField = args.vectorField || 'embedding';
     const METRICS = ['cosine', 'euclidean', 'dot'];
@@ -1521,7 +1528,7 @@ export class AdapterTableClient<T = any> {
         take,
         tail: whereSql ? ` WHERE ${whereSql}` : '',
         params,
-        preference: (this.adapter as any).vectorStrategy,
+        preference: args.vectorStrategy ?? (this.adapter as any).vectorStrategy ?? support?.options?.vectorStrategy,
       });
       if (ranked) return this.decodeVectorFields(ranked.rows) as (T & { distance: number })[];
       // No in-database strategy: score the column in the client instead.

@@ -908,7 +908,20 @@ namespace An5Orm
         public List<(T Item, double Distance)> VectorSearch(VectorSearchArgs args)
         {
             args ??= new VectorSearchArgs();
-            return VectorSearch(args.Vector, args.Take, null, null, args.VectorField, args.DistanceMetric);
+            Dictionary<string, object> parameters = null;
+            string whereSql = null;
+            if (args.Where != null)
+            {
+                parameters = new Dictionary<string, object>();
+                whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect);
+            }
+            return VectorSearch(
+                args.Vector,
+                args.Take,
+                string.IsNullOrEmpty(whereSql) ? null : whereSql,
+                parameters,
+                args.VectorField,
+                args.DistanceMetric);
         }
 
         public T FindFirst(string whereClause = null, Dictionary<string, object> parameters = null, string orderBy = null)

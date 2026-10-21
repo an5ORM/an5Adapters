@@ -422,15 +422,11 @@ export class SqliteVectorSupport {
     tail: string,
     params: Record<string, any>,
   ): Promise<boolean> {
-    const key = `${table}.${column}`;
-    if (!this.binaryRows.has(key)) {
-      const rows = await exec(
-        `SELECT 1 FROM ${table}${tail ? `${tail} AND` : ' WHERE'} typeof(${column}) = 'blob' LIMIT 1`,
-        params,
-      ).catch(() => []);
-      this.binaryRows.set(key, rows.length > 0);
-    }
-    return this.binaryRows.get(key) === true;
+    const rows = await exec(
+      `SELECT 1 FROM ${table}${tail ? `${tail} AND` : ' WHERE'} typeof(${column}) = 'blob' LIMIT 1`,
+      params,
+    ).catch(() => []);
+    return rows.length > 0;
   }
 
   reset(): void {
@@ -510,7 +506,7 @@ export async function runSqliteVectorSearch(
   for (const strategy of planSqliteVectorStrategies(caps, declaredType, args.preference)) {
     if (strategy === 'sql') {
       const binary = args.vectorSupport
-        ? await args.vectorSupport.hasBinaryRows(args.exec, args.rawTable, args.rawColumn, args.tail ?? '', args.params)
+        ? await args.vectorSupport.hasBinaryRows(args.exec, args.table, args.column, args.tail ?? '', args.params)
         : (await args.exec(
             `SELECT 1 FROM ${args.table}${args.tail ? `${args.tail} AND` : ' WHERE'} typeof(${args.column}) = 'blob' LIMIT 1`,
             args.params,

@@ -68,7 +68,7 @@ dragged in three drivers would not fit.
 <dependency>
   <groupId>io.github.an5orm</groupId>
   <artifactId>an5-adapters-java</artifactId>
-  <version>0.2.13</version>
+  <version>0.2.14</version>
 </dependency>
 ```
 
@@ -91,7 +91,7 @@ rather than reimplementing it, so the dialect rules and the where builder exist 
 
 ```kotlin
 dependencies {
-    implementation("io.github.an5orm:an5-adapters-kotlin:0.2.13")
+    implementation("io.github.an5orm:an5-adapters-kotlin:0.2.14")
 }
 ```
 
@@ -115,7 +115,7 @@ input. It needs the repository secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTR
 ### Swift
 
 ```swift
-.package(url: "https://github.com/an5ORM/an5Adapters.git", from: "0.2.13")
+.package(url: "https://github.com/an5ORM/an5Adapters.git", from: "0.2.14")
 ```
 
 A SwiftPM package that links the **system** SQLite — the database every Apple platform
@@ -260,7 +260,8 @@ const db = createAn5Adapter({
 ```
 
 `vectorStrategy` pins one strategy instead of probing — `'auto'` (the default),
-`'sqlite-vec'`, `'udf'`, `'sql'` or `'memory'`. Every other runtime implements
+`'sqlite-vec'`, `'udf'`, `'sql'` or `'memory'`. In TypeScript it can also be
+supplied per query on `vectorSearch`. Every other runtime implements
 the same four strategies with the same order; `sqlx` (Rust) and JDBC (Java,
 Kotlin) use `sql` for JSON text and `memory` for BLOB columns without
 driver-specific vector functions.
