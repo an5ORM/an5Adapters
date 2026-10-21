@@ -12,6 +12,7 @@
 - **TypeScript and Python `hasBinaryRows` / `has_binary_rows` quoting and cache invalidation** — `runSqliteVectorSearch` and `run_sqlite_vector_search` now pass the quoted table and column identifiers to `hasBinaryRows` / `has_binary_rows` instead of the raw names, and check for `blob` rows per query rather than caching an initial `false` forever. Inserting a float32 `BLOB` row into a legacy `TEXT` column after an earlier `sql` (`json_each`) search now switches strategies instead of missing the new binary row.
 - **.NET `VectorSearch(VectorSearchArgs)` `Where` filter** — `AdapterTableClient<T>.VectorSearch(VectorSearchArgs)` now parses `args.Where` with `SqlBuilder.ParseWhere` and forwards the resulting predicate and parameters instead of passing `null`.
 - Remove an unused `dimension` local variable in Java `An5TableClient.vectorSearch`.
+- Upgrade `org.sonatype.central:central-publishing-maven-plugin` from `0.8.0` to `0.12.0` in `java/pom.xml` so Maven 3.10+ strips `maven-metadata-local.xml` and `_remote.repositories` before bundling for the Central Publisher Portal.
 
 ## [0.2.13] - 2026-10-08
 
