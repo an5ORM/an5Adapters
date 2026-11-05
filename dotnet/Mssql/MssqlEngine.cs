@@ -59,6 +59,31 @@ namespace An5Orm
                 for (int i = 0; i < doubles.Length; i++) parts[i] = doubles[i].ToString("R", CultureInfo.InvariantCulture);
                 return "[" + string.Join(", ", parts) + "]";
             }
+            if (value is ReadOnlyMemory<float> romFloats)
+            {
+                return BindableValue(romFloats.ToArray());
+            }
+            if (value is Memory<float> memFloats)
+            {
+                return BindableValue(memFloats.ToArray());
+            }
+            if (value is ReadOnlyMemory<double> romDoubles)
+            {
+                return BindableValue(romDoubles.ToArray());
+            }
+            if (value is Memory<double> memDoubles)
+            {
+                return BindableValue(memDoubles.ToArray());
+            }
+            if (value != null && value.GetType().Name.StartsWith("SqlVector"))
+            {
+                var memProp = value.GetType().GetProperty("Memory");
+                if (memProp != null)
+                {
+                    var memVal = memProp.GetValue(value);
+                    if (memVal != null) return BindableValue(memVal);
+                }
+            }
             return value;
         }
 

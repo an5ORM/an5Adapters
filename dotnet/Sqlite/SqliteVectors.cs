@@ -67,6 +67,14 @@ namespace An5Orm
                     return array.Length > 0 ? array.ToList() : null;
                 case float[] floats:
                     return floats.Length > 0 ? floats.Select(f => (double)f).ToList() : null;
+                case ReadOnlyMemory<float> romFloats:
+                    return romFloats.Length > 0 ? romFloats.ToArray().Select(f => (double)f).ToList() : null;
+                case Memory<float> memFloats:
+                    return memFloats.Length > 0 ? memFloats.ToArray().Select(f => (double)f).ToList() : null;
+                case ReadOnlyMemory<double> romDoubles:
+                    return romDoubles.Length > 0 ? romDoubles.ToArray().ToList() : null;
+                case Memory<double> memDoubles:
+                    return memDoubles.Length > 0 ? memDoubles.ToArray().ToList() : null;
                 case byte[] bytes:
                     return DecodeVector(bytes);
                 case string text:
@@ -78,6 +86,15 @@ namespace An5Orm
                     try { return ParseVector(seq.Cast<object>().Select(o => Convert.ToDouble(o)).ToList()); }
                     catch { return null; }
                 default:
+                    if (value.GetType().Name.StartsWith("SqlVector"))
+                    {
+                        var memProp = value.GetType().GetProperty("Memory");
+                        if (memProp != null)
+                        {
+                            var memVal = memProp.GetValue(value);
+                            if (memVal != null) return ParseVector(memVal);
+                        }
+                    }
                     return null;
             }
         }

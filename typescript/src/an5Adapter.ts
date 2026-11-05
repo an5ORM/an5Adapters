@@ -1550,6 +1550,7 @@ export class AdapterTableClient<T = any> {
           msg.includes('pgvector') ||
           msg.includes('operator does not exist') ||
           msg.includes('limit of 1998') ||
+          msg.includes('limit of 3996') ||
           err?.number === 195 ||
           err?.number === 102 ||
           err?.number === 319 ||

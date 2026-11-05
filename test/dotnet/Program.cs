@@ -196,6 +196,8 @@ internal static class Program
         Check("legacy JSON text", string.Join(",", SqliteVectors.DecodeVector("[1, 0, 0]")), "1,0,0");
         Check("already a list", SqliteVectors.DecodeVector(new List<double> { 1, 2 }).Count, 2);
         Check("already a float array", SqliteVectors.DecodeVector(new float[] { 1, 2, 3 })[2], 3.0);
+        Check("read-only memory float", SqliteVectors.DecodeVector(new ReadOnlyMemory<float>(new float[] { 1, 2, 3 }))[2], 3.0);
+        Check("read-only memory double", SqliteVectors.DecodeVector(new ReadOnlyMemory<double>(new double[] { 1, 2, 3 }))[2], 3.0);
         Check("rejects a partial blob", SqliteVectors.DecodeVector(new byte[3]) == null, true);
         Check("rejects text that is not JSON", SqliteVectors.DecodeVector("nope") == null, true);
         Check("cosine of a vector with itself", Math.Round(SqliteVectors.VectorDistance(new List<double> { 1, 0 }, new List<double> { 1, 0 }, "cosine").Value, 9), 0.0);

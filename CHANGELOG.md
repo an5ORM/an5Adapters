@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.15] - 2026-11-05
+
+### Added
+- **.NET vector codec and MSSQL engine support for `ReadOnlyMemory` and `SqlVector<T>`** — `SqliteVectors.ParseVector`, `DecodeVector`, and `MssqlEngine.BindableValue` now recognize `ReadOnlyMemory<float>`, `Memory<float>`, `ReadOnlyMemory<double>`, `Memory<double>`, as well as `Microsoft.Data.SqlTypes.SqlVector<float>` from `Microsoft.Data.SqlClient` 6.1.0+ via its `.Memory` property, eliminating type-mapping failures and enabling direct binary array extraction.
+- **Extended vector error matching for SQL Server `float16`** — `AdapterTableClient.vectorSearch` in TypeScript now recognizes the SQL Server `limit of 3996` dimension boundary error for half-precision `float16` embeddings, cleanly falling back to client-side in-memory scoring.
 
 ### Changed
 - Use standard ORM model delegate properties (`db.article.*` and `db.document.*`) instead of `db.table('...')` in the NBase and SQLite vector search documentation examples in `README.md` and `native/sqlite/README.md`.
