@@ -251,7 +251,76 @@ public enum Dialect
             return parts.Count > 0 ? "ORDER BY " + string.Join(", ", parts) : "";
         }
 
-        public static string ParseWhere(object where, Dictionary<string, object> parameters, Dialect dialect, string prefix = "")
+        private static string ParseRelationFilter(string modelName, RelationDef relation, Dictionary<string, object> value, Dictionary<string, object> parameters, Dialect dialect, string prefix, string selfRef)
+        {
+            if (relation == null || value == null) return null;
+            var modelToTable = An5Metadata.GetModelToTable();
+            var childRawTable = modelToTable.TryGetValue(relation.ModelName, out var tbl) ? tbl : relation.ModelName;
+            var childTable = SqlQuote.QuoteTable(childRawTable, dialect);
+            var childAlias = "r_" + SanitizeParamName(prefix);
+            var fk = SqlQuote.QuoteName(relation.ForeignKey ?? "Id", dialect);
+            var lk = SqlQuote.QuoteName(relation.LocalKey ?? "Id", dialect);
+
+            var parentTable = modelToTable.TryGetValue(modelName, out var pt) ? pt : modelName;
+            var parentRef = !string.IsNullOrEmpty(selfRef) ? $"{selfRef}." : $"{SqlQuote.QuoteTable(parentTable, dialect)}.";
+            var correlation = $"{childAlias}.{fk} = {parentRef}{lk}";
+
+            string BuildExists(string innerWhere)
+            {
+                var inner = !string.IsNullOrEmpty(innerWhere) ? $" AND ({innerWhere})" : "";
+                return $"EXISTS (SELECT 1 FROM {childTable} AS {childAlias} WHERE {correlation}{inner})";
+            }
+
+            var parts = new List<string>();
+            var isMany = relation.RelationType == "many";
+
+            if (isMany)
+            {
+                if (value.TryGetValue("some", out var someVal) && someVal != null)
+                {
+                    var inner = ParseWhere(someVal, parameters, dialect, $"{prefix}some_", relation.ModelName, childAlias, $"{childAlias}.");
+                    parts.Add(BuildExists(inner));
+                }
+                if (value.TryGetValue("none", out var noneVal) && noneVal != null)
+                {
+                    var inner = ParseWhere(noneVal, parameters, dialect, $"{prefix}none_", relation.ModelName, childAlias, $"{childAlias}.");
+                    parts.Add($"NOT {BuildExists(inner)}");
+                }
+                if (value.TryGetValue("every", out var everyVal) && everyVal != null)
+                {
+                    var inner = ParseWhere(everyVal, parameters, dialect, $"{prefix}every_", relation.ModelName, childAlias, $"{childAlias}.");
+                    var negated = !string.IsNullOrEmpty(inner) ? $"NOT ({inner})" : "";
+                    var violated = $"EXISTS (SELECT 1 FROM {childTable} AS {childAlias} WHERE {correlation}{(!string.IsNullOrEmpty(negated) ? $" AND {negated}" : " AND 1=0")})";
+                    parts.Add($"NOT {violated}");
+                }
+            }
+            else
+            {
+                if (value.ContainsKey("is"))
+                {
+                    var isVal = value["is"];
+                    if (isVal == null) parts.Add($"NOT {BuildExists("")}");
+                    else
+                    {
+                        var inner = ParseWhere(isVal, parameters, dialect, $"{prefix}is_", relation.ModelName, childAlias, $"{childAlias}.");
+                        parts.Add(BuildExists(inner));
+                    }
+                }
+                if (value.ContainsKey("isNot"))
+                {
+                    var isNotVal = value["isNot"];
+                    if (isNotVal == null) parts.Add(BuildExists(""));
+                    else
+                    {
+                        var inner = ParseWhere(isNotVal, parameters, dialect, $"{prefix}isNot_", relation.ModelName, childAlias, $"{childAlias}.");
+                        parts.Add($"NOT {BuildExists(inner)}");
+                    }
+                }
+            }
+            return parts.Count > 0 ? string.Join(" AND ", parts) : null;
+        }
+
+        public static string ParseWhere(object where, Dictionary<string, object> parameters, Dialect dialect, string prefix = "", string modelName = null, string selfRef = "", string colPrefix = "")
         {
             if (!(where is Dictionary<string, object> dict) || dict.Count == 0) return "";
 
@@ -268,6 +337,8 @@ public enum Dialect
                 }
             }
 
+            var modelRelations = !string.IsNullOrEmpty(modelName) ? An5Metadata.GetRelationsForModel(modelName) : new Dictionary<string, RelationDef>();
+
             var conditions = new List<string>();
             foreach (var kv in clean)
             {
@@ -283,7 +354,7 @@ public enum Dialect
                     {
                         if (item is Dictionary<string, object> subMap)
                         {
-                            var s = ParseWhere(subMap, parameters, dialect, $"{prefix}{key}{i++}_");
+                            var s = ParseWhere(subMap, parameters, dialect, $"{prefix}{key}{i++}_", modelName, selfRef, colPrefix);
                             subs.Add(string.IsNullOrEmpty(s) ? "1=1" : s);
                         }
                     }
@@ -300,7 +371,17 @@ public enum Dialect
                     continue;
                 }
 
-                var col = SqlQuote.QuoteName(key, dialect);
+                if (modelRelations.TryGetValue(key, out var relation) && value is Dictionary<string, object> relMap)
+                {
+                    var relSql = ParseRelationFilter(modelName, relation, relMap, parameters, dialect, $"{prefix}{key}_", selfRef);
+                    if (!string.IsNullOrEmpty(relSql))
+                    {
+                        conditions.Add(relSql);
+                        continue;
+                    }
+                }
+
+                var col = $"{colPrefix}{SqlQuote.QuoteName(key, dialect)}";
                 var baseName = SanitizeParamName($"{prefix}{key}");
                 if (value == null)
                 {

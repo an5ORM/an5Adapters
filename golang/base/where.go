@@ -62,19 +62,126 @@ func sortedKeys(m map[string]interface{}) []string {
 	return keys
 }
 
+func sanitizeParamName(name string) string {
+	var sb strings.Builder
+	for _, ch := range name {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' {
+			sb.WriteRune(ch)
+		} else {
+			sb.WriteRune('_')
+		}
+	}
+	cleaned := sb.String()
+	if len(cleaned) > 0 && ((cleaned[0] >= 'a' && cleaned[0] <= 'z') || (cleaned[0] >= 'A' && cleaned[0] <= 'Z')) {
+		return cleaned
+	}
+	return "p_" + cleaned
+}
+
+func parseRelationFilter(modelName string, rel RelationDef, value map[string]interface{}, dialect Dialect, args *[]interface{}, ph func(n int) string, prefix string, selfRef string) string {
+	modelMap := GetModelToTable()
+	childRawTable := rel.ModelName
+	if tbl, ok := modelMap[rel.ModelName]; ok {
+		childRawTable = tbl
+	}
+	childTable := QuoteTable(childRawTable, dialect)
+	childAlias := fmt.Sprintf("r_%s", sanitizeParamName(prefix))
+	fk := QuoteIdentifier(rel.ForeignKey, dialect)
+	lk := QuoteIdentifier(rel.LocalKey, dialect)
+
+	parentTable := modelName
+	if pt, ok := modelMap[modelName]; ok {
+		parentTable = pt
+	}
+	parentRef := QuoteTable(parentTable, dialect) + "."
+	if selfRef != "" {
+		parentRef = selfRef + "."
+	}
+	correlation := fmt.Sprintf("%s.%s = %s%s", childAlias, fk, parentRef, lk)
+
+	buildExists := func(innerWhere string) string {
+		inner := ""
+		if innerWhere != "" {
+			inner = " AND (" + innerWhere + ")"
+		}
+		return fmt.Sprintf("EXISTS (SELECT 1 FROM %s AS %s WHERE %s%s)", childTable, childAlias, correlation, inner)
+	}
+
+	var parts []string
+	isMany := rel.RelationType == "many"
+
+	if isMany {
+		if someVal, ok := value["some"]; ok && someVal != nil {
+			if sm, ok := someVal.(map[string]interface{}); ok {
+				inner := buildWhereRecWithModel(cleanWhere(sm), rel.ModelName, dialect, args, ph, prefix+"some_", childAlias, childAlias+".")
+				parts = append(parts, buildExists(inner))
+			}
+		}
+		if noneVal, ok := value["none"]; ok && noneVal != nil {
+			if nm, ok := noneVal.(map[string]interface{}); ok {
+				inner := buildWhereRecWithModel(cleanWhere(nm), rel.ModelName, dialect, args, ph, prefix+"none_", childAlias, childAlias+".")
+				parts = append(parts, "NOT "+buildExists(inner))
+			}
+		}
+		if everyVal, ok := value["every"]; ok && everyVal != nil {
+			if em, ok := everyVal.(map[string]interface{}); ok {
+				inner := buildWhereRecWithModel(cleanWhere(em), rel.ModelName, dialect, args, ph, prefix+"every_", childAlias, childAlias+".")
+				negated := ""
+				if inner != "" {
+					negated = "NOT (" + inner + ")"
+				}
+				violatedWhere := " AND 1=0"
+				if negated != "" {
+					violatedWhere = " AND " + negated
+				}
+				violated := fmt.Sprintf("EXISTS (SELECT 1 FROM %s AS %s WHERE %s%s)", childTable, childAlias, correlation, violatedWhere)
+				parts = append(parts, "NOT "+violated)
+			}
+		}
+	} else {
+		if isVal, ok := value["is"]; ok {
+			if isVal == nil {
+				parts = append(parts, "NOT "+buildExists(""))
+			} else if im, ok := isVal.(map[string]interface{}); ok {
+				inner := buildWhereRecWithModel(cleanWhere(im), rel.ModelName, dialect, args, ph, prefix+"is_", childAlias, childAlias+".")
+				parts = append(parts, buildExists(inner))
+			}
+		}
+		if isNotVal, ok := value["isNot"]; ok {
+			if isNotVal == nil {
+				parts = append(parts, buildExists(""))
+			} else if inm, ok := isNotVal.(map[string]interface{}); ok {
+				inner := buildWhereRecWithModel(cleanWhere(inm), rel.ModelName, dialect, args, ph, prefix+"isNot_", childAlias, childAlias+".")
+				parts = append(parts, "NOT "+buildExists(inner))
+			}
+		}
+	}
+
+	return strings.Join(parts, " AND ")
+}
+
 // BuildWhere converts an ORM-style where object into a SQL clause with ordered placeholders.
 // ph returns the placeholder for arg position n (1-based).
 func BuildWhere(where map[string]interface{}, dialect Dialect, ph func(n int) string) (string, []interface{}) {
+	return BuildWhereWithModel(where, "", dialect, ph)
+}
+
+// BuildWhereWithModel converts an ORM-style where object into a SQL clause with relation filter support.
+func BuildWhereWithModel(where map[string]interface{}, modelName string, dialect Dialect, ph func(n int) string) (string, []interface{}) {
 	args := make([]interface{}, 0, 8)
-	clause := buildWhereRec(cleanWhere(where), dialect, &args, ph, "")
+	clause := buildWhereRecWithModel(cleanWhere(where), modelName, dialect, &args, ph, "", "", "")
 	return clause, args
 }
 
-func buildWhereRec(where map[string]interface{}, dialect Dialect, args *[]interface{}, ph func(n int) string, prefix string) string {
+func buildWhereRecWithModel(where map[string]interface{}, modelName string, dialect Dialect, args *[]interface{}, ph func(n int) string, prefix string, selfRef string, colPrefix string) string {
 	if where == nil || len(where) == 0 {
 		return ""
 	}
 	var conditions []string
+	var modelRels map[string]RelationDef
+	if modelName != "" {
+		modelRels = GetRelationsForModel(modelName)
+	}
 
 	for _, key := range sortedKeys(where) {
 		value := where[key]
@@ -92,7 +199,7 @@ func buildWhereRec(where map[string]interface{}, dialect Dialect, args *[]interf
 			var subs []string
 			for i, item := range list {
 				if m, ok := item.(map[string]interface{}); ok {
-					s := buildWhereRec(cleanWhere(m), dialect, args, ph, fmt.Sprintf("%s%s%d_", prefix, key, i))
+					s := buildWhereRecWithModel(cleanWhere(m), modelName, dialect, args, ph, fmt.Sprintf("%s%s%d_", prefix, key, i), selfRef, colPrefix)
 					if s == "" {
 						s = "1=1"
 					}
@@ -117,14 +224,26 @@ func buildWhereRec(where map[string]interface{}, dialect Dialect, args *[]interf
 			continue
 		}
 
-		conditions = append(conditions, buildFieldCondition(key, value, dialect, args, ph, prefix)...)
+		if modelRels != nil {
+			if rel, exists := modelRels[key]; exists {
+				if vm, ok := isPlainMap(value); ok {
+					relSql := parseRelationFilter(modelName, rel, vm, dialect, args, ph, fmt.Sprintf("%s%s_", prefix, key), selfRef)
+					if relSql != "" {
+						conditions = append(conditions, relSql)
+						continue
+					}
+				}
+			}
+		}
+
+		col := colPrefix + QuoteIdentifier(key, dialect)
+		conditions = append(conditions, buildFieldConditionWithCol(col, key, value, dialect, args, ph, prefix)...)
 	}
 
 	return strings.Join(conditions, " AND ")
 }
 
-func buildFieldCondition(key string, value interface{}, dialect Dialect, args *[]interface{}, ph func(n int) string, prefix string) []string {
-	col := QuoteIdentifier(key, dialect)
+func buildFieldConditionWithCol(col string, key string, value interface{}, dialect Dialect, args *[]interface{}, ph func(n int) string, prefix string) []string {
 
 	if value == nil {
 		return []string{col + " IS NULL"}
@@ -158,7 +277,7 @@ func buildFieldCondition(key string, value interface{}, dialect Dialect, args *[
 			if val == nil {
 				parts = append(parts, col+" IS NOT NULL")
 			} else if nested, ok := val.(map[string]interface{}); ok {
-				nestedCond := buildWhereRec(map[string]interface{}{key: nested}, dialect, args, ph, key+"_not_")
+				nestedCond := buildWhereRecWithModel(map[string]interface{}{key: nested}, "", dialect, args, ph, key+"_not_", "", "")
 				if nestedCond != "" {
 					parts = append(parts, "NOT ("+nestedCond+")")
 				}

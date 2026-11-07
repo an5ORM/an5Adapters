@@ -222,10 +222,17 @@ namespace An5Orm
             => _tableClient.GroupBy(args);
 
         public T Create(T entity) => throw new NotSupportedException($"View '{ViewName}' is read-only. Create is not allowed.");
+        public T Create(CreateArgs args) => throw new NotSupportedException($"View '{ViewName}' is read-only. Create is not allowed.");
+        public int CreateMany(CreateManyArgs args) => throw new NotSupportedException($"View '{ViewName}' is read-only. CreateMany is not allowed.");
         public T Update(T entity, string idColumnName = "Id") => throw new NotSupportedException($"View '{ViewName}' is read-only. Update is not allowed.");
+        public T Update(UpdateArgs args) => throw new NotSupportedException($"View '{ViewName}' is read-only. Update is not allowed.");
+        public int UpdateMany(UpdateManyArgs args) => throw new NotSupportedException($"View '{ViewName}' is read-only. UpdateMany is not allowed.");
         public bool Delete(object id, string idColumnName = "Id") => throw new NotSupportedException($"View '{ViewName}' is read-only. Delete is not allowed.");
+        public T Delete(DeleteArgs args) => throw new NotSupportedException($"View '{ViewName}' is read-only. Delete is not allowed.");
         public int DeleteMany(string whereClause = null, Dictionary<string, object> parameters = null) => throw new NotSupportedException($"View '{ViewName}' is read-only. DeleteMany is not allowed.");
+        public int DeleteMany(DeleteManyArgs args) => throw new NotSupportedException($"View '{ViewName}' is read-only. DeleteMany is not allowed.");
         public T Upsert(T entity, string idColumnName = "Id") => throw new NotSupportedException($"View '{ViewName}' is read-only. Upsert is not allowed.");
+        public T Upsert(UpsertArgs args) => throw new NotSupportedException($"View '{ViewName}' is read-only. Upsert is not allowed.");
     }
 
 // ─── ORM-style Args types ────────────────────────────────────────────────────
@@ -270,6 +277,11 @@ namespace An5Orm
     {
         public object Where { get; set; }
         public Dictionary<string, object> Data { get; set; }
+    }
+
+    public class DeleteArgs
+    {
+        public object Where { get; set; }
     }
 
     public class DeleteManyArgs
@@ -481,7 +493,7 @@ namespace An5Orm
         public List<T> FindMany(FindManyArgs args)
         {
             var parameters = new Dictionary<string, object>();
-            var whereSql = SqlBuilder.ParseWhere(args?.Where, parameters, _dialect);
+            var whereSql = SqlBuilder.ParseWhere(args?.Where, parameters, _dialect, "", _modelName);
             var orderSql = SqlBuilder.BuildOrderBy(args?.OrderBy, _dialect);
             var skip = args?.Skip;
             var take = args?.Take;
@@ -581,7 +593,7 @@ namespace An5Orm
         public int Count(CountArgs args)
         {
             var parameters = new Dictionary<string, object>();
-            var whereSql = args != null ? SqlBuilder.ParseWhere(args.Where, parameters, _dialect) : "";
+            var whereSql = args != null ? SqlBuilder.ParseWhere(args.Where, parameters, _dialect, "", _modelName) : "";
             var sql = $"SELECT COUNT(*) FROM {_tableName}{Nolock}";
             if (!string.IsNullOrEmpty(whereSql)) sql += $" WHERE {whereSql}";
             var rows = _adapter.QueryRaw(sql, parameters);
@@ -743,7 +755,7 @@ namespace An5Orm
         private List<Dictionary<string, object>> FindManyDynamic(FindManyArgs args)
         {
             var parameters = new Dictionary<string, object>();
-            var whereSql = SqlBuilder.ParseWhere(args?.Where, parameters, _dialect);
+            var whereSql = SqlBuilder.ParseWhere(args?.Where, parameters, _dialect, "", _modelName);
             var orderSql = SqlBuilder.BuildOrderBy(args?.OrderBy, _dialect);
             var query = $"SELECT * FROM {_tableName}{Nolock}";
             if (!string.IsNullOrEmpty(whereSql)) query += $" WHERE {whereSql}";
@@ -785,7 +797,7 @@ namespace An5Orm
         {
             args ??= new AggregateArgs();
             var parameters = new Dictionary<string, object>();
-            var whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect);
+            var whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect, "", _modelName);
             var aggs = new List<string>();
             var countFields = ArgsHelper.SelectedAggregateFields(args.Count);
             if (countFields.Count == 0 && args.Count != null && args.Count is not bool)
@@ -868,7 +880,7 @@ namespace An5Orm
                 throw new InvalidOperationException("groupBy requires 'by' fields");
 
             var parameters = new Dictionary<string, object>();
-            var whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect);
+            var whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect, "", _modelName);
             var byCols = string.Join(", ", byFields.ConvertAll(f => SqlQuote.QuoteName(f, _dialect)));
             var aggs = new List<string> { "COUNT(*) AS _count" };
             AddAggregates(aggs, "SUM", args.Sum);
@@ -913,7 +925,7 @@ namespace An5Orm
             if (args.Where != null)
             {
                 parameters = new Dictionary<string, object>();
-                whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect);
+                whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect, "", _modelName);
             }
             return VectorSearch(
                 args.Vector,
@@ -1023,6 +1035,270 @@ namespace An5Orm
             var existing = idVal != null ? FindUnique(idVal, idColumnName) : default;
             if (existing != null) return Update(entity, idColumnName);
             return Create(entity);
+        }
+
+        private static void AppendUpdateSet(List<string> sets, Dictionary<string, object> parameters, string col, object val, Dialect dialect, ref int counter)
+        {
+            var quoted = SqlQuote.QuoteName(col, dialect);
+            var pName = $"@s_{counter++}_{SqlBuilder.SanitizeParamName(col)}";
+
+            if (val is Dictionary<string, object> dict)
+            {
+                if (dict.TryGetValue("increment", out var incVal))
+                {
+                    sets.Add($"{quoted} = {quoted} + {pName}");
+                    parameters[pName] = incVal;
+                    return;
+                }
+                if (dict.TryGetValue("decrement", out var decVal))
+                {
+                    sets.Add($"{quoted} = {quoted} - {pName}");
+                    parameters[pName] = decVal;
+                    return;
+                }
+                if (dict.TryGetValue("multiply", out var mulVal))
+                {
+                    sets.Add($"{quoted} = {quoted} * {pName}");
+                    parameters[pName] = mulVal;
+                    return;
+                }
+                if (dict.TryGetValue("divide", out var divVal))
+                {
+                    sets.Add($"{quoted} = {quoted} / {pName}");
+                    parameters[pName] = divVal;
+                    return;
+                }
+                if (dict.TryGetValue("set", out var setVal))
+                {
+                    sets.Add($"{quoted} = {pName}");
+                    parameters[pName] = setVal;
+                    return;
+                }
+            }
+
+            sets.Add($"{quoted} = {pName}");
+            parameters[pName] = val;
+        }
+
+        public T Create(CreateArgs args)
+        {
+            if (args == null || args.Data == null) return default;
+            var modelRelations = An5Metadata.GetRelationsForModel(_modelName);
+            var rawData = new Dictionary<string, object>(args.Data);
+            var relationWrites = new Dictionary<string, object>();
+
+            foreach (var kv in rawData)
+            {
+                if (modelRelations.ContainsKey(kv.Key) && kv.Value is Dictionary<string, object> d && !d.ContainsKey("increment") && !d.ContainsKey("decrement") && !d.ContainsKey("multiply") && !d.ContainsKey("divide") && !d.ContainsKey("set"))
+                {
+                    relationWrites[kv.Key] = kv.Value;
+                }
+            }
+            foreach (var k in relationWrites.Keys) rawData.Remove(k);
+
+            var cols = new List<string>();
+            var vals = new List<string>();
+            var parameters = new Dictionary<string, object>();
+
+            foreach (var kv in rawData)
+            {
+                if (kv.Value == null) continue;
+                cols.Add(SqlQuote.QuoteName(kv.Key, _dialect));
+                var p = "@c_" + SqlBuilder.SanitizeParamName(kv.Key);
+                vals.Add(p);
+                parameters[p] = kv.Value;
+            }
+
+            var sql = $"INSERT INTO {_tableName} ({string.Join(", ", cols)}) VALUES ({string.Join(", ", vals)})";
+            _adapter.ExecuteRaw(sql, parameters);
+
+            T createdRecord = default;
+            if (rawData.TryGetValue("id", out var idVal) || rawData.TryGetValue("Id", out idVal))
+            {
+                createdRecord = FindUnique(idVal);
+            }
+            else
+            {
+                createdRecord = FindFirst(new FindManyArgs { Where = rawData });
+            }
+
+            if (createdRecord != null && relationWrites.Count > 0)
+            {
+                foreach (var rw in relationWrites)
+                {
+                    if (!modelRelations.TryGetValue(rw.Key, out var rel)) continue;
+                    if (!(rw.Value is Dictionary<string, object> relWrite)) continue;
+
+                    var childClient = new AdapterTableClient<DictionaryModel>(_adapter, rel.ModelName, _dialect);
+                    if (relWrite.TryGetValue("create", out var createObj))
+                    {
+                        var createItems = createObj is System.Collections.IList list ? list : new List<object> { createObj };
+                        var parentKeyVal = GetPropValue(createdRecord, rel.LocalKey);
+                        foreach (var item in createItems)
+                        {
+                            if (item is Dictionary<string, object> itemDict)
+                            {
+                                var childData = new Dictionary<string, object>(itemDict);
+                                childData[rel.ForeignKey] = parentKeyVal;
+                                childClient.Create(new CreateArgs { Data = childData });
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (createdRecord != null && args.Include is Dictionary<string, object> inc)
+            {
+                var list = new List<T> { createdRecord };
+                ResolveIncludes(list, inc);
+                createdRecord = list[0];
+            }
+            return createdRecord;
+        }
+
+        public int CreateMany(CreateManyArgs args)
+        {
+            if (args?.Data == null || args.Data.Count == 0) return 0;
+            int count = 0;
+            foreach (var row in args.Data)
+            {
+                try
+                {
+                    Create(new CreateArgs { Data = row });
+                    count++;
+                }
+                catch
+                {
+                    if (!args.SkipDuplicates) throw;
+                }
+            }
+            return count;
+        }
+
+        public T Update(UpdateArgs args)
+        {
+            if (args == null || args.Data == null) return default;
+            var modelRelations = An5Metadata.GetRelationsForModel(_modelName);
+            var rawData = new Dictionary<string, object>(args.Data);
+            var relationWrites = new Dictionary<string, object>();
+
+            foreach (var kv in rawData)
+            {
+                if (modelRelations.ContainsKey(kv.Key) && kv.Value is Dictionary<string, object> d && !d.ContainsKey("increment") && !d.ContainsKey("decrement") && !d.ContainsKey("multiply") && !d.ContainsKey("divide") && !d.ContainsKey("set"))
+                {
+                    relationWrites[kv.Key] = kv.Value;
+                }
+            }
+            foreach (var k in relationWrites.Keys) rawData.Remove(k);
+
+            var parameters = new Dictionary<string, object>();
+            var whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect, "", _modelName);
+            var sets = new List<string>();
+            int counter = 0;
+
+            foreach (var kv in rawData)
+            {
+                AppendUpdateSet(sets, parameters, kv.Key, kv.Value, _dialect, ref counter);
+            }
+
+            if (sets.Count > 0)
+            {
+                var sql = $"UPDATE {_tableName} SET {string.Join(", ", sets)}";
+                if (!string.IsNullOrEmpty(whereSql)) sql += $" WHERE {whereSql}";
+                _adapter.ExecuteRaw(sql, parameters);
+            }
+
+            var updatedRecord = FindFirst(new FindManyArgs { Where = args.Where });
+
+            if (updatedRecord != null && relationWrites.Count > 0)
+            {
+                foreach (var rw in relationWrites)
+                {
+                    if (!modelRelations.TryGetValue(rw.Key, out var rel)) continue;
+                    if (!(rw.Value is Dictionary<string, object> relWrite)) continue;
+
+                    var childClient = new AdapterTableClient<DictionaryModel>(_adapter, rel.ModelName, _dialect);
+                    if (relWrite.TryGetValue("create", out var createObj))
+                    {
+                        var createItems = createObj is System.Collections.IList list ? list : new List<object> { createObj };
+                        var parentKeyVal = GetPropValue(updatedRecord, rel.LocalKey);
+                        foreach (var item in createItems)
+                        {
+                            if (item is Dictionary<string, object> itemDict)
+                            {
+                                var childData = new Dictionary<string, object>(itemDict);
+                                childData[rel.ForeignKey] = parentKeyVal;
+                                childClient.Create(new CreateArgs { Data = childData });
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (updatedRecord != null && args.Include is Dictionary<string, object> inc)
+            {
+                var list = new List<T> { updatedRecord };
+                ResolveIncludes(list, inc);
+                updatedRecord = list[0];
+            }
+            return updatedRecord;
+        }
+
+        public int UpdateMany(UpdateManyArgs args)
+        {
+            if (args == null || args.Data == null || args.Data.Count == 0) return 0;
+            var parameters = new Dictionary<string, object>();
+            var whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect, "", _modelName);
+            var sets = new List<string>();
+            int counter = 0;
+
+            foreach (var kv in args.Data)
+            {
+                AppendUpdateSet(sets, parameters, kv.Key, kv.Value, _dialect, ref counter);
+            }
+
+            if (sets.Count > 0)
+            {
+                var sql = $"UPDATE {_tableName} SET {string.Join(", ", sets)}";
+                if (!string.IsNullOrEmpty(whereSql)) sql += $" WHERE {whereSql}";
+                return _adapter.ExecuteRaw(sql, parameters);
+            }
+            return 0;
+        }
+
+        public T Delete(DeleteArgs args)
+        {
+            if (args == null) return default;
+            var record = FindFirst(new FindManyArgs { Where = args.Where });
+            if (record != null)
+            {
+                var parameters = new Dictionary<string, object>();
+                var whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect, "", _modelName);
+                var sql = $"DELETE FROM {_tableName}";
+                if (!string.IsNullOrEmpty(whereSql)) sql += $" WHERE {whereSql}";
+                _adapter.ExecuteRaw(sql, parameters);
+            }
+            return record;
+        }
+
+        public int DeleteMany(DeleteManyArgs args)
+        {
+            var parameters = new Dictionary<string, object>();
+            var whereSql = SqlBuilder.ParseWhere(args?.Where, parameters, _dialect, "", _modelName);
+            var sql = $"DELETE FROM {_tableName}";
+            if (!string.IsNullOrEmpty(whereSql)) sql += $" WHERE {whereSql}";
+            return _adapter.ExecuteRaw(sql, parameters);
+        }
+
+        public T Upsert(UpsertArgs args)
+        {
+            if (args == null) return default;
+            var existing = FindFirst(new FindManyArgs { Where = args.Where });
+            if (existing != null)
+            {
+                return Update(new UpdateArgs { Where = args.Where, Data = args.Update });
+            }
+            return Create(new CreateArgs { Data = args.Create });
         }
 
         // ── Vector Search ──────────────────────────────────────────────────────

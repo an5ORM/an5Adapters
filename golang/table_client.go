@@ -185,7 +185,7 @@ func (t *TableClient) buildWhere(where interface{}) (string, []interface{}) {
 		return "", nil
 	}
 	if m, ok := where.(map[string]interface{}); ok && m != nil {
-		clause, args := base.BuildWhere(m, t.Adapter.Dialect, func(n int) string {
+		clause, args := base.BuildWhereWithModel(m, t.TableName, t.Adapter.Dialect, func(n int) string {
 			return placeholder(t.Adapter.Dialect, n)
 		})
 		return clause, args

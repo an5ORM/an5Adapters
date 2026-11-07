@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 from .dialects import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE
-from .metadata import model_to_table, model_fields, resolve_model_key
+from .metadata import model_to_table, model_fields, resolve_model_key, get_relations_for_model
 
 # ─── Quoting ───────────────────────────────────────────────────────────────────────
 
@@ -37,7 +37,54 @@ def _is_operator_value(value: Any) -> bool:
     return isinstance(value, dict) and any(op in value for op in _OPERATOR_KEYS)
 
 
-def _parse_where(model_name: str, where: Optional[Dict], params: Dict, dialect: str, prefix: str = "") -> str:
+def _parse_relation_filter(model_name: str, relation: Dict[str, str], value: Any, params: Dict, dialect: str, prefix: str = "", self_ref: str = "") -> Optional[str]:
+    if not isinstance(value, dict) or not relation:
+        return None
+    child_table = _quote_table(_resolve_table(relation.get("modelName", "")), dialect)
+    child_alias = f"r_{_sanitize_param_name(prefix)}"
+    fk = _quote(relation.get("foreignKey", "id"), dialect)
+    lk = _quote(relation.get("localKey", "id"), dialect)
+
+    parent_ref = f"{self_ref}." if self_ref else f"{_quote_table(_resolve_table(model_name), dialect)}."
+    correlation = f"{child_alias}.{fk} = {parent_ref}{lk}"
+
+    def build_exists(inner_where: str) -> str:
+        inner = f" AND ({inner_where})" if inner_where else ""
+        return f"EXISTS (SELECT 1 FROM {child_table} AS {child_alias} WHERE {correlation}{inner})"
+
+    parts: List[str] = []
+    is_many = relation.get("relationType") == "many"
+
+    if is_many:
+        if "some" in value and value["some"] is not None:
+            inner = _parse_where(relation.get("modelName", ""), value["some"], params, dialect, f"{prefix}some_", self_ref=child_alias, col_prefix=f"{child_alias}.")
+            parts.append(build_exists(inner))
+        if "none" in value and value["none"] is not None:
+            inner = _parse_where(relation.get("modelName", ""), value["none"], params, dialect, f"{prefix}none_", self_ref=child_alias, col_prefix=f"{child_alias}.")
+            parts.append(f"NOT {build_exists(inner)}")
+        if "every" in value and value["every"] is not None:
+            inner = _parse_where(relation.get("modelName", ""), value["every"], params, dialect, f"{prefix}every_", self_ref=child_alias, col_prefix=f"{child_alias}.")
+            negated = f"NOT ({inner})" if inner else ""
+            violated = f"EXISTS (SELECT 1 FROM {child_table} AS {child_alias} WHERE {correlation}{f' AND {negated}' if negated else ' AND 1=0'})"
+            parts.append(f"NOT {violated}")
+    else:
+        if "is" in value:
+            if value["is"] is None:
+                parts.append(f"NOT {build_exists('')}")
+            else:
+                inner = _parse_where(relation.get("modelName", ""), value["is"], params, dialect, f"{prefix}is_", self_ref=child_alias, col_prefix=f"{child_alias}.")
+                parts.append(build_exists(inner))
+        if "isNot" in value:
+            if value["isNot"] is None:
+                parts.append(build_exists(''))
+            else:
+                inner = _parse_where(relation.get("modelName", ""), value["isNot"], params, dialect, f"{prefix}isNot_", self_ref=child_alias, col_prefix=f"{child_alias}.")
+                parts.append(f"NOT {build_exists(inner)}")
+
+    return " AND ".join(parts) if parts else None
+
+
+def _parse_where(model_name: str, where: Optional[Dict], params: Dict, dialect: str, prefix: str = "", self_ref: str = "", col_prefix: str = "") -> str:
     if not where:
         return ""
     conditions: List[str] = []
@@ -49,23 +96,29 @@ def _parse_where(model_name: str, where: Optional[Dict], params: Dict, dialect: 
         else:
             clean_where[key] = value
 
+    model_relations = get_relations_for_model(model_name)
+
     for key, value in clean_where.items():
         if key == "OR" and isinstance(value, list):
-            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}or{i}_") or "1=1" for i, v in enumerate(value)]
+            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}or{i}_", self_ref=self_ref, col_prefix=col_prefix) or "1=1" for i, v in enumerate(value)]
             conditions.append(f"({' OR '.join(sub)})" if sub else "1=0")
         elif key == "AND":
             items = value if isinstance(value, list) else [value]
-            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}and{i}_") for i, v in enumerate(items)]
+            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}and{i}_", self_ref=self_ref, col_prefix=col_prefix) for i, v in enumerate(items)]
             sub = [s for s in sub if s]
             if sub:
                 conditions.append(f"({' AND '.join(sub)})")
         elif key == "NOT":
             items = value if isinstance(value, list) else [value]
-            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}not{i}_") or "1=1" for i, v in enumerate(items)]
+            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}not{i}_", self_ref=self_ref, col_prefix=col_prefix) or "1=1" for i, v in enumerate(items)]
             if sub:
                 conditions.append(f"NOT ({' OR '.join(sub)})")
+        elif key in model_relations and isinstance(value, dict) and any(k in value for k in ("some", "none", "every", "is", "isNot")):
+            rel_sql = _parse_relation_filter(model_name, model_relations[key], value, params, dialect, f"{prefix}{key}_", self_ref=self_ref)
+            if rel_sql:
+                conditions.append(rel_sql)
         else:
-            col = _quote(key, dialect)
+            col = f"{col_prefix}{_quote(key, dialect)}"
             pname = _sanitize_param_name(f"{prefix}{key}")
             placeholder = "%s" if dialect == DIALECT_POSTGRES else "?"
             if value is None:
