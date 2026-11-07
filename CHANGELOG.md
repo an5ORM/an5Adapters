@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.16] - 2026-11-07
+
+### Added
+- **Query and relation parity across .NET, Python, and Go** — achieve complete query feature parity including nested relation filters, transactions, aggregation, and groupBy.
+- **Reshaped aggregate and groupBy results** — Python and TypeScript `groupBy` and `aggregate` now structure `_sum`, `_avg`, `_min`, `_max`, and `_count` into nested dictionary/object properties matching Prisma and .NET specifications while preserving flat column access.
+- **PyPI Release workflow updates** — support `PYPI_TOKEN` secret and skip-existing in twine publication.
+
 ## [0.2.15] - 2026-11-05
 
 ### Added

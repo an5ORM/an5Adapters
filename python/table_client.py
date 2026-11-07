@@ -588,7 +588,39 @@ class AdapterTableClient(Generic[T]):
                 if has_take:
                     query += f" FETCH NEXT {_to_non_negative_int(take, 1)} ROWS ONLY"
 
-        return self._adapter.exec(query, list(params.values()))
+        rows = self._adapter.exec(query, list(params.values()))
+        if not (_sum or _avg or _min or _max or _count):
+            return rows
+        reshaped = []
+        for r in rows:
+            item = dict(r)
+            if _count:
+                all_count = int(r.get("_count") or 0)
+                item["_count"] = all_count if not isinstance(_count, dict) else {"_all": all_count}
+                if isinstance(_count, dict):
+                    for f in _selected_aggregate_fields(_count):
+                        if f != "_all":
+                            item["_count"][f] = int(r.get(f"_count_{f}", all_count))
+            if _sum:
+                item["_sum"] = {}
+                for f in _selected_aggregate_fields(_sum):
+                    v = r.get(f"_sum_{f}")
+                    item["_sum"][f] = float(v) if v is not None else None
+            if _avg:
+                item["_avg"] = {}
+                for f in _selected_aggregate_fields(_avg):
+                    v = r.get(f"_avg_{f}")
+                    item["_avg"][f] = float(v) if v is not None else None
+            if _min:
+                item["_min"] = {}
+                for f in _selected_aggregate_fields(_min):
+                    item["_min"][f] = r.get(f"_min_{f}")
+            if _max:
+                item["_max"] = {}
+                for f in _selected_aggregate_fields(_max):
+                    item["_max"][f] = r.get(f"_max_{f}")
+            reshaped.append(item)
+        return reshaped
 
     def vector_search(
         self,

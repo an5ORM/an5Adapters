@@ -1283,7 +1283,50 @@ export class AdapterTableClient<T = any> {
         if (hasTake) query += ` FETCH NEXT ${take} ROWS ONLY`;
       }
     }
-    return this.doExec(query, params);
+    const rows = await this.doExec(query, params);
+    if (!args?._sum && !args?._avg && !args?._min && !args?._max && !args?._count) {
+      return rows;
+    }
+    return rows.map((row: any) => {
+      const res: any = { ...row };
+      if (args._count) {
+        const allCount = row._count !== undefined ? Number(row._count) : 0;
+        res._count = typeof args._count === 'object' ? { _all: allCount } : allCount;
+        if (typeof args._count === 'object') {
+          for (const f of selectedAggregateFields(args._count)) {
+            if (f === '_all') continue;
+            res._count[f] = row[`_count_${f}`] !== undefined ? Number(row[`_count_${f}`]) : allCount;
+          }
+        }
+      }
+      if (args._sum) {
+        res._sum = {};
+        for (const f of selectedAggregateFields(args._sum)) {
+          const val = row[`_sum_${f}`];
+          res._sum[f] = val !== null && val !== undefined ? Number(val) : null;
+        }
+      }
+      if (args._avg) {
+        res._avg = {};
+        for (const f of selectedAggregateFields(args._avg)) {
+          const val = row[`_avg_${f}`];
+          res._avg[f] = val !== null && val !== undefined ? Number(val) : null;
+        }
+      }
+      if (args._min) {
+        res._min = {};
+        for (const f of selectedAggregateFields(args._min)) {
+          res._min[f] = row[`_min_${f}`] ?? null;
+        }
+      }
+      if (args._max) {
+        res._max = {};
+        for (const f of selectedAggregateFields(args._max)) {
+          res._max[f] = row[`_max_${f}`] ?? null;
+        }
+      }
+      return res;
+    });
   }
 
   /**
