@@ -518,10 +518,37 @@ class AdapterTableClient(Generic[T]):
         if where_sql:
             query += f" WHERE {where_sql}"
         rows = self._adapter.exec(query, list(params.values()))
-        return rows[0] if rows else {}
+        row = rows[0] if rows else {}
+        result: Dict = {}
+        if _count:
+            all_count = int(row.get("_count") or 0)
+            result["_count"] = {"_all": all_count}
+            if isinstance(_count, dict):
+                for f in _selected_aggregate_fields(_count):
+                    if f != "_all":
+                        result["_count"][f] = int(row.get(f"_count_{f}", all_count))
+        if _sum:
+            result["_sum"] = {}
+            for f in _selected_aggregate_fields(_sum):
+                v = row.get(f"_sum_{f}")
+                result["_sum"][f] = float(v) if v is not None else None
+        if _avg:
+            result["_avg"] = {}
+            for f in _selected_aggregate_fields(_avg):
+                v = row.get(f"_avg_{f}")
+                result["_avg"][f] = float(v) if v is not None else None
+        if _min:
+            result["_min"] = {}
+            for f in _selected_aggregate_fields(_min):
+                result["_min"][f] = row.get(f"_min_{f}")
+        if _max:
+            result["_max"] = {}
+            for f in _selected_aggregate_fields(_max):
+                result["_max"][f] = row.get(f"_max_{f}")
+        return result
 
     def group_by(self, by, where=None, order_by=None, skip: int = 0, take: Optional[int] = None,
-                 _sum=None, _avg=None, _min=None, _max=None) -> List[Dict]:
+                 _count=None, _sum=None, _avg=None, _min=None, _max=None) -> List[Dict]:
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect)
         by_fields = _normalize_by_fields(by)
