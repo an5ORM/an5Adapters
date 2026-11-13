@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.17] - 2026-11-12
+
+### Added
+- **Multi-provider vector database support (`Qdrant`, `Chroma`, `Pinecone`, `Weaviate`, `Milvus`)** — added zero-dependency REST clients and connection-string parsers (`qdrant://`, `chroma://`, `pinecone://`, `weaviate://`, `milvus://`) alongside `nbase://` behind a unified `VectorStoreProvider` abstraction across TypeScript, Python, Go, Rust, Java, .NET, Kotlin, and Swift.
+- **Per-provider subpath exports and Python subpackages** — exposed `@an5/adapters/qdrant`, `@an5/adapters/chroma`, `@an5/adapters/pinecone`, `@an5/adapters/weaviate`, `@an5/adapters/milvus`, and `@an5/adapters/vector` in `package.json`, with matching `python/<provider>/__init__.py` subpackages registered in `pyproject.toml`.
+- **Unified `An5Adapter` vector integration** — added `vectorStore`, `vectorStore()`, `$vectorHealth()`, and `indexVectors()` (preserving `nbase`, `nbaseClient()`, `nbaseOnly`, `$nbaseHealth()`, and `indexVectorsInNBase()` for 100% backward compatibility), supporting vector-only mode, sidecar relational row hydration, and automatic fallback on `VectorProviderError`.
+- **Tests** — added `test/vector-providers.test.js` (15 tests), `test/python/vector_providers.py` (5 tests), `golang/vector/vector_test.go`, and Rust unit tests in `rust/src/vector.rs`.
+
+### Changed
+- **Documentation** — updated `README.md` and `an5Adapters/README.md` with dedicated sections, connection string options, and import examples for NBase, Qdrant, Chroma, Pinecone, Weaviate, and Milvus.
+
 ## [0.2.16] - 2026-11-07
 
 ### Added

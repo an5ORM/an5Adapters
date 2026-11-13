@@ -29,6 +29,7 @@
 
 pub mod adapter;
 pub mod base;
+pub mod vector;
 
 pub use adapter::{
     blob_bytes, blob_value, AggregateArgs, An5Adapter, CountArgs, CreateArgs, CreateManyArgs,
@@ -40,6 +41,11 @@ pub use base::{
     euclidean_distance, get_fields_for_model, get_model_to_table, get_relations_for_model,
     resolve_table, set_adapter_metadata, vector_distance, AdapterMetadata, Dialect, RelationDef,
     Where,
+};
+pub use vector::{
+    detect_vector_provider, is_vector_connection_string, HttpVectorClient, StdHttpTransport,
+    VectorProviderError, VectorProviderKind, VectorRecord, VectorResult, VectorSearchHit,
+    VectorSearchOptions, VectorStoreProvider, VectorTransport,
 };
 
 /// Default connection string: `DATABASE_URL` or a local MSSQL fallback.

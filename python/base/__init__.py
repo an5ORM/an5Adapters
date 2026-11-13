@@ -16,3 +16,16 @@ from .vectors import (
     run_sqlite_vector_search,
     vector_distance,
 )
+from .vector_providers import (
+    ChromaVectorClient,
+    MilvusVectorClient,
+    NBaseVectorClient,
+    PineconeVectorClient,
+    QdrantVectorClient,
+    VectorProviderError,
+    VectorStoreProvider,
+    WeaviateVectorClient,
+    create_vector_store,
+    detect_vector_provider,
+    is_vector_connection_string,
+)

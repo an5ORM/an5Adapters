@@ -6,9 +6,11 @@ from typing import Any, Dict, Generic, List, Optional, TypeVar
 try:
     from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
     from .base.vectors import decode_vector, encode_vector, is_vector_field, needs_vector_encoding, run_sqlite_vector_search, vector_distance
+    from .base.vector_providers import VectorProviderError
 except ImportError:
     from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
     from base.vectors import decode_vector, encode_vector, is_vector_field, needs_vector_encoding, run_sqlite_vector_search, vector_distance
+    from base.vector_providers import VectorProviderError
 
 # ─── Select / Include helpers ────────────────────────────────────────────────────────
 
@@ -622,6 +624,50 @@ class AdapterTableClient(Generic[T]):
             reshaped.append(item)
         return reshaped
 
+    def index_vectors(
+        self,
+        vector_field: str = "embedding",
+        where=None,
+        take: Optional[int] = None,
+        batch_size: int = 200,
+        collection: Optional[str] = None,
+        namespace: Optional[str] = None,
+    ) -> Dict[str, int]:
+        store = self._adapter.vector_store() if hasattr(self._adapter, "vector_store") else None
+        if store is None:
+            raise RuntimeError("No vector store configured on this adapter.")
+        if getattr(self._adapter, "vector_store_only", False):
+            raise RuntimeError("index_vectors requires a relational database, but this adapter is vector-only.")
+        pk = "id"
+        fields = get_fields_for_model(self._model)
+        if isinstance(fields, dict) and fields:
+            if "id" not in fields:
+                pk = next(iter(fields.keys()))
+        rows = self.find_many(where=where, take=take)
+        indexed = 0
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i : i + batch_size]
+            vectors: List[Dict[str, Any]] = []
+            for row in batch:
+                raw = row.get(vector_field)
+                if raw is None:
+                    continue
+                vec = decode_vector(raw)
+                if not vec:
+                    continue
+                rid = str(row.get(pk, ""))
+                vectors.append(
+                    {
+                        "id": f"{self._model}:{rid}",
+                        "vector": vec,
+                        "metadata": {store.id_field: rid, store.model_field: self._model},
+                    }
+                )
+            if vectors:
+                res = store.upsert(vectors, collection=collection, namespace=namespace)
+                indexed += int(res.get("count", len(vectors)))
+        return {"indexed": indexed}
+
     def vector_search(
         self,
         vector: List[float],
@@ -629,7 +675,59 @@ class AdapterTableClient(Generic[T]):
         where=None,
         vector_field: str = "embedding",
         distance_metric: str = "cosine",
+        collection: Optional[str] = None,
+        namespace: Optional[str] = None,
     ) -> List[Dict]:
+        store = self._adapter.vector_store() if hasattr(self._adapter, "vector_store") else None
+        if store is not None:
+            try:
+                hits = store.search(
+                    vector,
+                    k=take,
+                    distance_metric=distance_metric,
+                    include_metadata=True,
+                    collection=collection,
+                    namespace=namespace,
+                )
+                if getattr(self._adapter, "vector_store_only", False):
+                    return [
+                        {"id": h["id"], **(h.get("metadata") or {}), "distance": h["distance"]}
+                        for h in hits
+                    ]
+                ids: List[str] = []
+                distances: Dict[str, float] = {}
+                for h in hits:
+                    meta = h.get("metadata") or {}
+                    raw_id = meta.get(store.id_field)
+                    if raw_id is None:
+                        s_id = str(h["id"])
+                        raw_id = s_id.split(":", 1)[1] if ":" in s_id else s_id
+                    rid = str(raw_id)
+                    if rid:
+                        ids.append(rid)
+                        distances[rid] = float(h["distance"])
+                if not ids:
+                    return []
+                pk = "id"
+                fields = get_fields_for_model(self._model)
+                if isinstance(fields, dict) and fields and "id" not in fields:
+                    pk = next(iter(fields.keys()))
+                ph = "%s" if self._dialect == DIALECT_POSTGRES else "?"
+                in_list = ", ".join([ph] * len(ids))
+                pk_sql = _quote(pk, self._dialect)
+                rows = self._adapter.exec(f"SELECT * FROM {self._table_sql} WHERE {pk_sql} IN ({in_list})", ids)
+                by_key = {str(r.get(pk)): r for r in rows}
+                hydrated: List[Dict] = []
+                for rid in ids:
+                    row = by_key.get(rid)
+                    if row is not None:
+                        hydrated.append({**row, "distance": distances[rid]})
+                        if len(hydrated) >= take:
+                            break
+                return self._decode_vector_fields(hydrated)
+            except VectorProviderError:
+                pass
+
         dim = len(vector)
         vec_json = json.dumps(vector)
         params: Dict = {}

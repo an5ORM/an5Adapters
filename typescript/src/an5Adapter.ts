@@ -26,6 +26,13 @@ import {
   type NBaseAdapterConfig,
   type NBaseVectorClient,
 } from './nbase';
+import {
+  VectorProviderError,
+  createVectorStore,
+  isVectorConnectionString,
+  type VectorHealthResult,
+  type VectorStoreProvider,
+} from './vector';
 import { bindParam, buildOrderBy, parseWhere, quote } from './base/sql';
 import {
   decodeVector,
@@ -256,6 +263,8 @@ export class An5Adapter {
   private _nbase: NBaseVectorClient | null = null;
   private _nbaseConfig: NBaseAdapterConfig | null = null;
   private _nbaseOnly = false;
+  private _vectorStore: VectorStoreProvider | null = null;
+  private _vectorStoreOnly = false;
 
   /**
    * Returns the NBase client for this adapter, if the project configured one.
@@ -275,11 +284,27 @@ export class An5Adapter {
   }
 
   /**
+   * Returns the configured external vector store provider (Qdrant, Chroma,
+   * Pinecone, Weaviate, Milvus, or NBase), if any.
+   */
+  vectorStore(): VectorStoreProvider | null {
+    return this._vectorStore;
+  }
+
+  /**
    * True when the adapter only knows about NBase, so there is no relational
    * database to read rows from.
    */
   get nbaseOnly(): boolean {
     return this._nbaseOnly === true;
+  }
+
+  /**
+   * True when the adapter was configured with a vector-only connection string
+   * (such as `qdrant://`, `chroma://`, `pinecone://`, `weaviate://`, `milvus://`, or `nbase://`).
+   */
+  get vectorStoreOnly(): boolean {
+    return this._vectorStoreOnly === true || this._nbaseOnly === true;
   }
 
   get dialect(): Dialect {
@@ -301,19 +326,30 @@ export class An5Adapter {
     // settings and anything else on the config are read from it later.
     this._engineConfig = adapterConfig as An5AdapterConfig;
 
-    // `nbase://host:port` as the connection string configures the vector store
-    // on its own: there is no relational database, so the adapter is
-    // vector-only. The same string passed as `nbase` keeps the database from
-    // `connectionString` as the source of rows.
+    // `nbase://host:port` (or any vector provider URL such as `qdrant://...`,
+    // `chroma://...`, `pinecone://...`, `weaviate://...`, `milvus://...`) as
+    // the connection string configures a vector-only adapter with no relational
+    // database. Passing it via `nbase` or `vectorStore` keeps `connectionString`
+    // as the relational source of rows.
     const rawConnectionString = String(this._engineConfig.connectionString ?? '').trim();
     if (isNBaseConnectionString(rawConnectionString)) {
       this._nbaseConfig = parseNBaseConnectionString(rawConnectionString);
       this._nbaseOnly = true;
+      this._vectorStore = createVectorStore(rawConnectionString);
+      this._vectorStoreOnly = true;
+      return createAdapterProxy(this, (name) => this.table(name));
+    }
+    if (isVectorConnectionString(rawConnectionString)) {
+      this._vectorStore = createVectorStore(rawConnectionString);
+      this._vectorStoreOnly = true;
       return createAdapterProxy(this, (name) => this.table(name));
     }
     const attached = this._engineConfig.nbase;
     if (attached && isNBaseConnectionString(attached)) {
       this._nbaseConfig = parseNBaseConnectionString(attached);
+    }
+    if (this._engineConfig.vectorStore) {
+      this._vectorStore = createVectorStore(this._engineConfig.vectorStore);
     }
 
     if ((adapterConfig as any).engine) {
@@ -465,7 +501,32 @@ export class An5Adapter {
       if (config) await this.nbaseClient()!.client.health();
       return;
     }
+    if (this._vectorStoreOnly) {
+      const store = this.vectorStore();
+      if (store) await store.health();
+      return;
+    }
     await (await this.requireEngine()).connect();
+  }
+
+  /**
+   * Health check for the configured vector store provider (Qdrant, Chroma,
+   * Pinecone, Weaviate, Milvus, or NBase).
+   */
+  async $vectorHealth(): Promise<VectorHealthResult> {
+    const store = this.vectorStore();
+    if (store) return store.health();
+    const nbase = this.nbaseClient();
+    if (nbase) {
+      const h = await this.$nbaseHealth();
+      return {
+        ok: h.connected,
+        provider: 'nbase',
+        endpoint: h.endpoint,
+        ...(h.error ? { error: h.error } : {}),
+      };
+    }
+    return { ok: false, provider: 'nbase', error: 'No vector store configured.' };
   }
 
   /**
@@ -1504,6 +1565,147 @@ export class AdapterTableClient<T = any> {
     return { indexed };
   }
 
+  /**
+   * Pushes a table's embedding column into the configured external vector store
+   * (Qdrant, Chroma, Pinecone, Weaviate, Milvus, or NBase).
+   */
+  async indexVectors(args: {
+    vectorField?: string;
+    where?: any;
+    take?: number;
+    batchSize?: number;
+    collection?: string;
+    namespace?: string;
+  } = {}): Promise<{ indexed: number }> {
+    const store = this.adapter.vectorStore?.() ?? null;
+    if (!store) {
+      if (this.adapter.nbaseClient?.()) {
+        return this.indexVectorsInNBase(args);
+      }
+      throw new Error(
+        'No vector store configured. Pass `vectorStore` (e.g. `qdrant://localhost:6333`, `chroma://localhost:8000`, `pinecone://...`, `weaviate://localhost:8080`, `milvus://localhost:19530`, or `nbase://localhost:1307`).',
+      );
+    }
+    if (this.adapter.vectorStoreOnly) {
+      throw new Error(
+        'indexVectors reads vectors from a relational table, but this adapter was created with a vector-only connection string and has no database.',
+      );
+    }
+    const vectorField = args.vectorField || 'embedding';
+    const batchSize = args.batchSize ?? 200;
+    const pk = this.primaryKeyColumn();
+    const rows = await this.findMany({ ...(args.where ? { where: args.where } : {}), ...(args.take ? { take: args.take } : {}) });
+
+    let indexed = 0;
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const batch = rows.slice(i, i + batchSize);
+      const vectors = batch
+        .map((row) => {
+          const raw = (row as Record<string, unknown>)[vectorField];
+          if (raw === undefined || raw === null) return null;
+          const vector = decodeVector(raw);
+          if (!Array.isArray(vector) || vector.length === 0) return null;
+          return {
+            id: buildVectorId(this.modelName, String((row as Record<string, unknown>)[pk])),
+            vector,
+            metadata: {
+              [store.idField]: String((row as Record<string, unknown>)[pk]),
+              [store.modelField]: this.modelName,
+            },
+          };
+        })
+        .filter((v): v is NonNullable<typeof v> => v !== null);
+
+      if (vectors.length === 0) continue;
+      const result = await store.upsert(vectors, {
+        ...(args.collection ? { collection: args.collection } : {}),
+        ...(args.namespace ? { namespace: args.namespace } : {}),
+      });
+      indexed += result.count;
+    }
+    return { indexed };
+  }
+
+  private async searchViaVectorStore(
+    store: VectorStoreProvider,
+    args: { vector: number[]; take?: number; where?: any; collection?: string; namespace?: string },
+    metric: 'cosine' | 'euclidean' | 'dot',
+    take: number,
+  ): Promise<(T & { distance: number })[]> {
+    const hits = await store.search(args.vector, {
+      k: take,
+      distanceMetric: metric,
+      includeMetadata: true,
+      ...(args.collection ? { collection: args.collection } : {}),
+      ...(args.namespace ? { namespace: args.namespace } : {}),
+    });
+
+    const ids: string[] = [];
+    const distances = new Map<string, number>();
+    for (const hit of hits) {
+      const fromMetadata = hit.metadata?.[store.idField];
+      const rawId = fromMetadata !== undefined && fromMetadata !== null
+        ? String(fromMetadata)
+        : parseVectorId(hit.id).id;
+      if (!rawId) continue;
+      const model = hit.metadata?.[store.modelField] ?? parseVectorId(hit.id).model;
+      const sameModel = !model || String(model).toLowerCase() === this.modelName.toLowerCase();
+      ids.push(sameModel ? rawId : `${model}:${rawId}`);
+      distances.set(ids[ids.length - 1] as string, hit.distance);
+    }
+    if (ids.length === 0) return [];
+
+    const pk = this.primaryKeyColumn();
+    const inList = ids.map((_, i) => `@vec_id_${i}`).join(', ');
+    const idParams: Record<string, any> = {};
+    ids.forEach((id, i) => { idParams[`vec_id_${i}`] = id; });
+
+    const selectColumns = this.modelFields().map((f) => quote(f, this.dialect)).join(', ');
+    const columns = selectColumns ? `${selectColumns}, ${quote(pk, this.dialect)} AS __an5_vec_key` : `${quote(pk, this.dialect)} AS __an5_vec_key`;
+    const query = `SELECT ${columns} FROM ${this.tableName} WHERE ${quote(pk, this.dialect)} IN (${inList})`;
+
+    const rows = await this.adapter.exec<Record<string, any>>(query, idParams);
+    const byKey = new Map<string, Record<string, any>>();
+    for (const row of rows ?? []) {
+      byKey.set(String(row.__an5_vec_key), row);
+    }
+
+    const hydrated: (T & { distance: number })[] = [];
+    for (const id of ids) {
+      const row = byKey.get(id);
+      if (!row) continue;
+      const { __an5_vec_key, ...rest } = row;
+      hydrated.push({ ...(rest as T), distance: distances.get(id) ?? 0 } as T & { distance: number });
+      if (hydrated.length >= take) break;
+    }
+    return hydrated;
+  }
+
+  private async searchViaVectorStoreOnly(
+    store: VectorStoreProvider,
+    args: { vector: number[]; take?: number; collection?: string; namespace?: string },
+    metric: 'cosine' | 'euclidean' | 'dot',
+    take: number,
+  ): Promise<Array<Record<string, unknown> & { distance: number }>> {
+    const hits = await store.search(args.vector, {
+      k: take,
+      distanceMetric: metric,
+      includeMetadata: true,
+      ...(args.collection ? { collection: args.collection } : {}),
+      ...(args.namespace ? { namespace: args.namespace } : {}),
+    });
+
+    return hits.map((hit) => {
+      const metadata = { ...(hit.metadata ?? {}) };
+      if (metadata[store.idField] === undefined) {
+        const parsed = parseVectorId(hit.id);
+        if (parsed.id) metadata[store.idField] = parsed.id;
+        if (parsed.model) metadata[store.modelField] = parsed.model;
+      }
+      return { id: hit.id, ...metadata, distance: hit.distance };
+    });
+  }
+
   async vectorSearch(args: {
     vector: number[];
     take?: number;
@@ -1512,6 +1714,8 @@ export class AdapterTableClient<T = any> {
     distanceMetric?: 'cosine' | 'euclidean' | 'dot';
     vectorElementType?: 'float32' | 'float16' | 'uint8';
     vectorStrategy?: VectorStrategyPreference;
+    collection?: string;
+    namespace?: string;
   }): Promise<(T & { distance: number })[]> {
     const vectorField = args.vectorField || 'embedding';
     const METRICS = ['cosine', 'euclidean', 'dot'];
@@ -1540,6 +1744,20 @@ export class AdapterTableClient<T = any> {
         // A NBase outage must not take vector search down with it; fall through
         // to the database instead of failing the query.
         console.warn(`[an5] NBase vector search unavailable (${err.message}); falling back to ${this.dialect}.`);
+      }
+    }
+
+    // 0b. External VectorStoreProvider (Qdrant, Chroma, Pinecone, Weaviate, Milvus).
+    const vectorStore = this.adapter.vectorStore?.() ?? null;
+    if (vectorStore) {
+      try {
+        if (this.adapter.vectorStoreOnly) {
+          return (await this.searchViaVectorStoreOnly(vectorStore, args, metric, take)) as (T & { distance: number })[];
+        }
+        return await this.searchViaVectorStore(vectorStore, args, metric, take);
+      } catch (err) {
+        if (!(err instanceof VectorProviderError)) throw err;
+        console.warn(`[an5] ${vectorStore.provider} vector search unavailable (${err.message}); falling back to ${this.dialect}.`);
       }
     }
 

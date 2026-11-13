@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "an5-adapters"
-version = "0.2.16"
+version = "0.2.17"
 description = "Python adapter helpers for AN5 ORM."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -26,7 +26,7 @@ py-modules = ["an5_adapter", "table_client"]
 # `sqlite` has to be listed here, or it is dropped from the installed package: the
 # build only closes over the packages named explicitly, so `import sqlite.provider`
 # breaks on a machine that installed the wheel while it still works from a checkout.
-packages = ["base", "mssql", "postgres", "sqlite"]
+packages = ["base", "mssql", "postgres", "sqlite", "nbase", "qdrant", "chroma", "pinecone", "weaviate", "milvus"]
 
 [tool.pyright]
 extraPaths = ["python"]

@@ -12,6 +12,7 @@ import (
 	"an5adapters/mssql"
 	"an5adapters/postgres"
 	"an5adapters/sqlite"
+	"an5adapters/vector"
 )
 
 // Re-export core base types and functions for package root convenience.
@@ -71,23 +72,70 @@ type An5Adapter struct {
 	// VectorSupport carries the SQLite vector settings. Set it before the first
 	// search to load sqlite-vec or to pin a strategy.
 	VectorSupport sqlite.VectorSupport
+	// VectorStore holds an optional external vector database provider (Qdrant,
+	// Chroma, Pinecone, Weaviate, Milvus, or NBase).
+	VectorStore     vector.VectorStoreProvider
+	VectorStoreOnly bool
 }
 
 // NewAn5Adapter constructs an An5Adapter instance.
 func NewAn5Adapter(db *sql.DB, connStr string) *An5Adapter {
+	if vector.IsVectorConnectionString(connStr) {
+		store, err := vector.CreateVectorStore(connStr)
+		if err == nil {
+			return &An5Adapter{
+				Dialect:         base.DialectSqlite,
+				VectorStore:     store,
+				VectorStoreOnly: true,
+			}
+		}
+	}
 	return &An5Adapter{
 		DB:      db,
 		Dialect: base.DetectDialect(connStr),
 	}
 }
 
+// NewVectorAn5Adapter constructs a vector-only An5Adapter from a vector DB connection string.
+func NewVectorAn5Adapter(connStr string) (*An5Adapter, error) {
+	store, err := vector.CreateVectorStore(connStr)
+	if err != nil {
+		return nil, err
+	}
+	return &An5Adapter{
+		Dialect:         base.DialectSqlite,
+		VectorStore:     store,
+		VectorStoreOnly: true,
+	}, nil
+}
+
+// SetVectorStore attaches an external vector database provider to the adapter.
+func (a *An5Adapter) SetVectorStore(store vector.VectorStoreProvider) {
+	a.VectorStore = store
+}
+
+// VectorHealth checks the health of the attached external vector store.
+func (a *An5Adapter) VectorHealth(ctx context.Context) (map[string]interface{}, error) {
+	if a.VectorStore == nil {
+		return map[string]interface{}{"ok": false, "error": "no vector store configured"}, nil
+	}
+	return a.VectorStore.Health(ctx)
+}
+
 // Connect validates the database connection (ping).
 func (a *An5Adapter) Connect(ctx context.Context) error {
+	if a.VectorStoreOnly && a.VectorStore != nil {
+		_, err := a.VectorStore.Health(ctx)
+		return err
+	}
 	return a.DB.PingContext(ctx)
 }
 
 // Disconnect closes the underlying database connection pool.
 func (a *An5Adapter) Disconnect() error {
+	if a.DB == nil {
+		return nil
+	}
 	return a.DB.Close()
 }
 

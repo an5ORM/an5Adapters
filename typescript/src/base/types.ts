@@ -1,4 +1,5 @@
 import type { SqliteVectorSupport, VectorStrategyPreference } from '../sqlite/vector';
+import type { VectorStoreProvider } from '../vector/types';
 
 export type Dialect = 'mssql' | 'postgres' | 'mysql' | 'sqlite' | 'googlesheets';
 
@@ -10,6 +11,13 @@ export interface An5AdapterConfig {
    * run in NBase while the rows stay in `connectionString`'s database.
    */
   nbase?: string;
+  /**
+   * External vector database provider (connection string such as `qdrant://...`,
+   * `chroma://...`, `pinecone://...`, `weaviate://...`, `milvus://...`, `nbase://...`,
+   * or a {@link VectorStoreProvider} instance). When set alongside `connectionString`,
+   * `vectorSearch` queries the vector store and hydrates rows from the relational table.
+   */
+  vectorStore?: string | VectorStoreProvider;
   /**
    * Path to sqlite-vec or the AN5 native vector extension. On SQLite it is loaded before the
    * vector capabilities are probed, so `vectorSearch` ranks inside the database

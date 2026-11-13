@@ -11,7 +11,7 @@ Standalone runtime database adapter and query engine for AN5 ORM. Provides conne
 - **Query Builder & Dialects** — Dialect-aware SQL formatting for MSSQL, PostgreSQL, MySQL, and SQLite
 - **Aggregations & GroupBy** — Standard ORM aggregates (`_count`, `_sum`, `_avg`, `_min`, `_max`) and `groupBy`
 - **Field Math Operators** — Atomic updates with `increment`, `decrement`, `multiply`, `divide`, `set`
-- **Vector Search** — Similarity search using NBase, pgvector (PostgreSQL), `VECTOR_DISTANCE` (MSSQL), or in-memory cosine/euclidean/dot similarity
+- **Vector Search** — Similarity search using external vector databases (NBase, Qdrant, Chroma, Pinecone, Weaviate, Milvus), pgvector (PostgreSQL), `VECTOR_DISTANCE` (MSSQL), SQLite, or in-memory cosine/euclidean/dot similarity
 - **Real Transactions** — Interactive and callback transactions (`$transaction(async tx => ...)` and `$begin()/$commit()/$rollback()`)
 - **Cross-Language** — Unified API in TypeScript, Python, .NET (C#), Golang, Rust, Java, Kotlin, and Swift
 - **Google Sheets Database** — Use spreadsheets as a live database with full CRUD and SQL syntax support
@@ -126,28 +126,16 @@ SQLite.swift underneath instead.
 
 ---
 
-## NBase — Neural Vector Database
+## Vector Database Providers
 
-[NBase](https://github.com/N2FlowJS/nbase) is a partitioned vector database with
-HNSW, LSH and KNN indexing behind a REST API. an5 can run vector search there
-instead of loading every row into memory, which matters once a table holds
-millions of embeddings.
+`@an5/adapters` supports six external vector databases behind a unified `VectorStoreProvider` abstraction (`@an5/adapters/vector`). All providers work in two modes:
 
-The rows stay in your relational table: only the vectors move to NBase, each one
-tagged with its row id, and search results are hydrated from the table.
+1. **Vector-only mode** — pass the provider connection string as `connectionString` to query vectors directly without a relational database.
+2. **Sidecar mode** — keep your relational `connectionString` and pass `vectorStore` (or legacy `nbase`). Rows stay in your SQL table, `indexVectors()` syncs embeddings tagged with `an5Id` / `an5Model`, and `vectorSearch()` hydrates full rows from the relational table. If the vector provider is unreachable (`VectorProviderError`), `vectorSearch` logs a warning and falls back to the relational database's native vector support, then to in-memory similarity.
 
-### Configure
+### NBase (`nbase://`)
 
-NBase is configured through the connection string, like every other backend:
-
-```ts
-import { createAn5Adapter } from '@an5/adapters';
-
-const db = createAn5Adapter({ connectionString: 'nbase://localhost:1307' });
-await db.$connect(); // probes NBase
-```
-
-Accepted forms:
+[NBase](https://github.com/N2FlowJS/nbase) is a partitioned vector database with HNSW, LSH, and KNN indexing behind a REST API.
 
 | Form | Result |
 |------|--------|
@@ -157,59 +145,156 @@ Accepted forms:
 | `nbase:https://vectors.example.com` | `https://vectors.example.com` |
 | `nbase://localhost:1307?token=t&timeoutMs=500&method=hnsw` | options applied |
 
-`?token`, `?timeoutMs`, `?method`, `?idField` and `?modelField` are read from the
-query string, and a path is kept as a base path for deployments behind a
-reverse proxy.
-
-This adapter is **vector-only**: it has no relational database, so a search
-returns the NBase hits — id, metadata and `distance` — instead of table rows.
-
-### Search
-
-With an `nbase://` connection string, search returns the hits themselves:
+Query options: `token`, `timeoutMs`, `method`, `idField`, `modelField`.
 
 ```ts
-const hits = await db.article.vectorSearch({ vector: queryEmbedding, take: 5 });
-// hits[0] = { id: 'Article:42', an5Id: '42', an5Model: 'Article', distance: 0.11 }
-```
-
-### Search rows from your own table
-
-To get real rows back, keep your database connection string and point it at the
-same NBase instance. NBase is still configured with a connection string, never a
-params object:
-
-```ts
-const db = createAn5Adapter({
-  connectionString: 'sqlserver://localhost:1433;database=mydb',
-  nbase: 'nbase://localhost:1307',
-});
-
-await db.article.indexVectorsInNBase({ vectorField: 'embedding' });
-// → { indexed: 1200 }
-
-const hits = await db.article.vectorSearch({ vector: queryEmbedding, take: 5 });
-// hits[0] = { id, title, ..., distance }
-```
-
-Vectors are tagged with their row id, so a hit is hydrated from the table by
-that id and the result keeps the `{ ...row, distance }` shape the other engines
-return.
-
-### Standalone client
-
-```ts
+import { createAn5Adapter } from '@an5/adapters';
 import { createNBaseVectorClient } from '@an5/adapters/nbase';
 
+// Vector-only or sidecar (`nbase` alias also supported)
+const db = createAn5Adapter({
+  connectionString: 'sqlserver://localhost:1433;database=mydb',
+  vectorStore: 'nbase://localhost:1307',
+});
+await db.article.indexVectors({ vectorField: 'embedding' }); // or indexVectorsInNBase(...)
+const hits = await db.article.vectorSearch({ vector: queryEmbedding, take: 5 });
+
+// Standalone client
 const nbase = createNBaseVectorClient({ url: 'http://localhost:1307' });
 await nbase.health();
-await nbase.addVectors([{ id: 'a:1', vector: [0.1, 0.2], metadata: { an5Id: '1' } }]);
-const { results } = await nbase.search([0.1, 0.2], { k: 5, distanceMetric: 'cosine' });
 ```
 
-If NBase is unreachable, `vectorSearch` logs a warning and falls back to the
-database's native vector support, then to in-memory similarity, so an outage
-degrades performance rather than breaking queries.
+### Qdrant (`qdrant://`)
+
+Uses Qdrant's REST API (`/collections/{collection}/points/...`).
+
+- **Connection strings**: `qdrant://localhost:6333?collection=articles`, `qdrant:https://cloud.qdrant.io:6333?apiKey=...&collection=articles`
+- **Query options**: `collection`, `apiKey`, `timeoutMs`
+
+```ts
+import { createAn5Adapter } from '@an5/adapters';
+import { createQdrantClient } from '@an5/adapters/qdrant';
+
+const db = createAn5Adapter({
+  connectionString: 'sqlite:///app.db',
+  vectorStore: 'qdrant://localhost:6333?collection=articles&apiKey=secret',
+});
+await db.article.indexVectors({ vectorField: 'embedding' });
+const hits = await db.article.vectorSearch({ vector: queryEmbedding, take: 5 });
+
+// Standalone client
+const qdrant = createQdrantClient('qdrant://localhost:6333?collection=articles');
+await qdrant.health();
+```
+
+### Chroma / ChromaDB (`chroma://`)
+
+Uses Chroma's v2 REST API (`/api/v2/tenants/{tenant}/databases/{database}/collections`).
+
+- **Connection strings**: `chroma://localhost:8000?collection=articles&tenant=default_tenant&database=default_database`, `chroma:https://chroma.example.com?collection=articles&token=...`
+- **Query options**: `collection`, `tenant`, `database`, `token`, `timeoutMs`
+
+```ts
+import { createAn5Adapter } from '@an5/adapters';
+import { createChromaClient } from '@an5/adapters/chroma';
+
+const db = createAn5Adapter({
+  connectionString: 'chroma://localhost:8000?collection=articles',
+});
+await db.$connect();
+const hits = await db.article.vectorSearch({ vector: queryEmbedding, take: 5 });
+
+// Standalone client
+const chroma = createChromaClient('chroma://localhost:8000?collection=articles');
+await chroma.upsert([{ id: 'Article:1', vector: [0.1, 0.2], metadata: { an5Id: '1', an5Model: 'Article' } }]);
+```
+
+### Pinecone (`pinecone://`)
+
+Uses Pinecone's index data-plane REST API (`/vectors/upsert`, `/query`, `/vectors/delete`, `/describe_index_stats`).
+
+- **Connection strings**: `pinecone://my-index.svc.region.pinecone.io?apiKey=...&namespace=articles`, `pinecone:https://my-index.svc.region.pinecone.io?apiKey=...`
+- **Query options**: `apiKey`, `namespace`, `timeoutMs`
+
+```ts
+import { createAn5Adapter } from '@an5/adapters';
+import { createPineconeClient } from '@an5/adapters/pinecone';
+
+const db = createAn5Adapter({
+  connectionString: 'postgres://user:pass@localhost:5432/mydb',
+  vectorStore: 'pinecone://my-index.svc.region.pinecone.io?apiKey=pcsk_...&namespace=articles',
+});
+
+// Standalone client
+const pinecone = createPineconeClient({
+  url: 'https://my-index.svc.region.pinecone.io',
+  apiKey: 'pcsk_...',
+  namespace: 'articles',
+});
+const results = await pinecone.search([0.1, 0.2], { k: 5 });
+```
+
+### Weaviate (`weaviate://`)
+
+Uses Weaviate's REST & GraphQL API (`/v1/batch/objects`, `/v1/graphql`, `/v1/objects/...`, `/v1/.well-known/ready`).
+
+- **Connection strings**: `weaviate://localhost:8080?className=Article`, `weaviate:https://cluster.weaviate.network?className=Article&apiKey=...&tenant=t1`
+- **Query options**: `className` (or `collection`), `apiKey`, `tenant`, `timeoutMs`
+
+```ts
+import { createAn5Adapter } from '@an5/adapters';
+import { createWeaviateClient } from '@an5/adapters/weaviate';
+
+const db = createAn5Adapter({
+  connectionString: 'weaviate://localhost:8080?className=Article',
+});
+
+// Standalone client
+const weaviate = createWeaviateClient('weaviate://localhost:8080?className=Article');
+await weaviate.health();
+```
+
+### Milvus / Zilliz (`milvus://`)
+
+Uses Milvus / Zilliz Cloud v2 REST API (`/v2/vectordb/entities/upsert`, `/search`, `/delete`, `/collections/list`).
+
+- **Connection strings**: `milvus://localhost:19530?collection=articles&dbName=default`, `milvus:https://in01-xxx.api.gcp-us-west1.zillizcloud.com?collection=articles&token=...`
+- **Query options**: `collection`, `token`, `dbName`, `timeoutMs`
+
+```ts
+import { createAn5Adapter } from '@an5/adapters';
+import { createMilvusClient } from '@an5/adapters/milvus';
+
+const db = createAn5Adapter({
+  connectionString: 'milvus://localhost:19530?collection=articles&token=root:Milvus',
+});
+
+// Standalone client
+const milvus = createMilvusClient('milvus://localhost:19530?collection=articles');
+await milvus.health();
+```
+
+### Unified Factory & Multi-language Support
+
+Use `createVectorStore(connectionString)` to auto-detect any of the six providers at runtime:
+
+```ts
+import { createVectorStore } from '@an5/adapters/vector';
+
+const store = createVectorStore(process.env.VECTOR_URL!);
+await store.health();
+```
+
+Zero-dependency REST clients for all six vector providers (`nbase`, `qdrant`, `chroma`, `pinecone`, `weaviate`, `milvus`) are included across every language runtime:
+
+- **TypeScript**: `typescript/src/vector/` (`@an5/adapters/vector`)
+- **Python**: `python/base/vector_providers.py` (`create_vector_store`, `vector_store=...`, `index_vectors()`, `vector_health()`)
+- **Go**: `golang/vector/vector.go` (`vector.CreateVectorStore`, `NewVectorAn5Adapter`, `SetVectorStore`, `VectorHealth`)
+- **Rust**: `rust/src/vector.rs` (`an5_adapters::vector::HttpVectorClient`)
+- **Java**: `java/src/main/java/an5/adapters/vector/VectorStoreProvider.java`
+- **.NET**: `dotnet/Vector/VectorProviders.cs`
+- **Kotlin**: `kotlin/src/main/kotlin/an5/adapters/VectorProviders.kt`
+- **Swift**: `swift/Sources/An5Adapters/VectorProviders.swift`
 
 ---
 
@@ -388,6 +473,8 @@ db.transaction(perform_transfer)
 | `$begin()` | Interactive transaction returning `An5AdapterTx` |
 | `$connect()` | Open connection / pool |
 | `$disconnect()` | Close connections |
+| `vectorStore()` | Return the configured `VectorStoreProvider` instance (if any) |
+| `$vectorHealth()` | Probe health of the configured external vector store |
 
 ### `AdapterTableClient`
 
@@ -406,7 +493,8 @@ db.transaction(perform_transfer)
 | `count(args)` | Count matching records |
 | `aggregate(args)` | Compute `_count`, `_sum`, `_avg`, `_min`, `_max` |
 | `groupBy(args)` | Group by fields with aggregations and pagination |
-| `vectorSearch(args)` | Semantic vector similarity search; SQLite ranks it in the database (sqlite-vec, `an5_vec_*`, `json_each`), everything else uses the engine's native support or scores in memory |
+| `indexVectors(args)` | Index table embeddings into the configured `vectorStore` (`indexVectorsInNBase` alias also supported) |
+| `vectorSearch(args)` | Semantic vector similarity search; uses `vectorStore` (NBase, Qdrant, Chroma, Pinecone, Weaviate, Milvus) when configured, SQLite in-DB ranking, native SQL vector distance, or in-memory fallback |
 
 Generated TypeScript field metadata marks schema primary keys with `isId: true`.
 SQL and Google Sheets `create` use this marker to identify custom primary-key

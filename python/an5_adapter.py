@@ -5,6 +5,12 @@ from typing import Dict, List, Optional, Any
 try:
     from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, detect_dialect, set_adapter_metadata
     from .base.vectors import decode_vector, encode_vector, vector_distance
+    from .base.vector_providers import (
+        VectorProviderError,
+        VectorStoreProvider,
+        create_vector_store,
+        is_vector_connection_string,
+    )
     from .mssql import connect as connect_mssql
     from .postgres import connect as connect_postgres
     from .sqlite import connect as connect_sqlite, is_memory as is_sqlite_memory, register_vector_functions as register_sqlite_vector_functions
@@ -12,6 +18,12 @@ try:
 except ImportError:
     from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, detect_dialect, set_adapter_metadata
     from base.vectors import decode_vector, encode_vector, vector_distance
+    from base.vector_providers import (
+        VectorProviderError,
+        VectorStoreProvider,
+        create_vector_store,
+        is_vector_connection_string,
+    )
     from mssql import connect as connect_mssql
     from postgres import connect as connect_postgres
     from sqlite import connect as connect_sqlite, is_memory as is_sqlite_memory, register_vector_functions as register_sqlite_vector_functions
@@ -25,9 +37,24 @@ except ImportError:
     from mssql import parse_connection_string as _parse_connection_string
 
 class An5Adapter:
-    def __init__(self, connection_string: str, sqlite_vec: Optional[str] = None, vector_strategy: Optional[str] = None):
-        self._dialect = detect_dialect(connection_string)
+    def __init__(
+        self,
+        connection_string: str,
+        sqlite_vec: Optional[str] = None,
+        vector_strategy: Optional[str] = None,
+        vector_store: Optional[Any] = None,
+    ):
         self._conn_str = connection_string
+        self._vector_store: Optional[VectorStoreProvider] = None
+        self._vector_store_only: bool = False
+        if is_vector_connection_string(connection_string):
+            self._vector_store = create_vector_store(connection_string)
+            self._vector_store_only = True
+            self._dialect = DIALECT_SQLITE
+        else:
+            self._dialect = detect_dialect(connection_string)
+            if vector_store is not None:
+                self._vector_store = create_vector_store(vector_store)
         # SQLite only. `sqlite_vec` names the extension binary to load;
         # `vector_strategy` pins one of "sqlite-vec" | "udf" | "sql" | "memory"
         # instead of probing for the fastest one available.
@@ -43,7 +70,24 @@ class An5Adapter:
         # gone as soon as every connection is closed.
         self._conn = None
 
+    def vector_store(self) -> Optional[VectorStoreProvider]:
+        """Returns the configured external vector store provider, if any."""
+        return self._vector_store
+
+    @property
+    def vector_store_only(self) -> bool:
+        """True when configured with a vector-only connection string."""
+        return self._vector_store_only
+
+    def vector_health(self) -> Dict[str, Any]:
+        """Health check for the configured external vector store."""
+        if self._vector_store is None:
+            return {"ok": False, "error": "No vector store configured."}
+        return self._vector_store.health()
+
     def _connect(self):
+        if self._vector_store_only:
+            raise RuntimeError("Adapter is configured in vector-only mode and has no relational database connection.")
         if self._dialect == DIALECT_POSTGRES:
             return connect_postgres(self._conn_str)
         if self._dialect == DIALECT_SQLITE:
