@@ -7,6 +7,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
 import java.net.HttpURLConnection;
+import java.net.URI;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -72,7 +73,7 @@ public final class VectorStoreProvider {
     }
 
     private static final Transport DEFAULT_TRANSPORT = (method, urlStr, headers, body, timeout) -> {
-        URL url = new URL(urlStr);
+        URL url = URI.create(urlStr).toURL();
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         int timeoutMs = (int) Math.min(timeout.toMillis(), (long) Integer.MAX_VALUE);
         conn.setConnectTimeout(timeoutMs);
