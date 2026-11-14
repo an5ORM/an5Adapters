@@ -1,11 +1,14 @@
 package an5.adapters.vector;
 
+import java.io.BufferedReader;
 import java.io.IOException;
-import java.net.URI;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.UnsupportedEncodingException;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
@@ -13,8 +16,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Unified vector database client for AN5 ORM (Java) using {@code java.net.http.HttpClient}.
- * Supports NBase, Qdrant, Chroma, Pinecone, Weaviate, and Milvus with zero external dependencies.
+ * Unified vector database client for AN5 ORM (Java) using {@code java.net.HttpURLConnection}.
+ * Supports NBase, Qdrant, Chroma, Pinecone, Weaviate, and Milvus with zero external dependencies,
+ * fully compatible with Java 8 / Android bytecode targets.
  */
 public final class VectorStoreProvider {
 
@@ -67,22 +71,49 @@ public final class VectorStoreProvider {
                 throws IOException, InterruptedException;
     }
 
-    private static final Transport DEFAULT_TRANSPORT = (method, url, headers, body, timeout) -> {
-        HttpClient client = HttpClient.newBuilder().connectTimeout(timeout).build();
-        HttpRequest.Builder builder = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(timeout)
-                .header("Content-Type", "application/json");
-        headers.forEach(builder::header);
-        HttpRequest.BodyPublisher publisher = body == null
-                ? HttpRequest.BodyPublishers.noBody()
-                : HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8);
-        builder.method(method, publisher);
-        HttpResponse<String> resp = client.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        if (resp.statusCode() >= 400) {
-            throw new IOException("HTTP " + resp.statusCode() + " from " + url + ": " + resp.body());
+    private static final Transport DEFAULT_TRANSPORT = (method, urlStr, headers, body, timeout) -> {
+        URL url = new URL(urlStr);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        int timeoutMs = (int) Math.min(timeout.toMillis(), (long) Integer.MAX_VALUE);
+        conn.setConnectTimeout(timeoutMs);
+        conn.setReadTimeout(timeoutMs);
+        conn.setRequestMethod(method);
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setRequestProperty("Accept", "application/json");
+        if (headers != null) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                conn.setRequestProperty(entry.getKey(), entry.getValue());
+            }
         }
-        return resp.body();
+        if (body != null && !body.isEmpty()) {
+            conn.setDoOutput(true);
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            conn.setFixedLengthStreamingMode(bytes.length);
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(bytes);
+                os.flush();
+            }
+        }
+        int code = conn.getResponseCode();
+        InputStream is = (code >= 400) ? conn.getErrorStream() : conn.getInputStream();
+        if (is == null) {
+            if (code >= 400) {
+                throw new IOException("HTTP " + code + " from " + urlStr);
+            }
+            return "";
+        }
+        StringBuilder resp = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+            char[] buf = new char[4096];
+            int n;
+            while ((n = reader.read(buf)) != -1) {
+                resp.append(buf, 0, n);
+            }
+        }
+        if (code >= 400) {
+            throw new IOException("HTTP " + code + " from " + urlStr + ": " + resp.toString());
+        }
+        return resp.toString();
     };
 
     private final Kind kind;
@@ -170,14 +201,30 @@ public final class VectorStoreProvider {
             }
         }
         String defaultScheme = kind == Kind.PINECONE ? "https" : "http";
-        String fallbackHost = switch (kind) {
-            case NBASE -> "localhost:1307";
-            case QDRANT -> "localhost:6333";
-            case CHROMA -> "localhost:8000";
-            case PINECONE -> "localhost";
-            case WEAVIATE -> "localhost:8080";
-            case MILVUS -> "localhost:19530";
-        };
+        String fallbackHost;
+        switch (kind) {
+            case NBASE:
+                fallbackHost = "localhost:1307";
+                break;
+            case QDRANT:
+                fallbackHost = "localhost:6333";
+                break;
+            case CHROMA:
+                fallbackHost = "localhost:8000";
+                break;
+            case PINECONE:
+                fallbackHost = "localhost";
+                break;
+            case WEAVIATE:
+                fallbackHost = "localhost:8080";
+                break;
+            case MILVUS:
+                fallbackHost = "localhost:19530";
+                break;
+            default:
+                fallbackHost = "localhost";
+                break;
+        }
         String endpoint = host.isEmpty()
                 ? defaultScheme + "://" + fallbackHost
                 : (host.contains("://") ? host : defaultScheme + "://" + host);
@@ -225,12 +272,26 @@ public final class VectorStoreProvider {
     public boolean health() {
         try {
             switch (kind) {
-                case NBASE -> call("GET", "/health", null);
-                case QDRANT -> call("GET", "/healthz", null);
-                case CHROMA -> call("GET", "/api/v2/heartbeat", null);
-                case PINECONE -> call("POST", "/describe_index_stats", "{}");
-                case WEAVIATE -> call("GET", "/v1/.well-known/ready", null);
-                case MILVUS -> call("POST", "/v2/vectordb/collections/list", dbName != null ? "{\"dbName\":" + quote(dbName) + "}" : "{}");
+                case NBASE:
+                    call("GET", "/health", null);
+                    break;
+                case QDRANT:
+                    call("GET", "/healthz", null);
+                    break;
+                case CHROMA:
+                    call("GET", "/api/v2/heartbeat", null);
+                    break;
+                case PINECONE:
+                    call("POST", "/describe_index_stats", "{}");
+                    break;
+                case WEAVIATE:
+                    call("GET", "/v1/.well-known/ready", null);
+                    break;
+                case MILVUS:
+                    call("POST", "/v2/vectordb/collections/list", dbName != null ? "{\"dbName\":" + quote(dbName) + "}" : "{}");
+                    break;
+                default:
+                    return false;
             }
             return true;
         } catch (Exception e) {
@@ -241,7 +302,7 @@ public final class VectorStoreProvider {
     public int upsert(List<VectorRecord> vectors) throws IOException, InterruptedException {
         if (vectors == null || vectors.isEmpty()) return 0;
         switch (kind) {
-            case NBASE -> {
+            case NBASE: {
                 StringBuilder sb = new StringBuilder("[");
                 for (int i = 0; i < vectors.size(); i++) {
                     if (i > 0) sb.append(',');
@@ -250,8 +311,9 @@ public final class VectorStoreProvider {
                 }
                 sb.append(']');
                 call("POST", "/api/vectors", sb.toString());
+                break;
             }
-            case QDRANT -> {
+            case QDRANT: {
                 StringBuilder sb = new StringBuilder("{\"points\":[");
                 for (int i = 0; i < vectors.size(); i++) {
                     if (i > 0) sb.append(',');
@@ -260,8 +322,9 @@ public final class VectorStoreProvider {
                 }
                 sb.append("]}");
                 call("PUT", "/collections/" + enc(collection) + "/points?wait=true", sb.toString());
+                break;
             }
-            case CHROMA -> {
+            case CHROMA: {
                 String cid = resolveChromaId(collection);
                 StringBuilder ids = new StringBuilder("[");
                 StringBuilder embs = new StringBuilder("[");
@@ -273,8 +336,9 @@ public final class VectorStoreProvider {
                 ids.append(']');
                 embs.append(']');
                 call("POST", chromaBase() + "/" + enc(cid) + "/upsert", "{\"ids\":" + ids + ",\"embeddings\":" + embs + "}");
+                break;
             }
-            case PINECONE -> {
+            case PINECONE: {
                 StringBuilder sb = new StringBuilder("{\"vectors\":[");
                 for (int i = 0; i < vectors.size(); i++) {
                     if (i > 0) sb.append(',');
@@ -285,8 +349,9 @@ public final class VectorStoreProvider {
                 if (namespace != null && !namespace.isEmpty()) sb.append(",\"namespace\":").append(quote(namespace));
                 sb.append('}');
                 call("POST", "/vectors/upsert", sb.toString());
+                break;
             }
-            case WEAVIATE -> {
+            case WEAVIATE: {
                 StringBuilder sb = new StringBuilder("{\"objects\":[");
                 for (int i = 0; i < vectors.size(); i++) {
                     if (i > 0) sb.append(',');
@@ -295,8 +360,9 @@ public final class VectorStoreProvider {
                 }
                 sb.append("]}");
                 call("POST", "/v1/batch/objects", sb.toString());
+                break;
             }
-            case MILVUS -> {
+            case MILVUS: {
                 StringBuilder sb = new StringBuilder("{\"collectionName\":").append(quote(collection)).append(",\"data\":[");
                 for (int i = 0; i < vectors.size(); i++) {
                     if (i > 0) sb.append(',');
@@ -307,21 +373,32 @@ public final class VectorStoreProvider {
                 if (dbName != null) sb.append(",\"dbName\":").append(quote(dbName));
                 sb.append('}');
                 call("POST", "/v2/vectordb/entities/upsert", sb.toString());
+                break;
             }
+            default:
+                break;
         }
         return vectors.size();
     }
 
     public String searchRaw(List<Double> vector, int k) throws IOException, InterruptedException {
         String vec = vecJson(vector);
-        return switch (kind) {
-            case NBASE -> call("POST", "/api/search", "{\"vector\":" + vec + ",\"k\":" + k + ",\"includeMetadata\":true}");
-            case QDRANT -> call("POST", "/collections/" + enc(collection) + "/points/search", "{\"vector\":" + vec + ",\"limit\":" + k + ",\"with_payload\":true}");
-            case CHROMA -> call("POST", chromaBase() + "/" + enc(resolveChromaId(collection)) + "/query", "{\"query_embeddings\":[" + vec + "],\"n_results\":" + k + "}");
-            case PINECONE -> call("POST", "/query", "{\"vector\":" + vec + ",\"topK\":" + k + ",\"includeMetadata\":true" + (namespace != null ? ",\"namespace\":" + quote(namespace) : "") + "}");
-            case WEAVIATE -> call("POST", "/v1/graphql", "{\"query\":" + quote("{ Get { " + collection + "(nearVector: { vector: " + vec + " }, limit: " + k + ") { _additional { id distance } } } }") + "}");
-            case MILVUS -> call("POST", "/v2/vectordb/entities/search", "{\"collectionName\":" + quote(collection) + ",\"data\":[" + vec + "],\"limit\":" + k + ",\"outputFields\":[\"*\"]}");
-        };
+        switch (kind) {
+            case NBASE:
+                return call("POST", "/api/search", "{\"vector\":" + vec + ",\"k\":" + k + ",\"includeMetadata\":true}");
+            case QDRANT:
+                return call("POST", "/collections/" + enc(collection) + "/points/search", "{\"vector\":" + vec + ",\"limit\":" + k + ",\"with_payload\":true}");
+            case CHROMA:
+                return call("POST", chromaBase() + "/" + enc(resolveChromaId(collection)) + "/query", "{\"query_embeddings\":[" + vec + "],\"n_results\":" + k + "}");
+            case PINECONE:
+                return call("POST", "/query", "{\"vector\":" + vec + ",\"topK\":" + k + ",\"includeMetadata\":true" + (namespace != null ? ",\"namespace\":" + quote(namespace) : "") + "}");
+            case WEAVIATE:
+                return call("POST", "/v1/graphql", "{\"query\":" + quote("{ Get { " + collection + "(nearVector: { vector: " + vec + " }, limit: " + k + ") { _additional { id distance } } } }") + "}");
+            case MILVUS:
+                return call("POST", "/v2/vectordb/entities/search", "{\"collectionName\":" + quote(collection) + ",\"data\":[" + vec + "],\"limit\":" + k + ",\"outputFields\":[\"*\"]}");
+            default:
+                throw new IllegalStateException("Unhandled vector database kind: " + kind);
+        }
     }
 
     private String chromaBase() {
@@ -346,7 +423,11 @@ public final class VectorStoreProvider {
     }
 
     private static String enc(String s) {
-        return URLEncoder.encode(s, StandardCharsets.UTF_8);
+        try {
+            return URLEncoder.encode(s, "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private static String quote(String s) {
