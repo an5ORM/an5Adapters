@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.18] - 2026-11-15
+
+### Changed
+- Removed the redundant `vectorStore` option from adapter configuration; vector database providers (`nbase`, `qdrant`, `chroma`, `pinecone`, `weaviate`, `milvus`) are configured directly via `connectionString`.
+- Improved Java 8 and Android compatibility in the Java adapter using `URI.create().toURL()` cleanly without deprecation or `-Werror` issues.
+
 ## [0.2.17] - 2026-11-12
 
 ### Added
