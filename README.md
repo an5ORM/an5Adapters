@@ -128,10 +128,7 @@ SQLite.swift underneath instead.
 
 ## Vector Database Providers
 
-`@an5/adapters` supports six external vector databases behind a unified `VectorStoreProvider` abstraction (`@an5/adapters/vector`). All providers work in two modes:
-
-1. **Vector-only mode** — pass the provider connection string as `connectionString` to query vectors directly without a relational database.
-2. **Sidecar mode** — keep your relational `connectionString` and pass `vectorStore` (or legacy `nbase`). Rows stay in your SQL table, `indexVectors()` syncs embeddings tagged with `an5Id` / `an5Model`, and `vectorSearch()` hydrates full rows from the relational table. If the vector provider is unreachable (`VectorProviderError`), `vectorSearch` logs a warning and falls back to the relational database's native vector support, then to in-memory similarity.
+`@an5/adapters` supports six external vector databases behind a unified `VectorStoreProvider` abstraction (`@an5/adapters/vector`). Pass any vector database URI directly as `connectionString` to `createAn5Adapter`.
 
 ### NBase (`nbase://`)
 
@@ -151,12 +148,10 @@ Query options: `token`, `timeoutMs`, `method`, `idField`, `modelField`.
 import { createAn5Adapter } from '@an5/adapters';
 import { createNBaseVectorClient } from '@an5/adapters/nbase';
 
-// Vector-only or sidecar (`nbase` alias also supported)
 const db = createAn5Adapter({
-  connectionString: 'sqlserver://localhost:1433;database=mydb',
-  vectorStore: 'nbase://localhost:1307',
+  connectionString: 'nbase://localhost:1307',
 });
-await db.article.indexVectors({ vectorField: 'embedding' }); // or indexVectorsInNBase(...)
+await db.$connect();
 const hits = await db.article.vectorSearch({ vector: queryEmbedding, take: 5 });
 
 // Standalone client
@@ -176,10 +171,9 @@ import { createAn5Adapter } from '@an5/adapters';
 import { createQdrantClient } from '@an5/adapters/qdrant';
 
 const db = createAn5Adapter({
-  connectionString: 'sqlite:///app.db',
-  vectorStore: 'qdrant://localhost:6333?collection=articles&apiKey=secret',
+  connectionString: 'qdrant://localhost:6333?collection=articles&apiKey=secret',
 });
-await db.article.indexVectors({ vectorField: 'embedding' });
+await db.$connect();
 const hits = await db.article.vectorSearch({ vector: queryEmbedding, take: 5 });
 
 // Standalone client
@@ -221,8 +215,7 @@ import { createAn5Adapter } from '@an5/adapters';
 import { createPineconeClient } from '@an5/adapters/pinecone';
 
 const db = createAn5Adapter({
-  connectionString: 'postgres://user:pass@localhost:5432/mydb',
-  vectorStore: 'pinecone://my-index.svc.region.pinecone.io?apiKey=pcsk_...&namespace=articles',
+  connectionString: 'pinecone://my-index.svc.region.pinecone.io?apiKey=pcsk_...&namespace=articles',
 });
 
 // Standalone client
@@ -288,7 +281,7 @@ await store.health();
 Zero-dependency REST clients for all six vector providers (`nbase`, `qdrant`, `chroma`, `pinecone`, `weaviate`, `milvus`) are included across every language runtime:
 
 - **TypeScript**: `typescript/src/vector/` (`@an5/adapters/vector`)
-- **Python**: `python/base/vector_providers.py` (`create_vector_store`, `vector_store=...`, `index_vectors()`, `vector_health()`)
+- **Python**: `python/base/vector_providers.py` (`create_vector_store`, `create_an5_adapter("qdrant://...")`, `vector_health()`)
 - **Go**: `golang/vector/vector.go` (`vector.CreateVectorStore`, `NewVectorAn5Adapter`, `SetVectorStore`, `VectorHealth`)
 - **Rust**: `rust/src/vector.rs` (`an5_adapters::vector::HttpVectorClient`)
 - **Java**: `java/src/main/java/an5/adapters/vector/VectorStoreProvider.java`
@@ -494,7 +487,7 @@ db.transaction(perform_transfer)
 | `aggregate(args)` | Compute `_count`, `_sum`, `_avg`, `_min`, `_max` |
 | `groupBy(args)` | Group by fields with aggregations and pagination |
 | `indexVectors(args)` | Index table embeddings into the configured `vectorStore` (`indexVectorsInNBase` alias also supported) |
-| `vectorSearch(args)` | Semantic vector similarity search; uses `vectorStore` (NBase, Qdrant, Chroma, Pinecone, Weaviate, Milvus) when configured, SQLite in-DB ranking, native SQL vector distance, or in-memory fallback |
+| `vectorSearch(args)` | Semantic vector similarity search; uses dedicated vector stores (NBase, Qdrant, Chroma, Pinecone, Weaviate, Milvus) when configured via `connectionString`, SQLite in-DB ranking, native SQL vector distance, or in-memory fallback |
 
 Generated TypeScript field metadata marks schema primary keys with `isId: true`.
 SQL and Google Sheets `create` use this marker to identify custom primary-key

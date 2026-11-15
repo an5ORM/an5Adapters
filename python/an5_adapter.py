@@ -42,7 +42,6 @@ class An5Adapter:
         connection_string: str,
         sqlite_vec: Optional[str] = None,
         vector_strategy: Optional[str] = None,
-        vector_store: Optional[Any] = None,
     ):
         self._conn_str = connection_string
         self._vector_store: Optional[VectorStoreProvider] = None
@@ -53,8 +52,6 @@ class An5Adapter:
             self._dialect = DIALECT_SQLITE
         else:
             self._dialect = detect_dialect(connection_string)
-            if vector_store is not None:
-                self._vector_store = create_vector_store(vector_store)
         # SQLite only. `sqlite_vec` names the extension binary to load;
         # `vector_strategy` pins one of "sqlite-vec" | "udf" | "sql" | "memory"
         # instead of probing for the fastest one available.

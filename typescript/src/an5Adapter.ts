@@ -328,9 +328,7 @@ export class An5Adapter {
 
     // `nbase://host:port` (or any vector provider URL such as `qdrant://...`,
     // `chroma://...`, `pinecone://...`, `weaviate://...`, `milvus://...`) as
-    // the connection string configures a vector-only adapter with no relational
-    // database. Passing it via `nbase` or `vectorStore` keeps `connectionString`
-    // as the relational source of rows.
+    // `connectionString` configures a vector adapter directly.
     const rawConnectionString = String(this._engineConfig.connectionString ?? '').trim();
     if (isNBaseConnectionString(rawConnectionString)) {
       this._nbaseConfig = parseNBaseConnectionString(rawConnectionString);
@@ -347,9 +345,6 @@ export class An5Adapter {
     const attached = this._engineConfig.nbase;
     if (attached && isNBaseConnectionString(attached)) {
       this._nbaseConfig = parseNBaseConnectionString(attached);
-    }
-    if (this._engineConfig.vectorStore) {
-      this._vectorStore = createVectorStore(this._engineConfig.vectorStore);
     }
 
     if ((adapterConfig as any).engine) {
@@ -1583,7 +1578,7 @@ export class AdapterTableClient<T = any> {
         return this.indexVectorsInNBase(args);
       }
       throw new Error(
-        'No vector store configured. Pass `vectorStore` (e.g. `qdrant://localhost:6333`, `chroma://localhost:8000`, `pinecone://...`, `weaviate://localhost:8080`, `milvus://localhost:19530`, or `nbase://localhost:1307`).',
+        'No vector store configured. Pass a vector provider URI in `connectionString` (e.g. `qdrant://localhost:6333`, `chroma://localhost:8000`, `pinecone://...`, `weaviate://localhost:8080`, `milvus://localhost:19530`, or `nbase://localhost:1307`).',
       );
     }
     if (this.adapter.vectorStoreOnly) {

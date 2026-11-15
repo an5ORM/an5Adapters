@@ -138,44 +138,18 @@ class TestPythonVectorProviders(unittest.TestCase):
         self.assertEqual(n.search([1.0, 0.0])[0]["distance"], 0.12)
         self.assertEqual(n.delete(["Doc:1"])["deleted"], 1)
 
-    def test_adapter_sidecar_and_vector_only(self):
-        vec_only = An5Adapter("qdrant://localhost:6333/docs")
-        self.assertTrue(vec_only.vector_store_only)
-        self.assertEqual(vec_only.vector_store().provider, "qdrant")
-
-        set_adapter_metadata({
-            "modelToTable": {"Doc": "docs"},
-            "modelFields": {
-                "Doc": [
-                    {"name": "id", "sql": "TEXT", "isId": True},
-                    {"name": "title", "sql": "TEXT"},
-                    {"name": "embedding", "sql": "VECTOR(2)"},
-                ]
-            },
-        })
-        req, _ = make_requester({
-            "GET /healthz": {"status": "ok"},
-            "PUT /collections/docs/points?wait=true": {"status": "ok"},
-            "POST /collections/docs/points/search": {
-                "result": [
-                    {"id": "Doc:d2", "score": 0.95, "payload": {"an5Id": "d2", "an5Model": "Doc"}},
-                    {"id": "Doc:d1", "score": 0.70, "payload": {"an5Id": "d1", "an5Model": "Doc"}},
-                ]
-            },
-        })
-        store = QdrantVectorClient("http://localhost:6333", collection="docs", requester=req)
-        db = An5Adapter("sqlite:///:memory:", vector_store=store)
-        db.execute_raw("CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT, embedding BLOB)")
-        doc = db.table("Doc")
-        doc.create({"id": "d1", "title": "First", "embedding": [1.0, 0.0]})
-        doc.create({"id": "d2", "title": "Second", "embedding": [0.0, 1.0]})
-
-        self.assertTrue(db.vector_health()["ok"])
-        self.assertEqual(doc.index_vectors(vector_field="embedding")["indexed"], 2)
-        res = doc.vector_search([0.0, 1.0], take=2)
-        self.assertEqual([r["id"] for r in res], ["d2", "d1"])
-        self.assertAlmostEqual(res[0]["distance"], 0.05)
-        db.close()
+    def test_adapter_connection_string_providers(self):
+        for uri, expected in [
+            ("nbase://localhost:1307", "nbase"),
+            ("qdrant://localhost:6333/docs", "qdrant"),
+            ("chroma://localhost:8000?collection=docs", "chroma"),
+            ("pinecone:https://idx.svc.region.pinecone.io?apiKey=k", "pinecone"),
+            ("weaviate://localhost:8080?className=Doc", "weaviate"),
+            ("milvus://localhost:19530?collection=docs", "milvus"),
+        ]:
+            db = An5Adapter(uri)
+            self.assertTrue(db.vector_store_only)
+            self.assertEqual(db.vector_store().provider, expected)
 
 
 if __name__ == "__main__":

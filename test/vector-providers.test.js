@@ -312,82 +312,19 @@ async function main() {
     assert.strictEqual(db.vectorStore().provider, 'qdrant');
   });
 
-  await atest('sidecar vectorStore hydrates rows from relational table and supports indexVectors', async () => {
-    const aliases = ['Doc', 'doc', 'Docs', 'docs'];
-    const docFields = {
-      id: { ts: 'string', sql: 'TEXT', isId: true },
-      title: { ts: 'string', sql: 'TEXT' },
-      embedding: { ts: 'number[] | string', sql: 'VECTOR(2)' },
-    };
-    setAdapterMetadata({
-      modelToTable: Object.fromEntries(aliases.map((n) => [n, '[docs]'])),
-      modelFields: Object.fromEntries(aliases.map((n) => [n, docFields])),
-    });
-
-    const { impl } = stubFetch({
-      'GET /healthz': { body: { status: 'ok' } },
-      'PUT /collections/docs/points?wait=true': { body: { status: 'ok' } },
-      'POST /collections/docs/points/search': {
-        body: {
-          result: [
-            { id: 'Doc:d2', score: 0.95, payload: { an5Id: 'd2', an5Model: 'Doc' } },
-            { id: 'Doc:d1', score: 0.7, payload: { an5Id: 'd1', an5Model: 'Doc' } },
-          ],
-        },
-      },
-    });
-
-    const store = new QdrantVectorClient({
-      url: 'http://localhost:6333',
-      collection: 'docs',
-      fetchImpl: impl,
-    });
-
-    const db = createAn5Adapter({
-      connectionString: 'sqlite::memory:',
-      vectorStore: store,
-    });
-    await db.$connect();
-    await db.$executeRaw('CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT, embedding BLOB)');
-    await db.doc.create({ data: { id: 'd1', title: 'First', embedding: [1, 0] } });
-    await db.doc.create({ data: { id: 'd2', title: 'Second', embedding: [0, 1] } });
-
-    const health = await db.$vectorHealth();
-    assert.strictEqual(health.ok, true);
-    assert.strictEqual(health.provider, 'qdrant');
-
-    const indexed = await db.doc.indexVectors({ vectorField: 'embedding' });
-    assert.strictEqual(indexed.indexed, 2);
-
-    const results = await db.doc.vectorSearch({ vector: [0, 1], take: 2 });
-    assert.strictEqual(results.length, 2);
-    assert.strictEqual(results[0].id, 'd2');
-    assert.strictEqual(results[0].title, 'Second');
-    assert.ok(Math.abs(results[0].distance - 0.05) < 1e-9);
-    await db.$disconnect();
-  });
-
-  await atest('vectorStore outage falls back to relational dialect instead of failing', async () => {
-    const failingFetch = async () => {
-      throw new Error('ECONNREFUSED');
-    };
-    const store = new QdrantVectorClient({
-      url: 'http://down:6333',
-      collection: 'docs',
-      fetchImpl: failingFetch,
-    });
-    const db = createAn5Adapter({
-      connectionString: 'sqlite::memory:',
-      vectorStore: store,
-    });
-    await db.$connect();
-    await db.$executeRaw('CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT, embedding BLOB)');
-    await db.doc.create({ data: { id: 'd1', title: 'Fallback', embedding: [1, 0] } });
-
-    const results = await db.doc.vectorSearch({ vector: [1, 0], take: 1 });
-    assert.strictEqual(results.length, 1);
-    assert.strictEqual(results[0].id, 'd1');
-    await db.$disconnect();
+  await atest('connectionString supports all vector providers in An5Adapter', async () => {
+    for (const [uri, expected] of [
+      ['nbase://localhost:1307', 'nbase'],
+      ['qdrant://localhost:6333?collection=docs', 'qdrant'],
+      ['chroma://localhost:8000?collection=docs', 'chroma'],
+      ['pinecone:https://idx.svc.region.pinecone.io?apiKey=k', 'pinecone'],
+      ['weaviate://localhost:8080?className=Doc', 'weaviate'],
+      ['milvus://localhost:19530?collection=docs', 'milvus'],
+    ]) {
+      const db = createAn5Adapter({ connectionString: uri });
+      assert.strictEqual(db.vectorStoreOnly, true);
+      assert.strictEqual(db.vectorStore().provider, expected);
+    }
   });
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
