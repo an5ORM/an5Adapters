@@ -33,7 +33,7 @@ import {
   type VectorHealthResult,
   type VectorStoreProvider,
 } from './vector';
-import { bindParam, buildOrderBy, parseWhere, quote } from './base/sql';
+import { bindParam, buildOrderBy, parseWhere, quote, type WhereContext } from './base/sql';
 import {
   decodeVector,
   isVectorField,
@@ -46,11 +46,13 @@ import {
 import {
   createAdapterProxy,
   getFieldsForModel,
+  getModelFieldsMap,
   resolveIdField,
   getModelToTable,
   getRelationMap,
   getRelationsForModel,
-  type RelationDef,
+  resolveModelRelation,
+  resolveRelationKeys,
 } from './base/metadata';
 export type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
 export { setAdapterMetadata, createAdapterProxy, type AdapterMetadata } from './base/metadata';
@@ -193,14 +195,12 @@ async function resolveIncludes(
       continue;
     }
 
-    const relation = modelRelations[key];
-    if (!relation) continue;
+    const relMatch = resolveModelRelation(modelName, key);
+    if (!relMatch) continue;
+    const relation = relMatch.relation;
 
     const isMany = relation.relationType === 'many';
-    const localKey = relation.localKey;
-    const foreignKey = relation.foreignKey;
-    const joinKey = isMany ? localKey : foreignKey;
-    const matchKey = isMany ? foreignKey : localKey;
+    const { childKey: matchKey, parentKey: joinKey } = resolveRelationKeys(modelName, relation, undefined, true);
     const uniqueKeys = Array.from(new Set(rows.map(r => r[joinKey]).filter(k => k !== undefined && k !== null)));
 
     if (uniqueKeys.length === 0) {
@@ -235,13 +235,13 @@ async function resolveIncludes(
 
     const groupMap = new Map<any, any[]>();
     relatedRows.forEach((r: any, idx: number) => {
-      const k = r[isMany ? foreignKey : localKey];
+      const k = r[matchKey];
       if (!groupMap.has(k)) groupMap.set(k, []);
       groupMap.get(k)!.push(outputRows[idx]);
     });
 
     rows.forEach(r => {
-      const k = r[isMany ? localKey : foreignKey];
+      const k = r[joinKey];
       const matches = groupMap.get(k) || [];
       if (isMany) {
         r[key] = matches;
@@ -860,10 +860,11 @@ export class AdapterTableClient<T = any> {
   }
 
   /** Build the shared context used by parseWhere to resolve relations and self references. */
-  private whereContext(): { relationMap: Record<string, Record<string, RelationDef>>; modelToTable: Record<string, string>; selfRef: string } {
+  private whereContext(): WhereContext {
     return {
       relationMap: getRelationMap(),
       modelToTable: getModelToTable(),
+      modelFields: getModelFieldsMap(),
       selfRef: this.tableName,
     };
   }

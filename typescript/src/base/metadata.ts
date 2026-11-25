@@ -92,14 +92,42 @@ export function setAdapterMetadata(metadata: AdapterMetadata): void {
   relationMap = { ...(metadata.relationMap || {}) };
 }
 
+export function toSnakeCase(name: string): string {
+  return String(name)
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+    .toLowerCase();
+}
+
+export function resolveModelEntry<T>(
+  map: Record<string, T> | undefined,
+  modelName: string
+): T | undefined {
+  if (!map || !modelName) return undefined;
+  if (Object.prototype.hasOwnProperty.call(map, modelName)) return map[modelName];
+  const camel = modelName.charAt(0).toLowerCase() + modelName.slice(1);
+  if (Object.prototype.hasOwnProperty.call(map, camel)) return map[camel];
+  const lower = modelName.toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(map, lower)) return map[lower];
+  for (const [k, v] of Object.entries(map)) {
+    if (k.toLowerCase() === lower) return v;
+  }
+  return undefined;
+}
+
 export function getModelToTable(): Record<string, string> {
   tryAutoLoadMetadata();
   return modelToTable;
 }
 
+export function getModelFieldsMap(): Record<string, Record<string, any>> {
+  tryAutoLoadMetadata();
+  return modelFields;
+}
+
 export function getFieldsForModel(modelName: string): any {
   tryAutoLoadMetadata();
-  return modelFields[modelName] || {};
+  return resolveModelEntry(modelFields, modelName) || {};
 }
 
 export function getRelationMap(): Record<string, Record<string, RelationDef>> {
@@ -109,7 +137,94 @@ export function getRelationMap(): Record<string, Record<string, RelationDef>> {
 
 export function getRelationsForModel(modelName: string): Record<string, RelationDef> {
   tryAutoLoadMetadata();
-  return relationMap[modelName] || {};
+  return resolveModelEntry(relationMap, modelName) || {};
+}
+
+export function modelHasFields(
+  modelName: string,
+  fieldsMap?: Record<string, Record<string, any>>
+): boolean {
+  const resolvedMap = fieldsMap === undefined ? getModelFieldsMap() : fieldsMap;
+  const fields = resolveModelEntry(resolvedMap, modelName);
+  return Boolean(fields && typeof fields === 'object' && Object.keys(fields).length > 0);
+}
+
+export function modelHasField(
+  modelName: string,
+  fieldName: string,
+  fieldsMap?: Record<string, Record<string, any>>
+): boolean {
+  if (!fieldName) return false;
+  const resolvedMap = fieldsMap === undefined ? getModelFieldsMap() : fieldsMap;
+  const fields = resolveModelEntry(resolvedMap, modelName);
+  if (!fields || typeof fields !== 'object') return false;
+  if (Object.prototype.hasOwnProperty.call(fields, fieldName)) return true;
+  const lowerTarget = fieldName.toLowerCase();
+  const snakeTarget = toSnakeCase(fieldName);
+  for (const key of Object.keys(fields)) {
+    if (key.toLowerCase() === lowerTarget || toSnakeCase(key) === snakeTarget) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function resolveModelRelation(
+  modelName: string,
+  relKey: string,
+  relMap?: Record<string, Record<string, RelationDef>>
+): { name: string; relation: RelationDef } | undefined {
+  if (!modelName || !relKey) return undefined;
+  const resolvedMap = relMap === undefined ? getRelationMap() : relMap;
+  const relations = resolveModelEntry(resolvedMap, modelName);
+  if (!relations || typeof relations !== 'object') return undefined;
+  if (Object.prototype.hasOwnProperty.call(relations, relKey)) {
+    return { name: relKey, relation: relations[relKey]! };
+  }
+  const lowerTarget = relKey.toLowerCase();
+  for (const [key, relation] of Object.entries(relations)) {
+    if (key.toLowerCase() === lowerTarget) {
+      return { name: key, relation };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve correlated `(childKey, parentKey)` join columns for a relation.
+ * Generated metadata stores FK on whichever side declares `@relation(fields: [...])`,
+ * which is the parent table for FK-holding to-one relations and the child table
+ * for to-many or inverse one-to-one relations.
+ */
+export function resolveRelationKeys(
+  parentModel: string,
+  relation: RelationDef,
+  fieldsMap?: Record<string, Record<string, any>>,
+  defaultOneFkOnParent = false
+): { childKey: string; parentKey: string } {
+  const fk = relation.foreignKey || 'id';
+  const lk = relation.localKey || 'id';
+  if (relation.relationType === 'many') {
+    return { childKey: fk, parentKey: lk };
+  }
+  const resolvedFields = fieldsMap === undefined ? getModelFieldsMap() : fieldsMap;
+  const parentHasFields = modelHasFields(parentModel, resolvedFields);
+  const childHasFields = modelHasFields(relation.modelName, resolvedFields);
+  if (parentHasFields || childHasFields) {
+    const parentHasFk = parentHasFields && modelHasField(parentModel, fk, resolvedFields);
+    const childHasFk = childHasFields && modelHasField(relation.modelName, fk, resolvedFields);
+    const parentHasLk = parentHasFields && modelHasField(parentModel, lk, resolvedFields);
+    const childHasLk = childHasFields && modelHasField(relation.modelName, lk, resolvedFields);
+    if ((parentHasFk && !childHasFk) || (childHasLk && !parentHasLk)) {
+      return { childKey: lk, parentKey: fk };
+    }
+    if ((childHasFk && !parentHasFk) || (parentHasLk && !childHasLk)) {
+      return { childKey: fk, parentKey: lk };
+    }
+  }
+  return defaultOneFkOnParent
+    ? { childKey: lk, parentKey: fk }
+    : { childKey: fk, parentKey: lk };
 }
 
 // ─── Dynamic model proxy ─────────────────────────────────────────────────────

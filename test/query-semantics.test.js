@@ -374,3 +374,94 @@ for (const dialect of ['sqlite', 'postgres', 'mysql', 'mssql']) {
     } }), { count: 1 });
   });
 }
+
+nodeTest('parseWhere rejects malformed clauses, unknown operators, and unknown fields', () => {
+  const fieldsCtx = {
+    ...ctx,
+    modelFields: {
+      User: { id: { ts: 'number' }, score: { ts: 'number' }, total_score: { ts: 'number' } },
+      Post: { id: { ts: 'number' }, userId: { ts: 'number' }, score: { ts: 'number' } },
+    },
+  };
+  assert.throws(() => parseWhere('User', 'bad', {}, 'sqlite'), /plain object/);
+  assert.throws(() => parseWhere('User', ['bad'], {}, 'sqlite'), /plain object/);
+  assert.throws(() => parseWhere('User', { OR: { id: 1 } }, {}, 'sqlite'), /OR filter must be an array/);
+  assert.throws(() => parseWhere('User', { OR: ['bad'] }, {}, 'sqlite'), /OR filter entries/);
+  assert.throws(() => parseWhere('User', { AND: 'bad' }, {}, 'sqlite'), /AND filter/);
+  assert.throws(() => parseWhere('User', { NOT: 123 }, {}, 'sqlite'), /NOT filter/);
+  assert.throws(() => parseWhere('User', { score: [1, 2] }, {}, 'sqlite'), /use \{ in:/);
+  assert.throws(() => parseWhere('User', { score: { bogus: 1 } }, {}, 'sqlite', '', fieldsCtx), /Unknown filter operator 'bogus'/);
+  assert.throws(() => parseWhere('User', { score: { some: {} } }, {}, 'sqlite', '', fieldsCtx), /Relation filter operator 'some' cannot be used on scalar field 'score'/);
+  assert.throws(() => parseWhere('User', { score: { is: null } }, {}, 'sqlite', '', fieldsCtx), /Relation filter operator 'is' cannot be used on scalar field 'score'/);
+  assert.throws(() => parseWhere('User', { score: { contains: 'a', mode: 'fuzzy' } }, {}, 'sqlite'), /Invalid filter mode 'fuzzy'/);
+  assert.throws(() => parseWhere('User', { score: { in: 10 } }, {}, 'sqlite'), /must be an array/);
+  assert.throws(() => parseWhere('User', { score: { notIn: 'x' } }, {}, 'sqlite'), /must be an array/);
+  assert.throws(() => parseWhere('User', { score: { contains: 123 } }, {}, 'sqlite'), /must be a string/);
+  assert.throws(() => parseWhere('User', { score: { not: [1, 2] } }, {}, 'sqlite'), /use 'notIn' instead/);
+  assert.throws(() => parseWhere('User', { posts: { is: { score: 10 } } }, {}, 'sqlite', '', fieldsCtx), /Unsupported relation filter operator 'is'/);
+  assert.throws(() => parseWhere('User', { posts: { bogus: {} } }, {}, 'sqlite', '', fieldsCtx), /Unsupported relation filter operator 'bogus'/);
+  assert.throws(() => parseWhere('User', { posts: { some: null } }, {}, 'sqlite', '', fieldsCtx), /must be a plain object/);
+  assert.throws(() => parseWhere('User', { posts: 'bad' }, {}, 'sqlite', '', fieldsCtx), /must be a plain object/);
+  assert.throws(() => parseWhere('User', { profile: { some: { score: 10 } } }, {}, 'sqlite', '', fieldsCtx), /Unsupported relation filter operator 'some'/);
+  assert.throws(() => parseWhere('User', { profile: { bogus: {} } }, {}, 'sqlite', '', fieldsCtx), /Unsupported relation filter operator 'bogus'/);
+  assert.throws(() => parseWhere('User', { profile: { is: 'bad' } }, {}, 'sqlite', '', fieldsCtx), /plain object or null/);
+  assert.throws(() => parseWhere('User', { profile: { isNot: null, is_not: null } }, {}, 'sqlite', '', fieldsCtx), /Duplicate relation filter operator/);
+  assert.throws(() => parseWhere('User', { missingCol: 1 }, {}, 'sqlite', '', fieldsCtx), /Unknown field 'missingCol'/);
+  // Undocumented underscored fields must not flatten bogus operators into compound keys.
+  assert.throws(() => parseWhere('User', { total_score: { bogus: 1 } }, {}, 'sqlite', '', fieldsCtx), /Unknown filter operator 'bogus' on field 'total_score'/);
+  assert.throws(() => parseWhere('User', { total_score: { bogus: 1 } }, {}, 'sqlite'), /Unknown filter operator 'bogus' on field 'total_score'/);
+  assert.throws(() => parseWhere('User', { other_posts: { is: {} } }, {}, 'sqlite', '', fieldsCtx), /Unsupported relation filter operator 'is'/);
+});
+
+test('parseWhere supports mode insensitive across operators on SQLite and ILIKE on Postgres', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(`CREATE TABLE names (id INTEGER, email TEXT);
+      INSERT INTO names VALUES (1, 'Alice@Example.com'), (2, 'bob@example.com'), (3, NULL);`);
+    const q = (where) => {
+      const params = {};
+      const sql = parseWhere('Name', where, params, 'sqlite');
+      return db.prepare(`SELECT id FROM names${sql ? ` WHERE ${sql}` : ''} ORDER BY id`).all(params).map(r => r.id);
+    };
+    assert.deepEqual(q({ email: { equals: 'alice@example.com', mode: 'insensitive' } }), [1]);
+    assert.deepEqual(q({ email: { contains: 'ALICE', mode: 'insensitive' } }), [1]);
+    assert.deepEqual(q({ email: { startsWith: 'BOB', mode: 'insensitive' } }), [2]);
+    assert.deepEqual(q({ email: { endsWith: 'EXAMPLE.COM', mode: 'insensitive' } }), [1, 2]);
+    assert.deepEqual(q({ email: { not: 'alice@example.com', mode: 'insensitive' } }), [2]);
+    assert.deepEqual(q({ email: { in: ['ALICE@EXAMPLE.COM'], mode: 'insensitive' } }), [1]);
+    assert.deepEqual(q({ email: { notIn: ['BOB@EXAMPLE.COM'], mode: 'insensitive' } }), [1]);
+  } finally { db.close(); }
+
+  const pgParams = {};
+  const pgSql = parseWhere('Name', { email: { contains: 'Alice', mode: 'insensitive' } }, pgParams, 'postgres');
+  assert.match(pgSql, /ILIKE/);
+  assert.equal(pgParams.email_co, '%Alice%');
+});
+
+test('parseWhere supports is_not alias and distinct per-operator aliases on the same relation', () => {
+  assert.deepEqual(query({ profile: { is_not: null } }, ctx), [1, 2]);
+  assert.deepEqual(query({ profile: { is_not: { score: 20 } } }, ctx), [2, 3]);
+  assert.deepEqual(query({ posts: { some: { score: 10 }, every: { score: { gte: 10 } } } }, ctx), [1, 2]);
+  assert.deepEqual(query({ profile: { is: { score: 10 }, isNot: { id: 999 } } }, ctx), [1, 2]);
+});
+
+nodeTest('Google Sheets matchWhere rejects malformed filters and supports mode insensitive cleanly', () => {
+  const sample = [{ id: 1, title: 'Alice', total_score: 5 }, { id: 2, title: '', total_score: 10 }, { id: 3, title: null, total_score: 0 }];
+  assert.throws(() => matchWhere(sample[0], 'bad'), /plain object/);
+  assert.throws(() => matchWhere(sample[0], { OR: { id: 1 } }), /OR filter must be an array/);
+  assert.throws(() => matchWhere(sample[0], { AND: 'bad' }), /AND filter/);
+  assert.throws(() => matchWhere(sample[0], { NOT: 1 }), /NOT filter/);
+  assert.throws(() => matchWhere(sample[0], { title: ['a'] }), /use \{ in:/);
+  assert.throws(() => matchWhere(sample[0], { title: { bogus: 'x' } }), /Unknown filter operator 'bogus'/);
+  assert.throws(() => matchWhere(sample[0], { total_score: { bogus: 1 } }), /Unknown filter operator 'bogus' on field 'total_score'/);
+  assert.throws(() => matchWhere(sample[0], { title: { some: {} } }), /Relation filter operator 'some'/);
+  assert.throws(() => matchWhere(sample[0], { title: { contains: 'a', mode: 'fuzzy' } }), /Invalid filter mode 'fuzzy'/);
+  assert.throws(() => matchWhere(sample[0], { title: { in: 'a' } }), /must be an array/);
+  assert.throws(() => matchWhere(sample[0], { title: { notIn: 'a' } }), /must be an array/);
+  assert.throws(() => matchWhere(sample[0], { title: { contains: 1 } }), /must be a string/);
+  assert.throws(() => matchWhere(sample[0], { title: { not: ['a'] } }), /use 'notIn' instead/);
+
+  assert.deepEqual(sample.filter(r => matchWhere(r, { title: { equals: null, mode: 'insensitive' } })).map(r => r.id), [3]);
+  assert.deepEqual(sample.filter(r => matchWhere(r, { title: { equals: 'ALICE', mode: 'insensitive' } })).map(r => r.id), [1]);
+  assert.deepEqual(sample.filter(r => matchWhere(r, { title: { in: ['alice'], mode: 'insensitive' } })).map(r => r.id), [1]);
+});
