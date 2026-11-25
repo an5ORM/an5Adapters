@@ -1,6 +1,15 @@
+from dataclasses import fields as dc_fields, is_dataclass
 from typing import Any, Dict, List, Optional
 from .dialects import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE
-from .metadata import model_to_table, model_fields, resolve_model_key, get_relations_for_model
+from .metadata import (
+    model_to_table,
+    model_fields,
+    resolve_model_key,
+    get_relations_for_model,
+    get_field_map_for_model,
+    resolve_field_name,
+    resolve_relation_key,
+)
 
 # ─── Quoting ───────────────────────────────────────────────────────────────────────
 
@@ -31,19 +40,106 @@ def _normalize_sort_direction(direction: Any) -> str:
 # ─── Where clause builder ──────────────────────────────────────────────────────────
 
 _OPERATOR_KEYS = {"equals", "in", "notIn", "contains", "startsWith", "endsWith", "not", "gte", "lte", "gt", "lt"}
+_OPERATOR_ALIASES = {
+    "not_": "not",
+    "in_": "in",
+    "not_in": "notIn",
+    "starts_with": "startsWith",
+    "ends_with": "endsWith",
+}
+_RELATION_MANY_KEYS = {"some", "none", "every"}
+_RELATION_ONE_KEYS = {"is", "isNot"}
+_RELATION_OPERATOR_ALIASES = {"is_not": "isNot", "is_": "is"}
+
+
+def _normalize_dataclass_dict(value: Any) -> Any:
+    """Convert generated filter/input dataclasses into plain dictionaries recursively.
+
+    Unset (`None`) attributes on dataclasses and empty all-`None` nested filter
+    dataclasses (e.g. `StringFilter()`) are omitted, while explicit `None` entries
+    inside plain dicts are preserved for IS NULL / IS NOT NULL semantics.
+    """
+    if is_dataclass(value) and not isinstance(value, type):
+        out: Dict[str, Any] = {}
+        for f in dc_fields(value):
+            raw_val = getattr(value, f.name)
+            if raw_val is None:
+                continue
+            val = _normalize_dataclass_dict(raw_val)
+            if is_dataclass(raw_val) and isinstance(val, dict) and not val:
+                continue
+            out[f.name] = val
+        return out
+    if isinstance(value, list):
+        return [_normalize_dataclass_dict(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _normalize_dataclass_dict(v) for k, v in value.items()}
+    return value
 
 
 def _is_operator_value(value: Any) -> bool:
-    return isinstance(value, dict) and any(op in value for op in _OPERATOR_KEYS)
+    return isinstance(value, dict) and any(_OPERATOR_ALIASES.get(op, op) in _OPERATOR_KEYS for op in value)
+
+
+def _is_relation_operator_value(value: Any) -> bool:
+    return isinstance(value, dict) and any(
+        _RELATION_OPERATOR_ALIASES.get(op, op) in (_RELATION_MANY_KEYS | _RELATION_ONE_KEYS)
+        for op in value
+    )
+
+
+def _normalize_operator_dict(raw: Dict[str, Any], field_name: str) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    for k, v in raw.items():
+        canonical = _OPERATOR_ALIASES.get(k, k)
+        normalized[canonical] = v
+    unknown = [k for k in normalized if k not in _OPERATOR_KEYS]
+    if unknown:
+        raise ValueError(
+            f"Unsupported filter operator(s) for '{field_name}': {', '.join(unknown)}"
+        )
+    return normalized
 
 
 def _parse_relation_filter(model_name: str, relation: Dict[str, str], value: Any, params: Dict, dialect: str, prefix: str = "", self_ref: str = "") -> Optional[str]:
+    if is_dataclass(value) and not isinstance(value, type):
+        value = _normalize_dataclass_dict(value)
     if not isinstance(value, dict) or not relation:
-        return None
+        raise ValueError(f"Relation filter on '{model_name}' must be a mapping or filter object")
+
+    normalized: Dict[str, Any] = {
+        _RELATION_OPERATOR_ALIASES.get(k, k): v for k, v in value.items()
+    }
+    is_many = relation.get("relationType") == "many"
+    allowed = _RELATION_MANY_KEYS if is_many else _RELATION_ONE_KEYS
+    unknown = [k for k in normalized if k not in allowed]
+    if unknown:
+        raise ValueError(
+            f"Unsupported relation filter operator(s): {', '.join(unknown)}"
+        )
+
     child_table = _quote_table(_resolve_table(relation.get("modelName", "")), dialect)
     child_alias = f"r_{_sanitize_param_name(prefix)}"
-    fk = _quote(relation.get("foreignKey", "id"), dialect)
-    lk = _quote(relation.get("localKey", "id"), dialect)
+
+    raw_fk = relation.get("foreignKey", "id")
+    raw_lk = relation.get("localKey", "id")
+    if is_many:
+        child_key, parent_key = raw_fk, raw_lk
+    else:
+        # Generated RELATION_MAP records foreignKey on the referencing model (parent)
+        # and localKey on the referenced model (child), matching _resolve_includes.
+        # Hand-written fixtures may reverse them to match sql.ts; disambiguate via model_fields.
+        parent_key, child_key = raw_fk, raw_lk
+        parent_fields = get_field_map_for_model(model_name)
+        child_fields = get_field_map_for_model(relation.get("modelName", ""))
+        if (
+            (child_fields and raw_fk in child_fields and raw_lk not in child_fields)
+            or (parent_fields and raw_lk in parent_fields and raw_fk not in parent_fields)
+        ):
+            child_key, parent_key = raw_fk, raw_lk
+
+    fk = _quote(child_key, dialect)
+    lk = _quote(parent_key, dialect)
 
     parent_ref = f"{self_ref}." if self_ref else f"{_quote_table(_resolve_table(model_name), dialect)}."
     correlation = f"{child_alias}.{fk} = {parent_ref}{lk}"
@@ -53,50 +149,64 @@ def _parse_relation_filter(model_name: str, relation: Dict[str, str], value: Any
         return f"EXISTS (SELECT 1 FROM {child_table} AS {child_alias} WHERE {correlation}{inner})"
 
     parts: List[str] = []
-    is_many = relation.get("relationType") == "many"
 
     if is_many:
-        if "some" in value and value["some"] is not None:
-            inner = _parse_where(relation.get("modelName", ""), value["some"], params, dialect, f"{prefix}some_", self_ref=child_alias, col_prefix=f"{child_alias}.")
+        if "some" in normalized and normalized["some"] is not None:
+            inner = _parse_where(relation.get("modelName", ""), normalized["some"], params, dialect, f"{prefix}some_", self_ref=child_alias, col_prefix=f"{child_alias}.")
             parts.append(build_exists(inner))
-        if "none" in value and value["none"] is not None:
-            inner = _parse_where(relation.get("modelName", ""), value["none"], params, dialect, f"{prefix}none_", self_ref=child_alias, col_prefix=f"{child_alias}.")
+        if "none" in normalized and normalized["none"] is not None:
+            inner = _parse_where(relation.get("modelName", ""), normalized["none"], params, dialect, f"{prefix}none_", self_ref=child_alias, col_prefix=f"{child_alias}.")
             parts.append(f"NOT {build_exists(inner)}")
-        if "every" in value and value["every"] is not None:
-            inner = _parse_where(relation.get("modelName", ""), value["every"], params, dialect, f"{prefix}every_", self_ref=child_alias, col_prefix=f"{child_alias}.")
+        if "every" in normalized and normalized["every"] is not None:
+            inner = _parse_where(relation.get("modelName", ""), normalized["every"], params, dialect, f"{prefix}every_", self_ref=child_alias, col_prefix=f"{child_alias}.")
             negated = f"NOT ({inner})" if inner else ""
             violated = f"EXISTS (SELECT 1 FROM {child_table} AS {child_alias} WHERE {correlation}{f' AND {negated}' if negated else ' AND 1=0'})"
             parts.append(f"NOT {violated}")
     else:
-        if "is" in value:
-            if value["is"] is None:
+        if "is" in normalized:
+            if normalized["is"] is None:
                 parts.append(f"NOT {build_exists('')}")
             else:
-                inner = _parse_where(relation.get("modelName", ""), value["is"], params, dialect, f"{prefix}is_", self_ref=child_alias, col_prefix=f"{child_alias}.")
+                inner = _parse_where(relation.get("modelName", ""), normalized["is"], params, dialect, f"{prefix}is_", self_ref=child_alias, col_prefix=f"{child_alias}.")
                 parts.append(build_exists(inner))
-        if "isNot" in value:
-            if value["isNot"] is None:
+        if "isNot" in normalized:
+            if normalized["isNot"] is None:
                 parts.append(build_exists(''))
             else:
-                inner = _parse_where(relation.get("modelName", ""), value["isNot"], params, dialect, f"{prefix}isNot_", self_ref=child_alias, col_prefix=f"{child_alias}.")
+                inner = _parse_where(relation.get("modelName", ""), normalized["isNot"], params, dialect, f"{prefix}isNot_", self_ref=child_alias, col_prefix=f"{child_alias}.")
                 parts.append(f"NOT {build_exists(inner)}")
 
     return " AND ".join(parts) if parts else None
 
 
-def _parse_where(model_name: str, where: Optional[Dict], params: Dict, dialect: str, prefix: str = "", self_ref: str = "", col_prefix: str = "") -> str:
+def _parse_where(model_name: str, where: Optional[Any], params: Dict, dialect: str, prefix: str = "", self_ref: str = "", col_prefix: str = "") -> str:
+    if where is None:
+        return ""
+    if is_dataclass(where) and not isinstance(where, type):
+        where = _normalize_dataclass_dict(where)
     if not where:
         return ""
     conditions: List[str] = []
 
-    clean_where: Dict[str, Any] = {}
-    for key, value in where.items():
-        if "_" in key and isinstance(value, dict) and not _is_operator_value(value):
-            clean_where.update(value)
-        else:
-            clean_where[key] = value
-
+    field_map = get_field_map_for_model(model_name)
     model_relations = get_relations_for_model(model_name)
+
+    clean_where: Dict[str, Any] = {}
+    for key, raw_value in where.items():
+        val = _normalize_dataclass_dict(raw_value) if is_dataclass(raw_value) and not isinstance(raw_value, type) else raw_value
+        if (
+            "_" in key
+            and key not in field_map
+            and resolve_relation_key(model_name, key) is None
+            and isinstance(val, dict)
+            and len(val) > 0
+            and not _is_operator_value(val)
+            and not _is_relation_operator_value(val)
+            and (not field_map or all(sub_k in field_map for sub_k in val))
+        ):
+            clean_where.update(val)
+        else:
+            clean_where[key] = val
 
     for key, value in clean_where.items():
         if key == "OR" and isinstance(value, list):
@@ -113,23 +223,38 @@ def _parse_where(model_name: str, where: Optional[Dict], params: Dict, dialect: 
             sub = [_parse_where(model_name, v, params, dialect, f"{prefix}not{i}_", self_ref=self_ref, col_prefix=col_prefix) or "1=1" for i, v in enumerate(items)]
             if sub:
                 conditions.append(f"NOT ({' OR '.join(sub)})")
-        elif key in model_relations and isinstance(value, dict) and any(k in value for k in ("some", "none", "every", "is", "isNot")):
-            rel_sql = _parse_relation_filter(model_name, model_relations[key], value, params, dialect, f"{prefix}{key}_", self_ref=self_ref)
-            if rel_sql:
-                conditions.append(rel_sql)
         else:
-            col = f"{col_prefix}{_quote(key, dialect)}"
-            pname = _sanitize_param_name(f"{prefix}{key}")
+            rel_key = resolve_relation_key(model_name, key)
+            if rel_key is not None:
+                if not isinstance(value, dict):
+                    raise ValueError(f"Relation filter for '{rel_key}' must be a mapping or filter object")
+                rel_sql = _parse_relation_filter(model_name, model_relations[rel_key], value, params, dialect, f"{prefix}{rel_key}_", self_ref=self_ref)
+                if rel_sql:
+                    conditions.append(rel_sql)
+                continue
+
+            resolved_key = resolve_field_name(model_name, key, strict=True)
+            col = f"{col_prefix}{_quote(resolved_key, dialect)}"
+            pname = _sanitize_param_name(f"{prefix}{resolved_key}")
             placeholder = "%s" if dialect == DIALECT_POSTGRES else "?"
             if value is None:
                 conditions.append(f"{col} IS NULL")
             elif isinstance(value, dict):
+                value = _normalize_operator_dict(value, resolved_key)
                 if "not" in value:
                     if value["not"] is None:
                         conditions.append(f"{col} IS NOT NULL")
                     elif isinstance(value["not"], dict):
                         nested_params: Dict[str, Any] = {}
-                        nested_sql = _parse_where(model_name, {key: value["not"]}, nested_params, dialect, f"{prefix}{key}_not_")
+                        nested_sql = _parse_where(
+                            model_name,
+                            {resolved_key: value["not"]},
+                            nested_params,
+                            dialect,
+                            f"{prefix}{resolved_key}_not_",
+                            self_ref=self_ref,
+                            col_prefix=col_prefix,
+                        )
                         params.update(nested_params)
                         if nested_sql:
                             conditions.append(f"NOT ({nested_sql})")
@@ -188,14 +313,23 @@ def _parse_where(model_name: str, where: Optional[Dict], params: Dict, dialect: 
     return " AND ".join(conditions)
 
 
-def _build_order_by(order_by: Any, dialect: str) -> str:
+def _build_order_by(order_by: Any, dialect: str, model_name: Optional[str] = None) -> str:
+    if not order_by:
+        return ""
+    if is_dataclass(order_by) and not isinstance(order_by, type):
+        order_by = _normalize_dataclass_dict(order_by)
     if not order_by:
         return ""
     entries = order_by if isinstance(order_by, list) else [order_by]
     parts: List[str] = []
     for entry in entries:
+        if is_dataclass(entry) and not isinstance(entry, type):
+            entry = _normalize_dataclass_dict(entry)
+        if not entry:
+            continue
         for col, direction in entry.items():
-            parts.append(f"{_quote(col, dialect)} {_normalize_sort_direction(direction)}")
+            resolved_col = resolve_field_name(model_name, col, strict=True) if model_name else col
+            parts.append(f"{_quote(resolved_col, dialect)} {_normalize_sort_direction(direction)}")
     return f"ORDER BY {', '.join(parts)}" if parts else ""
 
 

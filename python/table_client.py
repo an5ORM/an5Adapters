@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import fields as dc_fields, is_dataclass
 import json
 import uuid
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 try:
-    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
+    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model, resolve_field_name, resolve_relation_key
+    from .base.sql import _normalize_dataclass_dict
     from .base.vectors import decode_vector, encode_vector, is_vector_field, needs_vector_encoding, run_sqlite_vector_search, vector_distance
     from .base.vector_providers import VectorProviderError
 except ImportError:
-    from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model
+    from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model, resolve_field_name, resolve_relation_key
+    from base.sql import _normalize_dataclass_dict
     from base.vectors import decode_vector, encode_vector, is_vector_field, needs_vector_encoding, run_sqlite_vector_search, vector_distance
     from base.vector_providers import VectorProviderError
 
@@ -57,12 +60,84 @@ def _to_list(value: Any) -> List:
     return [value]
 
 
+def _is_find_args_dataclass(obj: Any) -> bool:
+    if not is_dataclass(obj) or isinstance(obj, type):
+        return False
+    names = {f.name for f in dc_fields(obj)}
+    return "where" in names and names.issubset({"where", "order_by", "take", "skip", "select", "include"})
+
+
+def _resolve_select(model_name: str, select: Any) -> Any:
+    if not select:
+        return select
+    if isinstance(select, str):
+        if select == "_count":
+            return select
+        rel_key = resolve_relation_key(model_name, select)
+        return rel_key if rel_key is not None else resolve_field_name(model_name, select, strict=True)
+    if isinstance(select, list):
+        resolved_list: List[Any] = []
+        for item in select:
+            if isinstance(item, str) and item:
+                if item == "_count":
+                    resolved_list.append(item)
+                else:
+                    rel_key = resolve_relation_key(model_name, item)
+                    resolved_list.append(rel_key if rel_key is not None else resolve_field_name(model_name, item, strict=True))
+            else:
+                resolved_list.append(item)
+        return resolved_list
+    if isinstance(select, dict):
+        resolved_dict: Dict[str, Any] = {}
+        for k, v in select.items():
+            key_str = str(k)
+            if key_str == "_count":
+                resolved_dict[key_str] = v
+                continue
+            rel_key = resolve_relation_key(model_name, key_str)
+            if rel_key is not None:
+                resolved_dict[rel_key] = v
+            else:
+                resolved_dict[resolve_field_name(model_name, key_str, strict=True)] = v
+        return resolved_dict
+    return select
+
+
+def _resolve_include(model_name: str, include: Any) -> Any:
+    if not include or not isinstance(include, dict):
+        return include
+    resolved: Dict[str, Any] = {}
+    for k, v in include.items():
+        key_str = str(k)
+        if key_str == "_count":
+            resolved[key_str] = v
+            continue
+        rel_key = resolve_relation_key(model_name, key_str)
+        resolved[rel_key if rel_key is not None else key_str] = v
+    return resolved
+
+
+def _normalize_write_data(model_name: str, data: Any) -> Dict[str, Any]:
+    if not data:
+        return {}
+    raw = _normalize_dataclass_dict(data) if is_dataclass(data) and not isinstance(data, type) else dict(data)
+    out: Dict[str, Any] = {}
+    for k, v in raw.items():
+        rel_key = resolve_relation_key(model_name, k)
+        if rel_key is not None:
+            out[rel_key] = _normalize_dataclass_dict(v) if is_dataclass(v) and not isinstance(v, type) else v
+        else:
+            out[resolve_field_name(model_name, k, strict=True)] = v
+    return out
+
+
 def _resolve_includes(model_name: str, rows: List[Dict], include: Any, adapter: Any) -> None:
     """Eager-load relation rows and attach them onto each row (mirrors TypeScript resolveIncludes)."""
     if not rows or not include:
         return
     if not isinstance(include, dict):
         return
+    include = _resolve_include(model_name, include)
     model_relations = get_relations_for_model(model_name)
 
     for key, value in include.items():
@@ -111,14 +186,16 @@ def _resolve_includes(model_name: str, rows: List[Dict], include: Any, adapter: 
         sub_args = value if isinstance(value, dict) else {}
         sub_where = {match_key: {"in": unique_keys}}
         if sub_args.get("where"):
-            sub_where.update(sub_args["where"])
+            extra_where = _normalize_dataclass_dict(sub_args["where"]) if is_dataclass(sub_args["where"]) else sub_args["where"]
+            if isinstance(extra_where, dict):
+                sub_where.update(extra_where)
 
         rel_client = adapter.table(relation["modelName"])
         related = rel_client.find_many(
             where=sub_where,
-            order_by=sub_args.get("orderBy"),
+            order_by=sub_args.get("orderBy") or sub_args.get("order_by"),
             take=sub_args.get("take"),
-            skip=sub_args.get("skip"),
+            skip=sub_args.get("skip") or 0,
         )
 
         if sub_args.get("include"):
@@ -126,7 +203,8 @@ def _resolve_includes(model_name: str, rows: List[Dict], include: Any, adapter: 
 
         output_rows = related
         if sub_args.get("select"):
-            output_rows = [_project_fields(r, sub_args["select"]) for r in related]
+            sub_select = _resolve_select(relation["modelName"], sub_args["select"])
+            output_rows = [_project_fields(r, sub_select) for r in related]
 
         group_map = {}
         for i, r in enumerate(related):
@@ -313,10 +391,62 @@ class AdapterTableClient(Generic[T]):
         order_prefix = "" if order_sql else " ORDER BY (SELECT NULL)"
         return f"{order_prefix} OFFSET {skip} ROWS FETCH NEXT {take} ROWS ONLY"
 
+    def _primary_key(self) -> str:
+        fields = get_fields_for_model(self._model)
+        if isinstance(fields, list) and fields:
+            id_field = next((f for f in fields if isinstance(f, dict) and f.get("isId")), None)
+            if id_field and id_field.get("name"):
+                return id_field["name"]
+            if any(isinstance(f, dict) and f.get("name") == "id" for f in fields):
+                return "id"
+            first_name = fields[0].get("name") if isinstance(fields[0], dict) else None
+            if first_name:
+                return first_name
+        elif isinstance(fields, dict) and fields and "id" not in fields:
+            return next(iter(fields.keys()))
+        return "id"
+
+    def _resolve_agg_fields(self, fields: Any, allow_all: bool = False) -> Any:
+        if not fields:
+            return fields
+        if isinstance(fields, str):
+            if allow_all and fields == "_all":
+                return fields
+            return resolve_field_name(self._model, fields, strict=True)
+        if isinstance(fields, list):
+            return [
+                f if (allow_all and f == "_all") else resolve_field_name(self._model, f, strict=True)
+                if isinstance(f, str) and f else f
+                for f in fields
+            ]
+        if isinstance(fields, dict):
+            return {
+                (str(k) if (allow_all and str(k) == "_all") else resolve_field_name(self._model, str(k), strict=True)): v
+                for k, v in fields.items()
+            }
+        return fields
+
     def find_many(self, where=None, order_by=None, skip: int = 0, take: Optional[int] = None, select=None, include=None) -> List[T]:
+        if _is_find_args_dataclass(where):
+            args = where
+            where = args.where
+            if order_by is None:
+                order_by = getattr(args, "order_by", None)
+            if skip == 0 and getattr(args, "skip", 0):
+                skip = args.skip
+            if take is None:
+                take = getattr(args, "take", None)
+            if select is None:
+                select = getattr(args, "select", None)
+            if include is None:
+                include = getattr(args, "include", None)
+
+        select = _resolve_select(self._model, select)
+        include = _resolve_include(self._model, include)
+
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect)
-        order_sql = _build_order_by(order_by, self._dialect)
+        order_sql = _build_order_by(order_by, self._dialect, model_name=self._model)
 
         relations = get_relations_for_model(self._model)
         cols = "SELECT *"
@@ -341,10 +471,19 @@ class AdapterTableClient(Generic[T]):
         return rows
 
     def find_first(self, where=None, order_by=None, select=None, include=None) -> Optional[T]:
+        if _is_find_args_dataclass(where):
+            args = where
+            where = args.where
+            if order_by is None:
+                order_by = getattr(args, "order_by", None)
+            if select is None:
+                select = getattr(args, "select", None)
+            if include is None:
+                include = getattr(args, "include", None)
         rows = self.find_many(where=where, order_by=order_by, take=1, select=select, include=include)
         return rows[0] if rows else None
 
-    def find_unique(self, where: Dict, select=None, include=None) -> Optional[T]:
+    def find_unique(self, where: Any, select=None, include=None) -> Optional[T]:
         return self.find_first(where=where, select=select, include=include)
 
     def count(self, where=None) -> int:
@@ -356,11 +495,14 @@ class AdapterTableClient(Generic[T]):
         rows = self._adapter.exec(query, list(params.values()))
         return int(rows[0]["cnt"]) if rows else 0
 
-    def create(self, data: Dict, include=None, select=None) -> T:
+    def create(self, data: Any, include=None, select=None) -> T:
         id_field = next((f for f in self._fields if f.get("isId")), None)
+        data = _normalize_write_data(self._model, data)
         if id_field and id_field["name"] not in data:
             data = {**data, id_field["name"]: str(uuid.uuid4())}
 
+        select = _resolve_select(self._model, select)
+        include = _resolve_include(self._model, include)
         data, relation_writes = _split_relation_writes(self._model, data)
         data = self._encode_vector_fields(data)
 
@@ -386,7 +528,8 @@ class AdapterTableClient(Generic[T]):
             if "create" in rel_write:
                 create_items = _to_list(rel_write["create"])
                 for item in create_items:
-                    merged = {**item, relation["foreignKey"]: created.get(relation["localKey"])}
+                    item_dict = _normalize_dataclass_dict(item) if is_dataclass(item) and not isinstance(item, type) else item
+                    merged = {**item_dict, relation["foreignKey"]: created.get(relation["localKey"])}
                     child_client.create(data=merged)
 
         if include:
@@ -396,7 +539,7 @@ class AdapterTableClient(Generic[T]):
             return _project_fields(created, select)
         return created
 
-    def create_many(self, data: List[Dict], skip_duplicates: bool = False) -> Dict:
+    def create_many(self, data: List[Any], skip_duplicates: bool = False) -> Dict:
         count = 0
         for row in data:
             try:
@@ -407,9 +550,12 @@ class AdapterTableClient(Generic[T]):
                     raise
         return {"count": count}
 
-    def update(self, where: Dict, data: Dict, include=None, select=None) -> Optional[T]:
+    def update(self, where: Any, data: Any, include=None, select=None) -> Optional[T]:
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect, "w_")
+        data = _normalize_write_data(self._model, data)
+        select = _resolve_select(self._model, select)
+        include = _resolve_include(self._model, include)
         data, relation_writes = _split_relation_writes(self._model, data)
         data = self._encode_vector_fields(data)
         set_parts: List[str] = []
@@ -437,7 +583,8 @@ class AdapterTableClient(Generic[T]):
             if "create" in rel_write:
                 create_items = _to_list(rel_write["create"])
                 for item in create_items:
-                    merged = {**item, relation["foreignKey"]: (updated or {}).get(relation["localKey"])}
+                    item_dict = _normalize_dataclass_dict(item) if is_dataclass(item) and not isinstance(item, type) else item
+                    merged = {**item_dict, relation["foreignKey"]: (updated or {}).get(relation["localKey"])}
                     child_client.create(data=merged)
             if "update" in rel_write:
                 update_obj = rel_write["update"]
@@ -452,9 +599,10 @@ class AdapterTableClient(Generic[T]):
             return _project_fields(updated, select)
         return updated
 
-    def update_many(self, where: Optional[Dict], data: Dict) -> Dict:
+    def update_many(self, where: Optional[Any], data: Any) -> Dict:
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect, "w_")
+        data = _normalize_write_data(self._model, data)
         data = self._encode_vector_fields(data)
         set_parts: List[str] = []
         set_values: List = []
@@ -496,6 +644,11 @@ class AdapterTableClient(Generic[T]):
         return self.create(data=create)
 
     def aggregate(self, where=None, _count=None, _sum=None, _avg=None, _min=None, _max=None) -> Dict:
+        _count = self._resolve_agg_fields(_count, allow_all=True) if isinstance(_count, (str, list, dict)) else _count
+        _sum = self._resolve_agg_fields(_sum)
+        _avg = self._resolve_agg_fields(_avg)
+        _min = self._resolve_agg_fields(_min)
+        _max = self._resolve_agg_fields(_max)
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect)
         aggs: List[str] = []
@@ -551,9 +704,14 @@ class AdapterTableClient(Generic[T]):
 
     def group_by(self, by, where=None, order_by=None, skip: int = 0, take: Optional[int] = None,
                  _count=None, _sum=None, _avg=None, _min=None, _max=None) -> List[Dict]:
+        _count = self._resolve_agg_fields(_count, allow_all=True) if isinstance(_count, (str, list, dict)) else _count
+        _sum = self._resolve_agg_fields(_sum)
+        _avg = self._resolve_agg_fields(_avg)
+        _min = self._resolve_agg_fields(_min)
+        _max = self._resolve_agg_fields(_max)
         params: Dict = {}
         where_sql = _parse_where(self._model, where, params, self._dialect)
-        by_fields = _normalize_by_fields(by)
+        by_fields = [resolve_field_name(self._model, f, strict=True) for f in _normalize_by_fields(by)]
         if not by_fields:
             raise ValueError("group_by requires 'by' fields")
 
@@ -572,7 +730,7 @@ class AdapterTableClient(Generic[T]):
         if where_sql:
             query += f" WHERE {where_sql}"
         query += f" GROUP BY {by_cols}"
-        order_sql = _build_order_by(order_by, self._dialect)
+        order_sql = _build_order_by(order_by, self._dialect, model_name=self._model)
         has_take = take is not None
         has_skip = skip is not None and skip > 0
         if order_sql:
@@ -638,11 +796,8 @@ class AdapterTableClient(Generic[T]):
             raise RuntimeError("No vector store configured on this adapter.")
         if getattr(self._adapter, "vector_store_only", False):
             raise RuntimeError("index_vectors requires a relational database, but this adapter is vector-only.")
-        pk = "id"
-        fields = get_fields_for_model(self._model)
-        if isinstance(fields, dict) and fields:
-            if "id" not in fields:
-                pk = next(iter(fields.keys()))
+        vector_field = resolve_field_name(self._model, vector_field, strict=True)
+        pk = self._primary_key()
         rows = self.find_many(where=where, take=take)
         indexed = 0
         for i in range(0, len(rows), batch_size):
@@ -678,6 +833,11 @@ class AdapterTableClient(Generic[T]):
         collection: Optional[str] = None,
         namespace: Optional[str] = None,
     ) -> List[Dict]:
+        vector_field = resolve_field_name(
+            self._model,
+            vector_field,
+            strict=not getattr(self._adapter, "vector_store_only", False),
+        )
         store = self._adapter.vector_store() if hasattr(self._adapter, "vector_store") else None
         if store is not None:
             try:
@@ -708,10 +868,7 @@ class AdapterTableClient(Generic[T]):
                         distances[rid] = float(h["distance"])
                 if not ids:
                     return []
-                pk = "id"
-                fields = get_fields_for_model(self._model)
-                if isinstance(fields, dict) and fields and "id" not in fields:
-                    pk = next(iter(fields.keys()))
+                pk = self._primary_key()
                 ph = "%s" if self._dialect == DIALECT_POSTGRES else "?"
                 in_list = ", ".join([ph] * len(ids))
                 pk_sql = _quote(pk, self._dialect)
