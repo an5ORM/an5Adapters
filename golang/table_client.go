@@ -160,7 +160,7 @@ type VectorSearchArgs struct {
 }
 
 func (t *TableClient) quotedTable() string {
-	return base.QuoteTable(t.TableName, t.Adapter.Dialect)
+	return base.QuoteTable(base.ResolveTable(t.TableName), t.Adapter.Dialect)
 }
 
 func (t *TableClient) nolock() string {
@@ -179,18 +179,33 @@ func (t *TableClient) placeholders(count int) string {
 	return strings.Join(phs, ", ")
 }
 
+func (t *TableClient) buildWhereWithOffsetE(where interface{}, offset int) (string, []interface{}, error) {
+	if where == nil {
+		return "", nil, nil
+	}
+	m, ok := where.(map[string]interface{})
+	if !ok {
+		return "", nil, fmt.Errorf("where clause for '%s' must be a map[string]interface{}", t.TableName)
+	}
+	if m == nil {
+		return "", nil, nil
+	}
+	return base.TryBuildWhereWithModel(m, t.TableName, t.Adapter.Dialect, func(n int) string {
+		return placeholder(t.Adapter.Dialect, n+offset)
+	})
+}
+
+func (t *TableClient) buildWhereE(where interface{}) (string, []interface{}, error) {
+	return t.buildWhereWithOffsetE(where, 0)
+}
+
 // buildWhere converts an ORM-style where object into SQL clause + bound args.
 func (t *TableClient) buildWhere(where interface{}) (string, []interface{}) {
-	if where == nil {
+	clause, args, err := t.buildWhereE(where)
+	if err != nil {
 		return "", nil
 	}
-	if m, ok := where.(map[string]interface{}); ok && m != nil {
-		clause, args := base.BuildWhereWithModel(m, t.TableName, t.Adapter.Dialect, func(n int) string {
-			return placeholder(t.Adapter.Dialect, n)
-		})
-		return clause, args
-	}
-	return "", nil
+	return clause, args
 }
 
 func (t *TableClient) orderSql(orderBy interface{}) string {
@@ -349,7 +364,13 @@ func (t *TableClient) decodeVectorRows(rows []map[string]interface{}) []map[stri
 
 // FindMany fetches rows matching structured ORM args (where/orderBy/skip/take/select/include).
 func (t *TableClient) FindMany(ctx context.Context, args *FindManyArgs) ([]map[string]interface{}, error) {
-	whereCond, queryArgs := t.buildWhere(args.Where)
+	if args == nil {
+		args = &FindManyArgs{}
+	}
+	whereCond, queryArgs, err := t.buildWhereE(args.Where)
+	if err != nil {
+		return nil, err
+	}
 	order := t.orderSql(args.OrderBy)
 	take := args.Take
 	skip := args.Skip
@@ -472,7 +493,11 @@ func (t *TableClient) Count(ctx context.Context, args *CountArgs) (int64, error)
 	var whereCond string
 	var queryArgs []interface{}
 	if args != nil {
-		whereCond, queryArgs = t.buildWhere(args.Where)
+		var err error
+		whereCond, queryArgs, err = t.buildWhereE(args.Where)
+		if err != nil {
+			return 0, err
+		}
 	}
 	query := fmt.Sprintf("SELECT COUNT(*) AS cnt FROM %s%s", t.quotedTable(), t.nolock())
 	if whereCond != "" {
@@ -705,11 +730,14 @@ func (t *TableClient) Update(ctx context.Context, args *UpdateArgs) (map[string]
 	data, relationWrites := splitRelationWrites(t.TableName, args.Data)
 	data = t.encodeVectorFields(data)
 
-	whereCond, whereArgs := t.buildWhere(args.Where)
 	setParts := []string{}
 	setValues := []interface{}{}
 	for col, val := range data {
 		appendUpdateSet(&setParts, &setValues, col, val, t.Adapter.Dialect)
+	}
+	whereCond, whereArgs, err := t.buildWhereWithOffsetE(args.Where, len(setValues))
+	if err != nil {
+		return nil, err
 	}
 
 	if len(setParts) > 0 {
@@ -791,11 +819,14 @@ func (t *TableClient) UpdateMany(ctx context.Context, args *UpdateManyArgs) (map
 		return map[string]interface{}{"count": 0}, nil
 	}
 	data := t.encodeVectorFields(args.Data)
-	whereCond, whereArgs := t.buildWhere(args.Where)
 	setParts := []string{}
 	setValues := []interface{}{}
 	for col, val := range data {
 		appendUpdateSet(&setParts, &setValues, col, val, t.Adapter.Dialect)
+	}
+	whereCond, whereArgs, err := t.buildWhereWithOffsetE(args.Where, len(setValues))
+	if err != nil {
+		return nil, err
 	}
 	if len(setParts) == 0 {
 		return map[string]interface{}{"count": 0}, nil
@@ -814,7 +845,13 @@ func (t *TableClient) UpdateMany(ctx context.Context, args *UpdateManyArgs) (map
 
 // DeleteMany deletes rows matching where criteria and returns affected count.
 func (t *TableClient) DeleteMany(ctx context.Context, args *DeleteManyArgs) (map[string]interface{}, error) {
-	whereCond, queryArgs := t.buildWhere(args.Where)
+	if args == nil {
+		args = &DeleteManyArgs{}
+	}
+	whereCond, queryArgs, err := t.buildWhereE(args.Where)
+	if err != nil {
+		return nil, err
+	}
 	query := fmt.Sprintf("DELETE FROM %s", t.quotedTable())
 	if whereCond != "" {
 		query += " WHERE " + whereCond
@@ -835,7 +872,10 @@ func (t *TableClient) Delete(ctx context.Context, args *DeleteArgs) (map[string]
 	if err != nil {
 		return nil, err
 	}
-	whereCond, queryArgs := t.buildWhere(args.Where)
+	whereCond, queryArgs, err := t.buildWhereE(args.Where)
+	if err != nil {
+		return nil, err
+	}
 	query := fmt.Sprintf("DELETE FROM %s WHERE %s", t.quotedTable(), whereCond)
 	affected, err := t.Adapter.ExecuteRaw(ctx, query, queryArgs...)
 	if err != nil {
@@ -872,7 +912,10 @@ func (t *TableClient) Aggregate(ctx context.Context, args *AggregateArgs) (map[s
 	if args == nil {
 		args = &AggregateArgs{}
 	}
-	whereCond, queryArgs := t.buildWhere(args.Where)
+	whereCond, queryArgs, err := t.buildWhereE(args.Where)
+	if err != nil {
+		return nil, err
+	}
 	var aggs []string
 
 	if args.Count != nil {
@@ -971,7 +1014,10 @@ func (t *TableClient) GroupBy(ctx context.Context, args *GroupByArgs) ([]map[str
 	if len(byFields) == 0 {
 		return nil, fmt.Errorf("groupBy requires at least one group field")
 	}
-	whereCond, queryArgs := t.buildWhere(args.Where)
+	whereCond, queryArgs, err := t.buildWhereE(args.Where)
+	if err != nil {
+		return nil, err
+	}
 
 	quotedGroups := make([]string, len(byFields))
 	for i, f := range byFields {
@@ -1047,8 +1093,10 @@ func (t *TableClient) VectorSearch(ctx context.Context, args *VectorSearchArgs) 
 	if distanceMetric == "" {
 		distanceMetric = "cosine"
 	}
-	whereCond, queryArgs := t.buildWhere(args.Where)
-	_ = queryArgs
+	whereCond, queryArgs, err := t.buildWhereE(args.Where)
+	if err != nil {
+		return nil, err
+	}
 
 	clause := ""
 	if whereCond != "" {
@@ -1104,22 +1152,23 @@ func resolveIncludes(ctx context.Context, modelName string, rows []map[string]in
 				if relation.RelationType != "many" {
 					continue
 				}
-				uniqueKeys := uniqueSet(rows, relation.LocalKey)
+				matchKey, joinKey := base.ResolveRelationKeys(modelName, relation)
+				uniqueKeys := uniqueSet(rows, joinKey)
 				if len(uniqueKeys) > 0 {
 					relClient := adapter.Table(relation.ModelName)
 					related, err := relClient.FindMany(ctx, &FindManyArgs{
-						Where: map[string]interface{}{relation.ForeignKey: map[string]interface{}{"in": uniqueKeys}},
+						Where: map[string]interface{}{matchKey: map[string]interface{}{"in": uniqueKeys}},
 					})
 					if err != nil {
 						return err
 					}
 					countMap := map[interface{}]int{}
 					for _, r := range related {
-						k := r[relation.ForeignKey]
+						k := r[matchKey]
 						countMap[k]++
 					}
 					for _, row := range rows {
-						k := row[relation.LocalKey]
+						k := row[joinKey]
 						c := 0
 						if n, ok := countMap[k]; ok {
 							c = n
@@ -1135,20 +1184,12 @@ func resolveIncludes(ctx context.Context, modelName string, rows []map[string]in
 			continue
 		}
 
-		relation, ok := modelRelations[key]
+		_, relation, ok := base.ResolveRelationForModel(modelName, key)
 		if !ok {
 			continue
 		}
 		isMany := relation.RelationType == "many"
-		joinKey := relation.LocalKey
-		matchKey := relation.ForeignKey
-		if isMany {
-			joinKey = relation.LocalKey
-			matchKey = relation.ForeignKey
-		} else {
-			joinKey = relation.ForeignKey
-			matchKey = relation.LocalKey
-		}
+		matchKey, joinKey := base.ResolveRelationKeys(modelName, relation)
 		uniqueKeys := uniqueSet(rows, joinKey)
 		if len(uniqueKeys) == 0 {
 			for _, row := range rows {
@@ -1204,22 +1245,12 @@ func resolveIncludes(ctx context.Context, modelName string, rows []map[string]in
 
 		groupMap := map[interface{}][]map[string]interface{}{}
 		for i, r := range related {
-			var k interface{}
-			if isMany {
-				k = r[relation.ForeignKey]
-			} else {
-				k = r[relation.LocalKey]
-			}
+			k := r[matchKey]
 			groupMap[k] = append(groupMap[k], outputRows[i])
 		}
 
 		for _, row := range rows {
-			var k interface{}
-			if isMany {
-				k = row[relation.LocalKey]
-			} else {
-				k = row[relation.ForeignKey]
-			}
+			k := row[joinKey]
 			matches := groupMap[k]
 			if matches == nil {
 				matches = []map[string]interface{}{}

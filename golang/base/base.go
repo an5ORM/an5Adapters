@@ -38,16 +38,56 @@ func QuoteIdentifier(name string, dialect Dialect) string {
 }
 
 // QuoteTable quotes schema-qualified table names (e.g. "dbo.users" -> "[dbo].[users]").
+// On SQLite, a leading "dbo." schema qualifier is stripped because SQLite attaches tables directly.
 func QuoteTable(tableName string, dialect Dialect) string {
-	if strings.HasPrefix(tableName, "[") || strings.HasPrefix(tableName, `"`) {
-		return tableName
+	rawParts := strings.Split(tableName, ".")
+	cleaned := make([]string, 0, len(rawParts))
+	for _, p := range rawParts {
+		seg := strings.TrimSpace(p)
+		seg = stripWrapping(seg, "[", "]")
+		seg = stripWrapping(seg, `"`, `"`)
+		seg = stripWrapping(seg, "`", "`")
+		if seg != "" {
+			cleaned = append(cleaned, seg)
+		}
 	}
-	parts := strings.Split(tableName, ".")
-	var quoted []string
-	for _, p := range parts {
-		quoted = append(quoted, QuoteIdentifier(p, dialect))
+	if len(cleaned) == 0 {
+		return QuoteIdentifier(tableName, dialect)
+	}
+	if dialect == DialectSqlite && len(cleaned) == 2 && strings.EqualFold(cleaned[0], "dbo") {
+		cleaned = cleaned[1:]
+	}
+	quoted := make([]string, len(cleaned))
+	for i, p := range cleaned {
+		quoted[i] = QuoteIdentifier(p, dialect)
 	}
 	return strings.Join(quoted, ".")
+}
+
+// ToSnakeCase converts camelCase/PascalCase identifiers to snake_case.
+func ToSnakeCase(s string) string {
+	if s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	var b strings.Builder
+	b.Grow(len(runes) + 4)
+	for i, r := range runes {
+		if r >= 'A' && r <= 'Z' {
+			if i > 0 {
+				prev := runes[i-1]
+				hasNextLower := i+1 < len(runes) && runes[i+1] >= 'a' && runes[i+1] <= 'z'
+				prevIsUpper := prev >= 'A' && prev <= 'Z'
+				if prev != '_' && (!prevIsUpper || hasNextLower) {
+					b.WriteByte('_')
+				}
+			}
+			b.WriteRune(r + ('a' - 'A'))
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func stripWrapping(name, left, right string) string {

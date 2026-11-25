@@ -3,6 +3,7 @@
 package base
 
 import (
+	"sort"
 	"strings"
 	"sync"
 )
@@ -62,18 +63,126 @@ func GetModelToTable() map[string]string {
 	return out
 }
 
-// GetFieldsForModel returns field metadata for the given model name.
+// GetFieldsForModel returns field metadata for the given model name (case-insensitive fallback).
 func GetFieldsForModel(modelName string) interface{} {
 	metaMu.RLock()
 	defer metaMu.RUnlock()
-	return modelFields[modelName]
+	return getFieldsLocked(modelName)
 }
 
-// GetRelationsForModel returns the relation map for the given model name (read-only snapshot).
+func getFieldsLocked(modelName string) interface{} {
+	if modelName == "" {
+		return nil
+	}
+	if fields, ok := modelFields[modelName]; ok {
+		return fields
+	}
+	for k, v := range modelFields {
+		if strings.EqualFold(k, modelName) {
+			return v
+		}
+	}
+	return nil
+}
+
+// ModelHasFields returns true if field metadata is registered for modelName.
+func ModelHasFields(modelName string) bool {
+	fields := GetFieldsForModel(modelName)
+	switch v := fields.(type) {
+	case map[string]interface{}:
+		return len(v) > 0
+	case map[string]bool:
+		return len(v) > 0
+	case map[string]string:
+		return len(v) > 0
+	case []map[string]interface{}:
+		return len(v) > 0
+	case []interface{}:
+		return len(v) > 0
+	case []string:
+		return len(v) > 0
+	default:
+		return false
+	}
+}
+
+// ModelHasField checks whether col (exact, case-insensitive, or snake_case) is a registered field of modelName.
+func ModelHasField(modelName, col string) bool {
+	if modelName == "" || col == "" {
+		return false
+	}
+	fields := GetFieldsForModel(modelName)
+	if fields == nil {
+		return false
+	}
+	targetSnake := ToSnakeCase(col)
+	matchesName := func(candidate string) bool {
+		return candidate == col || strings.EqualFold(candidate, col) || ToSnakeCase(candidate) == targetSnake
+	}
+	switch v := fields.(type) {
+	case map[string]interface{}:
+		for k := range v {
+			if matchesName(k) {
+				return true
+			}
+		}
+	case map[string]bool:
+		for k, enabled := range v {
+			if enabled && matchesName(k) {
+				return true
+			}
+		}
+	case map[string]string:
+		for k := range v {
+			if matchesName(k) {
+				return true
+			}
+		}
+	case []map[string]interface{}:
+		for _, item := range v {
+			if n, ok := item["name"].(string); ok && matchesName(n) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, raw := range v {
+			switch item := raw.(type) {
+			case string:
+				if matchesName(item) {
+					return true
+				}
+			case map[string]interface{}:
+				if n, ok := item["name"].(string); ok && matchesName(n) {
+					return true
+				}
+			}
+		}
+	case []string:
+		for _, n := range v {
+			if matchesName(n) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// GetRelationsForModel returns the relation map for the given model name (read-only snapshot, case-insensitive fallback).
 func GetRelationsForModel(modelName string) map[string]RelationDef {
 	metaMu.RLock()
 	defer metaMu.RUnlock()
+	if modelName == "" {
+		return map[string]RelationDef{}
+	}
 	rels := relationMap[modelName]
+	if rels == nil {
+		for k, v := range relationMap {
+			if strings.EqualFold(k, modelName) {
+				rels = v
+				break
+			}
+		}
+	}
 	if rels == nil {
 		return map[string]RelationDef{}
 	}
@@ -82,6 +191,57 @@ func GetRelationsForModel(modelName string) map[string]RelationDef {
 		out[k] = v
 	}
 	return out
+}
+
+// ResolveRelationForModel looks up a relation by exact key, case-insensitive match, or snake_case alias.
+func ResolveRelationForModel(modelName, key string) (string, RelationDef, bool) {
+	rels := GetRelationsForModel(modelName)
+	if len(rels) == 0 {
+		return "", RelationDef{}, false
+	}
+	if def, ok := rels[key]; ok {
+		return key, def, true
+	}
+	names := make([]string, 0, len(rels))
+	for relName := range rels {
+		names = append(names, relName)
+	}
+	sort.Strings(names)
+	for _, relName := range names {
+		if strings.EqualFold(relName, key) {
+			return relName, rels[relName], true
+		}
+	}
+	targetSnake := ToSnakeCase(key)
+	for _, relName := range names {
+		if ToSnakeCase(relName) == targetSnake {
+			return relName, rels[relName], true
+		}
+	}
+	return "", RelationDef{}, false
+}
+
+// ResolveRelationKeys resolves (childCol, parentCol) for a relation filter or eager-load.
+func ResolveRelationKeys(parentModel string, rel RelationDef) (string, string) {
+	rawFK := rel.ForeignKey
+	if rawFK == "" {
+		rawFK = "id"
+	}
+	rawLK := rel.LocalKey
+	if rawLK == "" {
+		rawLK = "id"
+	}
+	if rel.RelationType == "many" {
+		return rawFK, rawLK
+	}
+	// Generated relation maps record ForeignKey on the referencing side and LocalKey on the referenced target.
+	// Disambiguate inverse 1-to-1 relations (parent holds LocalKey, child holds ForeignKey) from FK-holding
+	// to-one relations using field metadata when available.
+	if (ModelHasField(rel.ModelName, rawFK) && !ModelHasField(rel.ModelName, rawLK)) ||
+		(ModelHasField(parentModel, rawLK) && !ModelHasField(parentModel, rawFK)) {
+		return rawFK, rawLK
+	}
+	return rawLK, rawFK
 }
 
 // GetRelationMap returns the full model-to-relations map (read-only snapshot).

@@ -65,6 +65,21 @@ func GetRelationsForModel(modelName string) map[string]RelationDef {
 	return base.GetRelationsForModel(modelName)
 }
 
+// ResolveRelationKeys resolves (childCol, parentCol) for a relation filter or include.
+func ResolveRelationKeys(parentModel string, rel RelationDef) (string, string) {
+	return base.ResolveRelationKeys(parentModel, rel)
+}
+
+// TryBuildWhere builds a SQL WHERE clause with strict operator validation.
+func TryBuildWhere(where map[string]interface{}, dialect Dialect, ph func(n int) string) (string, []interface{}, error) {
+	return base.TryBuildWhere(where, dialect, ph)
+}
+
+// TryBuildWhereWithModel builds a model-aware SQL WHERE clause with strict operator and relation validation.
+func TryBuildWhereWithModel(where map[string]interface{}, modelName string, dialect Dialect, ph func(n int) string) (string, []interface{}, error) {
+	return base.TryBuildWhereWithModel(where, modelName, dialect, ph)
+}
+
 // An5Adapter manages runtime database execution for Go applications.
 type An5Adapter struct {
 	DB      *sql.DB
