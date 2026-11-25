@@ -5,13 +5,15 @@
 //! row decoding and dialect handling are caught.
 
 use an5_adapters::{
-    AdapterMetadata, An5Adapter, CountArgs, DeleteManyArgs, FindManyArgs, UpdateArgs,
+    AdapterMetadata, An5Adapter, CountArgs, DeleteManyArgs, FindManyArgs, GroupByArgs, RelationDef,
+    UpdateArgs,
 };
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Once;
 
 static DRIVER: Once = Once::new();
+static METADATA_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Removes the temporary database when the test finishes.
 struct TempDb(std::path::PathBuf);
@@ -68,6 +70,7 @@ fn unique_id() -> u64 {
 
 #[tokio::test]
 async fn crud_round_trip() {
+    let _guard = METADATA_GUARD.lock().await;
     let (db, _tmp) = adapter().await;
     let users = db.table("User");
 
@@ -209,6 +212,7 @@ async fn crud_round_trip() {
 
 #[tokio::test]
 async fn raw_sql_and_transaction() {
+    let _guard = METADATA_GUARD.lock().await;
     let (db, _tmp) = adapter().await;
 
     db.execute_raw(
@@ -257,6 +261,7 @@ async fn raw_sql_and_transaction() {
 
 #[tokio::test]
 async fn aggregate_and_group_by() {
+    let _guard = METADATA_GUARD.lock().await;
     let (db, _tmp) = adapter().await;
     let users = db.table("User");
     for (id, name, age) in [("1", "Alice", 30), ("2", "Bob", 25), ("3", "Cara", 35)] {
@@ -292,6 +297,7 @@ async fn aggregate_and_group_by() {
 
 #[tokio::test]
 async fn shared_query_contract() {
+    let _guard = METADATA_GUARD.lock().await;
     let (db, _tmp) = adapter().await;
     db.execute_raw("ALTER TABLE users ADD COLUMN score INTEGER", &[]).await.unwrap();
     let contract: serde_json::Value = serde_json::from_str(include_str!("../../test/fixtures/query-semantics.json")).unwrap();
@@ -308,4 +314,215 @@ async fn shared_query_contract() {
         let expected: Vec<i64> = case["ids"].as_array().unwrap().iter().map(|id| id.as_i64().unwrap()).collect();
         assert_eq!(ids, expected, "{}", case["name"]);
     }
+}
+
+#[tokio::test]
+async fn relation_filters_and_strict_operator_rejection() {
+    let _guard = METADATA_GUARD.lock().await;
+    let (db, _tmp) = adapter().await;
+    db.execute_raw(
+        "CREATE TABLE orders (id TEXT PRIMARY KEY, user_id TEXT NULL, total INTEGER NOT NULL)",
+        &[],
+    )
+    .await
+    .expect("create orders table");
+
+    db.set_metadata(AdapterMetadata {
+        model_to_table: HashMap::from([
+            ("User".to_string(), "users".to_string()),
+            ("user".to_string(), "users".to_string()),
+            ("Order".to_string(), "orders".to_string()),
+            ("order".to_string(), "orders".to_string()),
+        ]),
+        model_fields: HashMap::from([
+            ("User".to_string(), json!({ "id": {}, "email": {}, "name": {}, "age": {} })),
+            ("Order".to_string(), json!({ "id": {}, "userId": {}, "total": {} })),
+        ]),
+        relation_map: HashMap::from([
+            (
+                "user".to_string(),
+                HashMap::from([(
+                    "orders".to_string(),
+                    RelationDef {
+                        model_name: "order".to_string(),
+                        relation_type: "many".to_string(),
+                        foreign_key: "user_id".to_string(),
+                        local_key: "id".to_string(),
+                    },
+                )]),
+            ),
+            (
+                "order".to_string(),
+                HashMap::from([(
+                    "user".to_string(),
+                    RelationDef {
+                        model_name: "user".to_string(),
+                        relation_type: "one".to_string(),
+                        foreign_key: "user_id".to_string(),
+                        local_key: "id".to_string(),
+                    },
+                )]),
+            ),
+        ]),
+    });
+
+    db.execute_raw(
+        "INSERT INTO users (id, email, name, age) VALUES ('u1', 'a@example.com', 'Alice', 30), ('u2', 'b@example.com', 'Bob', 25), ('u3', 'c@example.com', 'Carol', 28)",
+        &[],
+    )
+    .await
+    .unwrap();
+    db.execute_raw(
+        "INSERT INTO orders (id, user_id, total) VALUES ('o1', 'u1', 100), ('o2', 'u1', 250), ('o3', 'u2', 50), ('o4', NULL, 75)",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let users = db.table("User");
+    let orders = db.table("Order");
+
+    // some / none / every and nested `not` inside relation filter
+    let some_big = users
+        .find_many(&FindManyArgs {
+            r#where: Some(json!({ "orders": { "some": { "total": { "not": { "lt": 200 } } } } })),
+            order_by: Some(json!({ "id": "asc" })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        some_big.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["u1"]
+    );
+
+    let none_big = users
+        .find_many(&FindManyArgs {
+            r#where: Some(json!({ "orders": { "none": { "total": { "gte": 200 } } } })),
+            order_by: Some(json!({ "id": "asc" })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        none_big.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["u2", "u3"]
+    );
+
+    let every_ge_50 = users
+        .find_many(&FindManyArgs {
+            r#where: Some(json!({ "orders": { "every": { "total": { "gte": 50 } } } })),
+            order_by: Some(json!({ "id": "asc" })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        every_ge_50.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["u1", "u2", "u3"]
+    );
+
+    // to-one is / isNot / is: null / isNot: null
+    let alice_orders = orders
+        .find_many(&FindManyArgs {
+            r#where: Some(json!({ "user": { "is": { "email": "a@example.com" } } })),
+            order_by: Some(json!({ "id": "asc" })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        alice_orders.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["o1", "o2"]
+    );
+
+    let orphan_orders = orders
+        .find_many(&FindManyArgs {
+            r#where: Some(json!({ "user": { "is": null } })),
+            order_by: Some(json!({ "id": "asc" })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        orphan_orders.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["o4"]
+    );
+
+    let owned_orders = orders
+        .find_many(&FindManyArgs {
+            r#where: Some(json!({ "user": { "isNot": null } })),
+            order_by: Some(json!({ "id": "asc" })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        owned_orders.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["o1", "o2", "o3"]
+    );
+
+    // count and group_by with relation filter
+    assert_eq!(
+        users
+            .count(&CountArgs {
+                r#where: Some(json!({ "orders": { "some": { "total": { "gte": 100 } } } })),
+            })
+            .await
+            .unwrap(),
+        1
+    );
+    let grouped = users
+        .group_by(&GroupByArgs {
+            by: Some(json!(["id"])),
+            r#where: Some(json!({ "orders": { "some": { "total": 50 } } })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(grouped.len(), 1);
+    assert_eq!(grouped[0]["id"].as_str(), Some("u2"));
+
+    // include for to-many and to-one
+    let u1_inc = users
+        .find_first(&FindManyArgs {
+            r#where: Some(json!({ "id": "u1" })),
+            include: Some(json!({ "orders": true })),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(u1_inc["orders"].as_array().unwrap().len(), 2);
+
+    let o3_inc = orders
+        .find_first(&FindManyArgs {
+            r#where: Some(json!({ "id": "o3" })),
+            include: Some(json!({ "user": true })),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(o3_inc["user"]["email"].as_str(), Some("b@example.com"));
+
+    // unknown scalar / relation operator returns Err
+    assert!(
+        users
+            .find_many(&FindManyArgs {
+                r#where: Some(json!({ "email": { "badOp": "x" } })),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        users
+            .find_many(&FindManyArgs {
+                r#where: Some(json!({ "orders": { "is": { "total": 10 } } })),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+    );
 }

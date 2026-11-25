@@ -10,9 +10,10 @@ use sqlx::{Any, AnyConnection, AnyPool, Row};
 use std::collections::HashMap;
 
 use crate::base::{
-    build_order_by, build_where, decode_vector, encode_vector, get_fields_for_model, is_vector_field,
-    needs_vector_encoding, resolve_table, set_adapter_metadata, vector_distance, AdapterMetadata,
-    Dialect, RelationDef, Where,
+    build_order_by, decode_vector, encode_vector, get_fields_for_model, is_vector_field,
+    needs_vector_encoding, resolve_relation_for_model, resolve_relation_keys, resolve_table,
+    set_adapter_metadata, try_build_where_with_model, vector_distance, AdapterMetadata, Dialect,
+    Where,
 };
 use crate::base::vectors::{
     distance_function, normalize_metric, plan_vector_strategies, STRATEGY_SQLITE_VEC, STRATEGY_UDF,
@@ -531,16 +532,22 @@ impl TableClient {
         self.adapter.dialect.placeholder(n)
     }
 
-    fn build_where(&self, where_value: &Option<Value>) -> Where {
+    fn build_where(&self, where_value: &Option<Value>) -> Result<Where> {
         match where_value {
-            Some(v) => build_where(v, self.adapter.dialect, &|n| self.ph(n)),
-            None => Where::default(),
+            Some(v) => try_build_where_with_model(
+                v,
+                &self.table_name,
+                self.adapter.dialect,
+                &|n| self.ph(n),
+            )
+            .map_err(|e| e.into()),
+            None => Ok(Where::default()),
         }
     }
 
     /// Fetch rows matching the structured args.
     pub async fn find_many(&self, args: &FindManyArgs) -> Result<Vec<RowMap>> {
-        let w = self.build_where(&args.r#where);
+        let w = self.build_where(&args.r#where)?;
         let order = args
             .order_by
             .as_ref()
@@ -633,7 +640,7 @@ impl TableClient {
 
     /// Total number of matching rows.
     pub async fn count(&self, args: &CountArgs) -> Result<i64> {
-        let w = self.build_where(&args.r#where);
+        let w = self.build_where(&args.r#where)?;
         let mut sql = format!(
             "SELECT COUNT(*) AS cnt FROM {}{}",
             self.quoted_table(),
@@ -721,7 +728,7 @@ impl TableClient {
 
     /// Update rows matching `where` with `data`.
     pub async fn update(&self, args: &UpdateArgs) -> Result<u64> {
-        let w = self.build_where(&args.r#where);
+        let w = self.build_where(&args.r#where)?;
         let (sets, bind) = build_set_clause(&args.data, &|n| self.ph(n))?;
         if sets.is_empty() {
             return Ok(0);
@@ -746,7 +753,7 @@ impl TableClient {
 
     /// Delete rows matching `where`.
     pub async fn delete_many(&self, args: &DeleteManyArgs) -> Result<u64> {
-        let w = self.build_where(&args.r#where);
+        let w = self.build_where(&args.r#where)?;
         let mut sql = format!("DELETE FROM {}", self.quoted_table());
         if !w.is_empty() {
             sql.push_str(&format!(" WHERE {}", w.clause));
@@ -776,7 +783,7 @@ impl TableClient {
 
     /// Aggregations over matching rows.
     pub async fn aggregate(&self, args: &AggregateArgs) -> Result<RowMap> {
-        let w = self.build_where(&args.r#where);
+        let w = self.build_where(&args.r#where)?;
         let mut select = String::from("COUNT(*) AS _count");
         if let Some(Value::Array(cols)) = &args.sum {
             for c in cols {
@@ -875,7 +882,7 @@ impl TableClient {
             }
         }
 
-        let w = self.build_where(&args.r#where);
+        let w = self.build_where(&args.r#where)?;
         let mut sql = format!(
             "SELECT {} FROM {}{}",
             select.join(", "),
@@ -1122,7 +1129,7 @@ impl TableClient {
             &args.distance_metric
         };
         let quoted_field = self.adapter.dialect.quote_identifier(field);
-        let w = self.build_where(&args.r#where);
+        let w = self.build_where(&args.r#where)?;
 
         // Native path: MSSQL VECTOR_DISTANCE / Postgres pgvector operators.
         let native_sql = match self.adapter.dialect {
@@ -1250,37 +1257,25 @@ impl TableClient {
             _ => Vec::new(),
         };
 
-        let relations: HashMap<String, RelationDef> =
-            crate::base::get_relations_for_model(&self.table_name);
-
         for key in requested {
             if key == "_count" {
                 continue;
             }
-            let def = match relations.get(&key) {
-                Some(d) => d.clone(),
+            let def = match resolve_relation_for_model(&self.table_name, &key) {
+                Some((_, d)) => d,
                 None => continue,
             };
             let target = self.adapter.table(&def.model_name);
-            let fk = if def.foreign_key.is_empty() {
-                "id".to_string()
-            } else {
-                def.foreign_key.clone()
-            };
-            let lk = if def.local_key.is_empty() {
-                "id".to_string()
-            } else {
-                def.local_key.clone()
-            };
+            let (child_key, parent_key) = resolve_relation_keys(&self.table_name, &def);
 
             for row in rows.iter_mut() {
-                let parent_value = match row.get(&lk) {
+                let parent_value = match row.get(&parent_key) {
                     Some(v) if !v.is_null() => v.clone(),
                     _ => continue,
                 };
                 let child_rows = target
                     .find_many(&FindManyArgs {
-                        r#where: Some(serde_json::json!({ fk.clone(): parent_value })),
+                        r#where: Some(serde_json::json!({ child_key.clone(): parent_value })),
                         ..Default::default()
                     })
                     .await?;
@@ -1545,6 +1540,7 @@ fn score_rows(rows: &mut [RowMap], query: &[f64], metric: &str) -> Vec<RowMap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base::RelationDef;
     use serde_json::json;
 
     async fn client() -> TableClient {

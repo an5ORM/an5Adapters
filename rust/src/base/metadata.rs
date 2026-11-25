@@ -75,9 +75,52 @@ pub fn get_model_to_table() -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Convert camelCase/PascalCase identifier to snake_case (matches RustGenerator).
+pub fn to_snake_case(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, &ch) in chars.iter().enumerate() {
+        if i > 0 && ch.is_ascii_uppercase() {
+            let prev = chars[i - 1];
+            let next_is_lower = chars.get(i + 1).is_some_and(|c| c.is_ascii_lowercase());
+            if prev.is_ascii_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_ascii_uppercase() && next_is_lower)
+            {
+                out.push('_');
+            }
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+fn find_case_insensitive<'a, V: Clone>(
+    map: &'a HashMap<String, V>,
+    key: &str,
+) -> Option<V> {
+    if let Some(v) = map.get(key) {
+        return Some(v.clone());
+    }
+    let snake = to_snake_case(key);
+    if let Some(v) = map.get(&snake) {
+        return Some(v.clone());
+    }
+    let lower = key.to_lowercase();
+    for (k, v) in map {
+        if k.to_lowercase() == lower {
+            return Some(v.clone());
+        }
+    }
+    None
+}
+
 /// Field metadata for a model, if present.
 pub fn get_fields_for_model(model: &str) -> Option<serde_json::Value> {
-    model_fields_store().read().ok().and_then(|s| s.get(model).cloned())
+    model_fields_store()
+        .read()
+        .ok()
+        .and_then(|s| find_case_insensitive(&s, model))
 }
 
 /// Relations declared for a model.
@@ -85,8 +128,77 @@ pub fn get_relations_for_model(model: &str) -> HashMap<String, RelationDef> {
     relation_map_store()
         .read()
         .ok()
-        .and_then(|s| s.get(model).cloned())
+        .and_then(|s| find_case_insensitive(&s, model))
         .unwrap_or_default()
+}
+
+/// Look up a relation by exact key or its snake_case alias.
+pub fn resolve_relation_for_model(model: &str, key: &str) -> Option<(String, RelationDef)> {
+    let rels = get_relations_for_model(model);
+    if rels.is_empty() {
+        return None;
+    }
+    if let Some(def) = rels.get(key) {
+        return Some((key.to_string(), def.clone()));
+    }
+    for (rel_name, def) in rels {
+        if to_snake_case(&rel_name) == key {
+            return Some((rel_name, def));
+        }
+    }
+    None
+}
+
+pub fn model_has_fields_metadata(model: &str) -> bool {
+    get_fields_for_model(model).is_some_and(|v| match v {
+        serde_json::Value::Object(m) => !m.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        _ => false,
+    })
+}
+
+pub fn model_has_field(model: &str, col: &str) -> bool {
+    let Some(fields) = get_fields_for_model(model) else {
+        return false;
+    };
+    let target_snake = to_snake_case(col);
+    match fields {
+        serde_json::Value::Object(map) => map
+            .keys()
+            .any(|k| k == col || to_snake_case(k) == target_snake),
+        serde_json::Value::Array(items) => items.iter().any(|item| {
+            item.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n == col || to_snake_case(n) == target_snake)
+        }),
+        _ => false,
+    }
+}
+
+/// Resolve `(child_col, parent_col)` for a relation filter or eager-load.
+pub fn resolve_relation_keys(parent_model: &str, rel: &RelationDef) -> (String, String) {
+    let raw_fk = if rel.foreign_key.is_empty() {
+        "id"
+    } else {
+        rel.foreign_key.as_str()
+    };
+    let raw_lk = if rel.local_key.is_empty() {
+        "id"
+    } else {
+        rel.local_key.as_str()
+    };
+    if rel.relation_type == "many" {
+        return (raw_fk.to_string(), raw_lk.to_string());
+    }
+    // Generated relation_map puts foreign_key on the referencing model (parent)
+    // and local_key on the referenced model (child). Hand-written fixtures may
+    // reverse them to match sql.ts; disambiguate via model_fields when present.
+    if (model_has_field(&rel.model_name, raw_fk) && !model_has_field(&rel.model_name, raw_lk))
+        || (model_has_field(parent_model, raw_lk) && !model_has_field(parent_model, raw_fk))
+    {
+        return (raw_fk.to_string(), raw_lk.to_string());
+    }
+    (raw_lk.to_string(), raw_fk.to_string())
 }
 
 /// Resolve the physical table for a model, honouring overrides, then the
