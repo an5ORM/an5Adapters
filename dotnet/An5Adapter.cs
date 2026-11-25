@@ -151,6 +151,9 @@ namespace An5Orm
 
         public static object GetFieldsForModel(string modelName)
             => An5Metadata.GetFieldsForModel(modelName);
+
+        public static (string ChildCol, string ParentCol) ResolveRelationKeys(string parentModel, RelationDef relation)
+            => An5Metadata.ResolveRelationKeys(parentModel, relation);
     }
 
 // ─── Transaction wrapper ───────────────────────────────────────────────────
@@ -433,18 +436,18 @@ namespace An5Orm
         public AdapterTableClient(An5Adapter adapter, string tableName, Dialect dialect)
         {
             _adapter = adapter;
-            _rawTable = tableName;
-            _tableName = SqlQuote.QuoteTable(tableName, dialect);
             _modelName = tableName;
+            _rawTable = An5Metadata.ResolveTable(tableName);
+            _tableName = SqlQuote.QuoteTable(_rawTable, dialect);
             _dialect = dialect;
         }
 
         public AdapterTableClient(An5Adapter adapter, string tableName, string modelName, Dialect dialect)
         {
             _adapter = adapter;
-            _rawTable = tableName;
-            _tableName = SqlQuote.QuoteTable(tableName, dialect);
-            _modelName = modelName;
+            _modelName = string.IsNullOrEmpty(modelName) ? tableName : modelName;
+            _rawTable = An5Metadata.TryResolveTable(_modelName, out var resolved) ? resolved : tableName;
+            _tableName = SqlQuote.QuoteTable(_rawTable, dialect);
             _dialect = dialect;
         }
 
@@ -663,54 +666,53 @@ namespace An5Orm
                     foreach (var rel in modelRelations)
                     {
                         if (rel.Value.RelationType != "many") continue;
+                        var (matchKey, joinKey) = An5Metadata.ResolveRelationKeys(_modelName, rel.Value);
                         var relKeys = new HashSet<object>();
                         foreach (var r in rows)
                         {
-                            var lk = GetPropValue(r, rel.Value.LocalKey);
+                            var lk = GetPropValue(r, joinKey);
                             if (lk != null) relKeys.Add(lk);
                         }
                         var childClient = new AdapterTableClient<DictionaryModel>(_adapter, rel.Value.ModelName, _dialect);
-                        var matches = childClient.FindManyDynamic(new FindManyArgs
-                        {
-                            Where = new Dictionary<string, object> { { rel.Value.ForeignKey, new Dictionary<string, object> { { "in", ToList(relKeys) } } } },
-                        });
                         var cmap = new Dictionary<object, int>();
-                        foreach (var m in matches)
-                            if (m.ContainsKey(rel.Value.ForeignKey) && m[rel.Value.ForeignKey] != null)
-                                cmap[m[rel.Value.ForeignKey]] = cmap.GetValueOrDefault(m[rel.Value.ForeignKey]) + 1;
+                        if (relKeys.Count > 0)
+                        {
+                            var matches = childClient.FindManyDynamic(new FindManyArgs
+                            {
+                                Where = new Dictionary<string, object> { { matchKey, new Dictionary<string, object> { { "in", ToList(relKeys) } } } },
+                            });
+                            foreach (var m in matches)
+                            {
+                                var mk = NormalizeJoinKey(GetDictValue(m, matchKey));
+                                if (mk != null)
+                                    cmap[mk] = cmap.GetValueOrDefault(mk) + 1;
+                            }
+                        }
                         foreach (var r in rows)
                         {
-                            var lk = GetPropValue(r, rel.Value.LocalKey);
-                            var countProp = typeof(T).GetProperty("_count", BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-                            var countBox = countProp != null ? countProp.GetValue(r) as Dictionary<string, object> : null;
-                            countBox ??= new Dictionary<string, object>();
+                            var lk = NormalizeJoinKey(GetPropValue(r, joinKey));
+                            var countBox = GetPropValue(r, "_count") as Dictionary<string, object> ?? new Dictionary<string, object>();
                             countBox[rel.Key] = lk != null && cmap.TryGetValue(lk, out var n) ? n : 0;
-                            if (countProp != null) TrySetProp(r, "_count", countBox);
+                            TrySetProp(r, "_count", countBox);
                         }
                     }
                     continue;
                 }
 
-                var relation = modelRelations.TryGetValue(key, out var rdef) ? rdef : null;
-                if (relation == null) continue;
+                if (!An5Metadata.ResolveRelationForModel(_modelName, key, out _, out var relation) || relation == null) continue;
                 var isMany = relation.RelationType == "many";
-                var joinKey = isMany ? relation.LocalKey : relation.ForeignKey;
-                var matchKey = isMany ? relation.ForeignKey : relation.LocalKey;
+                var (relMatchKey, relJoinKey) = An5Metadata.ResolveRelationKeys(_modelName, relation);
 
                 var uniqueKeys = new HashSet<object>();
                 foreach (var r in rows)
                 {
-                    var jv = GetPropValue(r, joinKey);
+                    var jv = GetPropValue(r, relJoinKey);
                     if (jv != null) uniqueKeys.Add(jv);
-                }
-                foreach (var r in rows)
-                {
-                    if (!isMany) { r.GetType(); }
                 }
                 if (uniqueKeys.Count == 0)
                 {
                     foreach (var r in rows)
-                        TrySetProp(r, key, isMany ? new List<object>() : null);
+                        TrySetProp(r, key, isMany ? new List<Dictionary<string, object>>() : null);
                     continue;
                 }
 
@@ -718,7 +720,7 @@ namespace An5Orm
                 var subArgs = kv.Value as Dictionary<string, object> ?? new Dictionary<string, object>();
                 var subWhere = new Dictionary<string, object>
                 {
-                    { matchKey, new Dictionary<string, object> { { "in", ToList(uniqueKeys) } } },
+                    { relMatchKey, new Dictionary<string, object> { { "in", ToList(uniqueKeys) } } },
                 };
                 if (subArgs.TryGetValue("where", out var subWhereVal) && subWhereVal is Dictionary<string, object> sw)
                     foreach (var swKv in sw) subWhere[swKv.Key] = swKv.Value;
@@ -733,8 +735,7 @@ namespace An5Orm
                 Dictionary<object, List<Dictionary<string, object>>> groupMap = new();
                 foreach (var c in children)
                 {
-                    var gk = isMany ? (c.ContainsKey(relation.ForeignKey) ? c[relation.ForeignKey] : null)
-                                     : (c.ContainsKey(relation.LocalKey) ? c[relation.LocalKey] : null);
+                    var gk = NormalizeJoinKey(GetDictValue(c, relMatchKey));
                     if (gk == null) continue;
                     if (!groupMap.TryGetValue(gk, out var list)) { list = new List<Dictionary<string, object>>(); groupMap[gk] = list; }
                     list.Add(c);
@@ -742,13 +743,31 @@ namespace An5Orm
 
                 foreach (var r in rows)
                 {
-                    var gk = isMany ? GetPropValue(r, relation.LocalKey) : GetPropValue(r, relation.ForeignKey);
+                    var gk = NormalizeJoinKey(GetPropValue(r, relJoinKey));
                     var matches = gk != null && groupMap.TryGetValue(gk, out var ml) ? ml : new List<Dictionary<string, object>>();
                     if (isMany)
                         TrySetProp(r, key, matches);
                     else
                         TrySetProp(r, key, matches.Count > 0 ? matches[0] : null);
                 }
+            }
+        }
+
+        private static object NormalizeJoinKey(object value)
+        {
+            if (value == null || value == DBNull.Value) return null;
+            switch (value)
+            {
+                case sbyte _:
+                case byte _:
+                case short _:
+                case ushort _:
+                case int _:
+                case uint _:
+                case long _:
+                    return Convert.ToInt64(value);
+                default:
+                    return value;
             }
         }
 
@@ -763,14 +782,40 @@ namespace An5Orm
             return _adapter.QueryRaw(query, parameters);
         }
 
+        private static object GetDictValue(IDictionary<string, object> dict, string key)
+        {
+            if (dict == null || string.IsNullOrEmpty(key)) return null;
+            if (dict.TryGetValue(key, out var exact)) return exact;
+            foreach (var kv in dict)
+            {
+                if (string.Equals(kv.Key, key, StringComparison.OrdinalIgnoreCase))
+                    return kv.Value;
+            }
+            var targetSnake = An5Metadata.ToSnakeCase(key);
+            foreach (var kv in dict)
+            {
+                if (string.Equals(An5Metadata.ToSnakeCase(kv.Key), targetSnake, StringComparison.Ordinal))
+                    return kv.Value;
+            }
+            return null;
+        }
+
         private static object GetPropValue(object obj, string propName)
         {
+            if (obj == null || string.IsNullOrEmpty(propName)) return null;
+            if (obj is IDictionary<string, object> dict) return GetDictValue(dict, propName);
             var prop = obj.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
             return prop?.GetValue(obj);
         }
 
         private static void TrySetProp(object obj, string propName, object value)
         {
+            if (obj == null || string.IsNullOrEmpty(propName)) return;
+            if (obj is IDictionary<string, object> dict)
+            {
+                dict[propName] = value;
+                return;
+            }
             var prop = obj.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
             if (prop == null || !prop.CanWrite) return;
             if (value == null) { prop.SetValue(obj, null); return; }

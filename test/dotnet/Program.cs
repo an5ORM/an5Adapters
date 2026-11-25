@@ -20,6 +20,24 @@ public class CatalogType
     public string NameVi { get; set; }
 }
 
+public class RelUser
+{
+    public int Id { get; set; }
+    public string Email { get; set; }
+    public string Created_At { get; set; }
+    public Dictionary<string, object> Profile { get; set; }
+    public List<Dictionary<string, object>> Orders { get; set; }
+    public Dictionary<string, object> _count { get; set; }
+}
+
+public class RelOrder
+{
+    public int Id { get; set; }
+    public int User_Id { get; set; }
+    public int Total { get; set; }
+    public string Status { get; set; }
+}
+
 internal static class Program
 {
     private static int _failed;
@@ -350,6 +368,205 @@ internal static class Program
         }
     }
 
+    private static void RelationFiltersAndValidation(string dbPath)
+    {
+        Console.WriteLine("\n[relation filters & strict validation]");
+        An5AdapterMetadata.Set(new AdapterMetadata
+        {
+            ModelToTable = new Dictionary<string, string>
+            {
+                { "User", "dbo.rel_users" },
+                { "Order", "dbo.rel_orders" },
+                { "OrderItem", "dbo.rel_order_items" },
+                { "Profile", "dbo.rel_profiles" },
+            },
+            ModelFields = new Dictionary<string, object>
+            {
+                { "User", new Dictionary<string, bool> { { "id", true }, { "email", true }, { "created_at", true } } },
+                { "Order", new Dictionary<string, bool> { { "id", true }, { "user_id", true }, { "total", true }, { "status", true } } },
+                { "OrderItem", new Dictionary<string, bool> { { "id", true }, { "order_id", true }, { "sku", true } } },
+                { "Profile", new Dictionary<string, bool> { { "id", true }, { "user_id", true }, { "bio", true } } },
+            },
+            RelationMap = new Dictionary<string, Dictionary<string, RelationDef>>
+            {
+                { "User", new Dictionary<string, RelationDef>
+                    {
+                        { "orders", new RelationDef { ModelName = "Order", RelationType = "many", ForeignKey = "user_id", LocalKey = "id" } },
+                        { "profile", new RelationDef { ModelName = "Profile", RelationType = "one", ForeignKey = "user_id", LocalKey = "id" } },
+                    }
+                },
+                { "Order", new Dictionary<string, RelationDef>
+                    {
+                        { "user", new RelationDef { ModelName = "User", RelationType = "one", ForeignKey = "user_id", LocalKey = "id" } },
+                        { "order_items", new RelationDef { ModelName = "OrderItem", RelationType = "many", ForeignKey = "order_id", LocalKey = "id" } },
+                    }
+                },
+                { "OrderItem", new Dictionary<string, RelationDef>
+                    {
+                        { "order", new RelationDef { ModelName = "Order", RelationType = "one", ForeignKey = "order_id", LocalKey = "id" } },
+                    }
+                },
+                { "Profile", new Dictionary<string, RelationDef>
+                    {
+                        { "user", new RelationDef { ModelName = "User", RelationType = "one", ForeignKey = "user_id", LocalKey = "id" } },
+                    }
+                },
+            },
+        });
+
+        try
+        {
+            var manyKeys = An5AdapterMetadata.ResolveRelationKeys("User", new RelationDef { ModelName = "Order", RelationType = "many", ForeignKey = "user_id", LocalKey = "id" });
+            Check("ResolveRelationKeys User.orders", $"{manyKeys.ChildCol}:{manyKeys.ParentCol}", "user_id:id");
+
+            var toOneFkKeys = An5AdapterMetadata.ResolveRelationKeys("Order", new RelationDef { ModelName = "User", RelationType = "one", ForeignKey = "user_id", LocalKey = "id" });
+            Check("ResolveRelationKeys Order.user", $"{toOneFkKeys.ChildCol}:{toOneFkKeys.ParentCol}", "id:user_id");
+
+            var inverseKeys = An5AdapterMetadata.ResolveRelationKeys("User", new RelationDef { ModelName = "Profile", RelationType = "one", ForeignKey = "user_id", LocalKey = "id" });
+            Check("ResolveRelationKeys User.profile inverse 1-to-1", $"{inverseKeys.ChildCol}:{inverseKeys.ParentCol}", "user_id:id");
+
+            using var setupConn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}");
+            setupConn.Open();
+            using (var setup = setupConn.CreateCommand())
+            {
+                setup.CommandText = @"
+CREATE TABLE rel_users (id INTEGER PRIMARY KEY, email TEXT, created_at TEXT);
+CREATE TABLE rel_profiles (id INTEGER PRIMARY KEY, user_id INTEGER, bio TEXT);
+CREATE TABLE rel_orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER, status TEXT);
+CREATE TABLE rel_order_items (id INTEGER PRIMARY KEY, order_id INTEGER, sku TEXT);
+INSERT INTO rel_users VALUES (1,'alice@example.com','2026-01-01'),(2,'bob@example.com','2026-01-02'),(3,'carol@example.com','2026-01-03');
+INSERT INTO rel_profiles VALUES (10,1,'VIP buyer'),(11,3,'New buyer');
+INSERT INTO rel_orders VALUES (100,1,150,'paid'),(101,1,60,'open'),(102,2,40,'cancelled'),(103,99,200,'paid');
+INSERT INTO rel_order_items VALUES (1000,100,'AN5-PRO'),(1001,102,'BASIC');";
+                setup.ExecuteNonQuery();
+            }
+
+            var adapter = new An5Adapter($"sqlite:{dbPath}");
+            var usersTbl = adapter.Table<RelUser>("User");
+            var ordersTbl = adapter.Table<RelOrder>("Order");
+
+            var someUsers = usersTbl.FindMany(new FindManyArgs
+            {
+                Where = new Dictionary<string, object> { { "orders", new Dictionary<string, object> { { "some", new Dictionary<string, object> { { "status", "paid" }, { "total", new Dictionary<string, object> { { "gte", 100 } } } } } } } },
+                OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+            });
+            Check("some orders paid >= 100", string.Join(",", someUsers.Select(u => u.Id)), "1");
+
+            var noneCancelled = usersTbl.FindMany(new FindManyArgs
+            {
+                Where = new Dictionary<string, object> { { "orders", new Dictionary<string, object> { { "none", new Dictionary<string, object> { { "status", "cancelled" } } } } } },
+                OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+            });
+            Check("none cancelled", string.Join(",", noneCancelled.Select(u => u.Id)), "1,3");
+
+            var everyBig = usersTbl.FindMany(new FindManyArgs
+            {
+                Where = new Dictionary<string, object> { { "orders", new Dictionary<string, object> { { "every", new Dictionary<string, object> { { "total", new Dictionary<string, object> { { "gte", 50 } } } } } } } },
+                OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+            });
+            Check("every total >= 50", string.Join(",", everyBig.Select(u => u.Id)), "1,3");
+
+            var combinedSomeEvery = usersTbl.FindMany(new FindManyArgs
+            {
+                Where = new Dictionary<string, object>
+                {
+                    { "orders", new Dictionary<string, object>
+                        {
+                            { "some", new Dictionary<string, object> { { "status", new Dictionary<string, object> { { "not", new Dictionary<string, object> { { "equals", "cancelled" } } } } } } },
+                            { "every", new Dictionary<string, object> { { "total", new Dictionary<string, object> { { "gte", 50 } } } } },
+                        }
+                    },
+                },
+                OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+            });
+            Check("combined some + every + nested scalar not", string.Join(",", combinedSomeEvery.Select(u => u.Id)), "1");
+
+            var multiHop = usersTbl.FindMany(new FindManyArgs
+            {
+                Where = new Dictionary<string, object>
+                {
+                    { "orders", new Dictionary<string, object> { { "some", new Dictionary<string, object> { { "order_items", new Dictionary<string, object> { { "some", new Dictionary<string, object> { { "sku", "AN5-PRO" } } } } } } } } },
+                    { "created_at", new Dictionary<string, object> { { "gte", "2026-01-01" } } },
+                    { "user_compound", new Dictionary<string, object> { { "email", "alice@example.com" } } },
+                },
+                OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+            });
+            Check("multi-hop + cleanWhere protection/flattening", string.Join(",", multiHop.Select(u => u.Id)), "1");
+
+            var inverseIs = usersTbl.FindMany(new FindManyArgs
+            {
+                Where = new Dictionary<string, object> { { "profile", new Dictionary<string, object> { { "is", new Dictionary<string, object> { { "bio", new Dictionary<string, object> { { "contains", "vip" }, { "mode", "insensitive" } } } } } } } },
+                Include = new Dictionary<string, object> { { "profile", true }, { "_count", true } },
+            });
+            Check("inverse 1-to-1 profile.is mode=insensitive", string.Join(",", inverseIs.Select(u => u.Id)), "1");
+            Check("inverse 1-to-1 Include profile bio", inverseIs.Count == 1 && inverseIs[0].Profile != null ? inverseIs[0].Profile["bio"] : null, "VIP buyer");
+            Check("Include _count orders", inverseIs.Count == 1 && inverseIs[0]._count != null ? inverseIs[0]._count["orders"] : null, 2);
+
+            var inverseIsNull = usersTbl.FindMany(new FindManyArgs
+            {
+                Where = new Dictionary<string, object> { { "profile", new Dictionary<string, object> { { "is", null } } } },
+            });
+            Check("inverse 1-to-1 profile.is null", string.Join(",", inverseIsNull.Select(u => u.Id)), "2");
+
+            var inverseIsNotNull = usersTbl.FindMany(new FindManyArgs
+            {
+                Where = new Dictionary<string, object> { { "profile", new Dictionary<string, object> { { "isNot", null } } } },
+                OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+            });
+            Check("inverse 1-to-1 profile.isNot null", string.Join(",", inverseIsNotNull.Select(u => u.Id)), "1,3");
+
+            var fkToOneIs = ordersTbl.FindMany(new FindManyArgs
+            {
+                Where = new Dictionary<string, object> { { "user", new Dictionary<string, object> { { "is", new Dictionary<string, object> { { "email", "alice@example.com" } } } } } },
+                OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+            });
+            Check("Order.user is alice", string.Join(",", fkToOneIs.Select(o => o.Id)), "100,101");
+
+            var fkToOneIsNot = ordersTbl.FindMany(new FindManyArgs
+            {
+                Where = new Dictionary<string, object> { { "user", new Dictionary<string, object> { { "is_not", new Dictionary<string, object> { { "email", "alice@example.com" } } } } } },
+                OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+            });
+            Check("Order.user is_not alice", string.Join(",", fkToOneIsNot.Select(o => o.Id)), "102,103");
+
+            var fkToOneNull = ordersTbl.FindMany(new FindManyArgs
+            {
+                Where = new Dictionary<string, object> { { "user", new Dictionary<string, object> { { "is", null } } } },
+            });
+            Check("Order.user is null (orphan)", string.Join(",", fkToOneNull.Select(o => o.Id)), "103");
+
+            // Strict validation rejections
+            CheckThrows<ArgumentException>("reject unknown scalar op", () =>
+                usersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "email", new Dictionary<string, object> { { "bogus", "x" } } } } }));
+            CheckThrows<ArgumentException>("reject relation op on scalar", () =>
+                usersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "email", new Dictionary<string, object> { { "some", new Dictionary<string, object>() } } } } }));
+            CheckThrows<ArgumentException>("reject to-one op on to-many", () =>
+                usersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "orders", new Dictionary<string, object> { { "is", new Dictionary<string, object>() } } } } }));
+            CheckThrows<ArgumentException>("reject to-many op on to-one", () =>
+                ordersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "user", new Dictionary<string, object> { { "some", new Dictionary<string, object>() } } } } }));
+            CheckThrows<ArgumentException>("reject unknown relation op", () =>
+                usersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "orders", new Dictionary<string, object> { { "any", new Dictionary<string, object>() } } } } }));
+            CheckThrows<ArgumentException>("reject non-dict relation value", () =>
+                usersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "orders", "bad" } } }));
+            CheckThrows<ArgumentException>("reject null some relation filter", () =>
+                usersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "orders", new Dictionary<string, object> { { "some", null } } } } }));
+            CheckThrows<ArgumentException>("reject non-collection in operator", () =>
+                usersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "email", new Dictionary<string, object> { { "in", "not-a-list" } } } } }));
+            CheckThrows<ArgumentException>("reject non-string contains", () =>
+                usersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "email", new Dictionary<string, object> { { "contains", 42 } } } } }));
+            CheckThrows<ArgumentException>("reject invalid filter mode", () =>
+                usersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "email", new Dictionary<string, object> { { "mode", "fuzzy" }, { "equals", "a" } } } } }));
+            CheckThrows<ArgumentException>("reject unknown model field", () =>
+                usersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "unknown_field", "x" } } }));
+            CheckThrows<ArgumentException>("reject non-dict where", () =>
+                usersTbl.FindMany(new FindManyArgs { Where = "not-a-dict" }));
+        }
+        finally
+        {
+            An5AdapterMetadata.Set(new AdapterMetadata());
+        }
+    }
+
     private static int Main()
     {
         _dbPath = Path.Combine(Path.GetTempPath(), $"an5-sqlite-smoke-{Guid.NewGuid():N}.db");
@@ -360,6 +577,7 @@ internal static class Program
             DialectDetection();
             Normalisation();
             Quoting();
+            RelationFiltersAndValidation(_dbPath);
 
             var adapter = new An5Adapter($"sqlite:{_dbPath}");
             Crud(adapter);
