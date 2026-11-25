@@ -128,3 +128,26 @@ fun andOf(vararg clauses: Where): Where = mapOf("AND" to clauses.toList())
 
 /** None of [clauses]; an empty list matches everything. */
 fun notOf(vararg clauses: Where): Where = mapOf("NOT" to clauses.toList())
+
+// ─── Relation filter building ───────────────────────────────────────────────────────
+
+/** At least one related record matches [filter]. */
+infix fun String.some(filter: Where): Where = mapOf(this to mapOf("some" to filter))
+
+/** At least one related record exists. */
+fun String.some(): Where = mapOf(this to mapOf("some" to emptyMap<String, Any?>()))
+
+/** No related record matches [filter]. */
+infix fun String.none(filter: Where): Where = mapOf(this to mapOf("none" to filter))
+
+/** Zero related records exist. */
+fun String.none(): Where = mapOf(this to mapOf("none" to emptyMap<String, Any?>()))
+
+/** Every related record matches [filter] (vacuously true when zero related records exist). */
+infix fun String.every(filter: Where): Where = mapOf(this to mapOf("every" to filter))
+
+/** To-one related record matches [filter], or does not exist when [filter] is `null`. */
+infix fun String.isRelated(filter: Where?): Where = mapOf(this to mapOf("is" to filter))
+
+/** To-one related record does not match [filter], or exists when [filter] is `null`. */
+infix fun String.isNotRelated(filter: Where?): Where = mapOf(this to mapOf("isNot" to filter))

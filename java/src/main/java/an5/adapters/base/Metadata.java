@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -83,18 +84,39 @@ public final class Metadata {
     if (modelName == null || modelName.isEmpty()) {
       return modelName;
     }
-    if (MODEL_TO_TABLE.containsKey(modelName) || MODEL_FIELDS.containsKey(modelName)) {
+    if (hasKey(modelName)) {
       return modelName;
     }
     String camel = Character.toLowerCase(modelName.charAt(0)) + modelName.substring(1);
-    if (MODEL_TO_TABLE.containsKey(camel) || MODEL_FIELDS.containsKey(camel)) {
+    if (hasKey(camel)) {
       return camel;
     }
-    String lower = modelName.toLowerCase();
-    if (MODEL_TO_TABLE.containsKey(lower) || MODEL_FIELDS.containsKey(lower)) {
+    String lower = modelName.toLowerCase(Locale.ROOT);
+    if (hasKey(lower)) {
       return lower;
     }
+    for (String key : MODEL_TO_TABLE.keySet()) {
+      if (key.toLowerCase(Locale.ROOT).equals(lower)) {
+        return key;
+      }
+    }
+    for (String key : MODEL_FIELDS.keySet()) {
+      if (key.toLowerCase(Locale.ROOT).equals(lower)) {
+        return key;
+      }
+    }
+    for (String key : RELATION_MAP.keySet()) {
+      if (key.toLowerCase(Locale.ROOT).equals(lower)) {
+        return key;
+      }
+    }
     return modelName;
+  }
+
+  private static boolean hasKey(String key) {
+    return MODEL_TO_TABLE.containsKey(key)
+        || MODEL_FIELDS.containsKey(key)
+        || RELATION_MAP.containsKey(key);
   }
 
   /** The table name a model maps to, or the model name when the schema used none. */
@@ -112,12 +134,64 @@ public final class Metadata {
     return fields == null ? Collections.<FieldMeta>emptyList() : fields;
   }
 
+  /** True when the metadata declares at least one column for {@code modelName}. */
+  public static boolean hasFields(String modelName) {
+    return !fieldsFor(modelName).isEmpty();
+  }
+
+  /** True when {@code modelName} declares a column named {@code fieldName}. */
+  public static boolean hasField(String modelName, String fieldName) {
+    if (fieldName == null) {
+      return false;
+    }
+    for (FieldMeta field : fieldsFor(modelName)) {
+      if (fieldName.equals(field.name)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   public static Map<String, RelationDef> relationsFor(String modelName) {
     Map<String, RelationDef> relations = RELATION_MAP.get(modelName);
     if (relations == null) {
       relations = RELATION_MAP.get(resolveModelKey(modelName));
     }
     return relations == null ? Collections.<String, RelationDef>emptyMap() : relations;
+  }
+
+  /** Looks up a single named relation declared on {@code modelName}. */
+  public static RelationDef relationFor(String modelName, String relationName) {
+    if (modelName == null || modelName.isEmpty() || relationName == null) {
+      return null;
+    }
+    return relationsFor(modelName).get(relationName);
+  }
+
+  /**
+   * Resolves {@code [childKey, parentKey]} join column names for {@code relation} on {@code
+   * modelName}.
+   *
+   * <p>To-many relations keep {@code foreignKey} on the related child model and {@code localKey} on
+   * {@code modelName}. To-one relations generated from {@code @relation(fields: [fk], references:
+   * [lk])} record {@code foreignKey} on {@code modelName} and {@code localKey} on the related
+   * model, whereas an inverse one-to-one holds {@code foreignKey} on the related model instead.
+   */
+  public static String[] relationKeys(String modelName, RelationDef relation) {
+    String fk = relation.foreignKey == null || relation.foreignKey.isEmpty() ? "id" : relation.foreignKey;
+    String lk = relation.localKey == null || relation.localKey.isEmpty() ? "id" : relation.localKey;
+    if (relation.isMany()) {
+      return new String[] {fk, lk};
+    }
+    boolean parentHasFk = hasField(modelName, fk);
+    boolean childHasFk = hasField(relation.modelName, fk);
+    if (parentHasFk && !childHasFk) {
+      return new String[] {lk, fk};
+    }
+    if (childHasFk && !parentHasFk) {
+      return new String[] {fk, lk};
+    }
+    return new String[] {lk, fk};
   }
 
   /** A snapshot of the registered table map, for callers that want to inspect it. */

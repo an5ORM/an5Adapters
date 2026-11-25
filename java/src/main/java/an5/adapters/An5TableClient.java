@@ -126,7 +126,7 @@ public class An5TableClient {
 
   public List<Map<String, Object>> findMany(An5Query query) throws SQLException {
     Map<String, Object> params = new LinkedHashMap<String, Object>();
-    SqlBuilder.Where where = SqlBuilder.parseWhere(query.whereMap(), dialect, params, "");
+    SqlBuilder.Where where = SqlBuilder.parseWhere(query.whereMap(), dialect, params, "", modelName);
     String orderSql = SqlBuilder.buildOrderBy(query.orderByValue(), dialect);
 
     Map<String, RelationDef> relations = Metadata.relationsFor(modelName);
@@ -148,11 +148,11 @@ public class An5TableClient {
 
     List<Map<String, Object>> rows = adapter.exec(sql.toString(), where.params);
     if (query.includeValue() != null && !query.includeValue().isEmpty()) {
-      resolveIncludes(relations, rows, query.includeValue());
+      resolveIncludes(modelName, relations, rows, query.includeValue());
     }
     if (selected != null) {
       if (hasRelationSelect(selected, relations)) {
-        resolveIncludes(relations, rows, relationSelect(selected, relations));
+        resolveIncludes(modelName, relations, rows, relationSelect(selected, relations));
       }
       rows = projectFields(rows, selected);
     }
@@ -184,7 +184,7 @@ public class An5TableClient {
 
   public long count(Map<String, Object> where) throws SQLException {
     Map<String, Object> params = new LinkedHashMap<String, Object>();
-    SqlBuilder.Where clause = SqlBuilder.parseWhere(where, dialect, params, "");
+    SqlBuilder.Where clause = SqlBuilder.parseWhere(where, dialect, params, "", modelName);
     StringBuilder sql =
         new StringBuilder("SELECT COUNT(*) AS cnt FROM ").append(tableSql()).append(nolock());
     if (!clause.isEmpty()) {
@@ -300,7 +300,7 @@ public class An5TableClient {
   public Map<String, Object> update(An5Query query, Map<String, Object> data, An5Query options)
       throws SQLException {
     Map<String, Object> params = new LinkedHashMap<String, Object>();
-    SqlBuilder.Where where = SqlBuilder.parseWhere(query.whereMap(), dialect, params, "w_");
+    SqlBuilder.Where where = SqlBuilder.parseWhere(query.whereMap(), dialect, params, "w_", modelName);
 
     Map<String, Object> relationWrites = splitRelationWrites(data);
     Map<String, Object> scalars = withoutRelations(data);
@@ -339,7 +339,7 @@ public class An5TableClient {
   public Map<String, Object> updateMany(Map<String, Object> where, Map<String, Object> data)
       throws SQLException {
     Map<String, Object> params = new LinkedHashMap<String, Object>();
-    SqlBuilder.Where clause = SqlBuilder.parseWhere(where, dialect, params, "w_");
+    SqlBuilder.Where clause = SqlBuilder.parseWhere(where, dialect, params, "w_", modelName);
 
     Map<String, Object> encoded = encodeVectorFields(data);
     List<String> setParts = new ArrayList<String>();
@@ -377,7 +377,7 @@ public class An5TableClient {
   /** Deletes every matching row, or the whole table when {@code where} is {@code null}. */
   public Map<String, Object> deleteMany(Map<String, Object> where) throws SQLException {
     Map<String, Object> params = new LinkedHashMap<String, Object>();
-    SqlBuilder.Where clause = SqlBuilder.parseWhere(where, dialect, params, "");
+    SqlBuilder.Where clause = SqlBuilder.parseWhere(where, dialect, params, "", modelName);
     StringBuilder sql = new StringBuilder("DELETE FROM ").append(tableSql());
     if (!clause.isEmpty()) {
       sql.append(" WHERE ").append(clause.sql);
@@ -408,7 +408,7 @@ public class An5TableClient {
       throw new IllegalArgumentException("aggregate requires at least one aggregator column");
     }
     Map<String, Object> params = new LinkedHashMap<String, Object>();
-    SqlBuilder.Where where = SqlBuilder.parseWhere(aggregate.whereMap(), dialect, params, "");
+    SqlBuilder.Where where = SqlBuilder.parseWhere(aggregate.whereMap(), dialect, params, "", modelName);
     StringBuilder sql =
         new StringBuilder("SELECT ")
             .append(join(expressions, ", "))
@@ -428,7 +428,7 @@ public class An5TableClient {
       throw new IllegalArgumentException("groupBy requires at least one 'by' column");
     }
     Map<String, Object> params = new LinkedHashMap<String, Object>();
-    SqlBuilder.Where where = SqlBuilder.parseWhere(group.whereMap(), dialect, params, "");
+    SqlBuilder.Where where = SqlBuilder.parseWhere(group.whereMap(), dialect, params, "", modelName);
 
     String byColumns = quoteAll(byFields);
     // Counted unconditionally: a group is only useful next to its size, and a group whose
@@ -488,7 +488,7 @@ public class An5TableClient {
     String distanceMetric = metric == null || metric.isEmpty() ? "cosine" : metric;
 
     Map<String, Object> params = new LinkedHashMap<String, Object>();
-    SqlBuilder.Where clause = SqlBuilder.parseWhere(where, dialect, params, "");
+    SqlBuilder.Where clause = SqlBuilder.parseWhere(where, dialect, params, "", modelName);
 
     if (dialect == Dialect.SQLITE) {
       // SQLite ranks through sqlite-vec, a registered distance function or json_each,
@@ -662,6 +662,7 @@ public class An5TableClient {
   /** Eager-loads relations onto rows already fetched, in place. */
   @SuppressWarnings("unchecked")
   private void resolveIncludes(
+      String currentModel,
       Map<String, RelationDef> relations,
       List<Map<String, Object>> rows,
       Map<String, Object> include)
@@ -687,8 +688,9 @@ public class An5TableClient {
         continue;
       }
       boolean isMany = relation.isMany();
-      String joinKey = isMany ? relation.localKey : relation.foreignKey;
-      String matchKey = isMany ? relation.foreignKey : relation.localKey;
+      String[] keys = Metadata.relationKeys(currentModel, relation);
+      String matchKey = keys[0];
+      String joinKey = keys[1];
 
       List<Object> uniqueKeys = uniqueKeys(rows, joinKey);
       if (uniqueKeys.isEmpty()) {
@@ -724,7 +726,11 @@ public class An5TableClient {
       if (value instanceof Map) {
         Map<String, Object> options = (Map<String, Object>) value;
         if (options.get("include") instanceof Map) {
-          resolveIncludes(Metadata.relationsFor(relation.modelName), related, (Map<String, Object>) options.get("include"));
+          resolveIncludes(
+              relation.modelName,
+              Metadata.relationsFor(relation.modelName),
+              related,
+              (Map<String, Object>) options.get("include"));
         }
         if (options.get("select") instanceof List) {
           List<String> fields = new ArrayList<String>();
@@ -738,7 +744,7 @@ public class An5TableClient {
       }
 
       Map<Object, List<Map<String, Object>>> groups = new LinkedHashMap<Object, List<Map<String, Object>>>();
-      String groupColumn = isMany ? relation.foreignKey : relation.localKey;
+      String groupColumn = matchKey;
       for (int i = 0; i < related.size(); i++) {
         Object groupKey = related.get(i).get(groupColumn);
         if (!groups.containsKey(groupKey)) {
@@ -746,7 +752,7 @@ public class An5TableClient {
         }
         groups.get(groupKey).add(projected.get(i));
       }
-      String rowColumn = isMany ? relation.localKey : relation.foreignKey;
+      String rowColumn = joinKey;
       for (Map<String, Object> row : rows) {
         List<Map<String, Object>> matches = groups.get(row.get(rowColumn));
         if (isMany) {
@@ -902,10 +908,10 @@ public class An5TableClient {
     rows.add(row);
     Map<String, RelationDef> relations = Metadata.relationsFor(modelName);
     if (query.includeValue() != null && !query.includeValue().isEmpty()) {
-      resolveIncludes(relations, rows, query.includeValue());
+      resolveIncludes(modelName, relations, rows, query.includeValue());
     }
     if (query.selectValue() != null) {
-      resolveIncludes(relations, rows, relationSelect(query.selectValue(), relations));
+      resolveIncludes(modelName, relations, rows, relationSelect(query.selectValue(), relations));
       return projectFields(rows, query.selectValue()).get(0);
     }
     return row;

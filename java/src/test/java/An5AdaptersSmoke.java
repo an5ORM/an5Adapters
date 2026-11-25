@@ -7,9 +7,11 @@ import an5.adapters.An5ViewClient;
 import an5.adapters.base.Dialect;
 import an5.adapters.base.JdbcUrls;
 import an5.adapters.base.Metadata;
+import an5.adapters.base.SqlBuilder;
 import an5.adapters.base.SqliteVectors;
 import an5.adapters.base.Vectors;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -36,6 +38,8 @@ public final class An5AdaptersSmoke {
     checkVectors();
     crud();
     relations();
+    relationFiltersAndIncludes();
+    strictFilterValidation();
     aggregation();
     transactionRollback();
     viewIsReadOnly();
@@ -241,6 +245,250 @@ public final class An5AdaptersSmoke {
     } finally {
       adapter.close();
     }
+  }
+
+  private static void relationFiltersAndIncludes() throws Exception {
+    System.out.println("\n[relation filters & includes]");
+    An5Adapter adapter = openRelational();
+    try {
+      An5TableClient users = adapter.table("User");
+      An5TableClient posts = adapter.table("Post");
+
+      // To-many: some / none / every
+      equals(
+          "to-many some filtered",
+          list("Alice", "Bob"),
+          sortedValues(users.findMany(new An5Query().where(map("posts", map("some", map("published", Integer.valueOf(1)))))), "name"));
+      equals(
+          "to-many some empty map",
+          list("Alice", "Bob"),
+          sortedValues(users.findMany(new An5Query().where(map("posts", map("some", map())))), "name"));
+      equals(
+          "to-many none filtered",
+          list("Bob", "Charlie"),
+          sortedValues(users.findMany(new An5Query().where(map("posts", map("none", map("published", Integer.valueOf(0)))))), "name"));
+      equals(
+          "to-many none empty map",
+          list("Charlie"),
+          sortedValues(users.findMany(new An5Query().where(map("posts", map("none", map())))), "name"));
+      // Vacuous truth for `every`: Bob (all published) + Charlie (0 posts)
+      equals(
+          "to-many every filtered",
+          list("Bob", "Charlie"),
+          sortedValues(users.findMany(new An5Query().where(map("posts", map("every", map("published", Integer.valueOf(1)))))), "name"));
+      equals(
+          "to-many every empty map",
+          list("Alice", "Bob", "Charlie"),
+          sortedValues(users.findMany(new An5Query().where(map("posts", map("every", map())))), "name"));
+      equals(
+          "to-many combined some + none",
+          list("Bob"),
+          sortedValues(
+              users.findMany(
+                  new An5Query()
+                      .where(
+                          map(
+                              "posts",
+                              map(
+                                  "some",
+                                  map("published", Integer.valueOf(1)),
+                                  "none",
+                                  map("published", Integer.valueOf(0)))))),
+              "name"));
+
+      // Nested scalar not inside relation subquery preserves alias prefix
+      equals(
+          "to-many some with nested scalar not",
+          list("Alice"),
+          sortedValues(
+              users.findMany(
+                  new An5Query()
+                      .where(
+                          map("posts", map("some", map("title", map("not", map("contains", "Published"))))))),
+              "name"));
+
+      // To-one (FK on querying side: Post.author)
+      equals(
+          "to-one is",
+          list("Draft One", "Published One"),
+          sortedValues(posts.findMany(new An5Query().where(map("author", map("is", map("name", "Alice"))))), "title"));
+      equals(
+          "to-one is null",
+          list("Orphan Post"),
+          sortedValues(posts.findMany(new An5Query().where(map("author", map("is", null)))), "title"));
+      equals(
+          "to-one isNot",
+          list("All Published", "Orphan Post"),
+          sortedValues(posts.findMany(new An5Query().where(map("author", map("isNot", map("name", "Alice"))))), "title"));
+      equals(
+          "to-one is_not null alias",
+          list("All Published", "Draft One", "Published One"),
+          sortedValues(posts.findMany(new An5Query().where(map("author", map("is_not", null)))), "title"));
+
+      // Inverse one-to-one (FK on related table: User.profile)
+      equals(
+          "inverse to-one is",
+          list("Alice"),
+          sortedValues(users.findMany(new An5Query().where(map("profile", map("is", map("bio", map("contains", "Systems")))))), "name"));
+      equals(
+          "inverse to-one is null",
+          list("Charlie"),
+          sortedValues(users.findMany(new An5Query().where(map("profile", map("is", null)))), "name"));
+      equals(
+          "inverse to-one isNot null",
+          list("Alice", "Bob"),
+          sortedValues(users.findMany(new An5Query().where(map("profile", map("isNot", null)))), "name"));
+
+      // Multi-hop nested relation filter: User -> posts.some -> author.is
+      equals(
+          "nested multi-hop relation filter",
+          list("Alice"),
+          sortedValues(
+              users.findMany(
+                  new An5Query()
+                      .where(
+                          map(
+                              "posts",
+                              map("some", map("author", map("is", map("score", map("gte", Integer.valueOf(100))))))))),
+              "name"));
+
+      // To-one include (FK-holding Post.author) & inverse 1-to-1 include (User.profile)
+      List<Map<String, Object>> postWithAuthor =
+          posts.findMany(new An5Query().where(map("id", "p1")).include(map("author", Boolean.TRUE)));
+      Object authorObj = postWithAuthor.get(0).get("author");
+      equals("to-one include populates author", true, authorObj instanceof Map);
+      equals("to-one include author name", "Alice", ((Map<?, ?>) authorObj).get("name"));
+
+      List<Map<String, Object>> userWithProfile =
+          users.findMany(new An5Query().where(map("id", "u1")).include(map("profile", Boolean.TRUE)));
+      Object profileObj = userWithProfile.get(0).get("profile");
+      equals("inverse to-one include populates profile", true, profileObj instanceof Map);
+      equals("inverse to-one include profile bio", "Systems engineer", ((Map<?, ?>) profileObj).get("bio"));
+
+      // Count, updateMany, deleteMany with relation filters
+      equals("count with relation filter", 1L, users.count(map("posts", map("some", map("published", Integer.valueOf(0))))));
+      equals(
+          "updateMany with relation filter",
+          1,
+          ((Number) posts.updateMany(map("author", map("is", map("name", "Bob"))), map("title", "Updated Bob Post")).get("count")).intValue());
+      equals("deleteMany with relation filter", 1, ((Number) posts.deleteMany(map("author", map("is", null))).get("count")).intValue());
+      equals("remaining posts after relation deleteMany", 3L, posts.count(null));
+
+      // Multi-dialect SQL generation check
+      SqlBuilder.Where mssqlWhere =
+          SqlBuilder.parseWhere(
+              map("posts", map("some", map("published", Integer.valueOf(1)))),
+              Dialect.MSSQL,
+              new LinkedHashMap<String, Object>(),
+              "",
+              "User");
+      equals(
+          "MSSQL relation EXISTS SQL",
+          true,
+          mssqlWhere.sql.contains("EXISTS (SELECT 1 FROM [posts] AS r_posts_some_ WHERE r_posts_some_.[authorId] = [users].[id]"));
+      SqlBuilder.Where pgWhere =
+          SqlBuilder.parseWhere(
+              map("author", map("is", map("score", map("gte", Integer.valueOf(50))))),
+              Dialect.POSTGRES,
+              new LinkedHashMap<String, Object>(),
+              "",
+              "Post");
+      equals(
+          "Postgres relation EXISTS SQL",
+          true,
+          pgWhere.sql.contains("EXISTS (SELECT 1 FROM \"users\" AS r_author_is_ WHERE r_author_is_.\"id\" = \"posts\".\"authorId\""));
+    } finally {
+      adapter.close();
+    }
+  }
+
+  private static void strictFilterValidation() throws Exception {
+    System.out.println("\n[strict filter validation]");
+    An5Adapter adapter = openRelational();
+    try {
+      An5TableClient users = adapter.table("User");
+      An5TableClient posts = adapter.table("Post");
+
+      expectInvalidQuery("unknown scalar op", users, map("name", map("bogus", "Ada")));
+      expectInvalidQuery("unregistered relation op", users, map("ghosts", map("some", map("title", "x"))));
+      expectInvalidQuery("to-one op on to-many relation", users, map("posts", map("is", map("title", "x"))));
+      expectInvalidQuery("to-many op on to-one relation", posts, map("author", map("some", map("name", "Alice"))));
+      expectInvalidQuery("unknown relation op", users, map("posts", map("bogus", map("title", "x"))));
+      expectInvalidQuery("non-map relation filter", users, map("posts", "not-a-map"));
+      expectInvalidQuery("non-map some body", users, map("posts", map("some", "not-a-map")));
+      expectInvalidQuery("non-map is body", posts, map("author", map("is", Integer.valueOf(123))));
+      expectInvalidQuery("non-list OR filter", users, map("OR", "invalid"));
+      expectInvalidQuery("non-list in operand", users, map("score", map("in", "not-a-list")));
+    } finally {
+      adapter.close();
+    }
+  }
+
+  private static void expectInvalidQuery(String label, An5TableClient client, Map<String, Object> where) {
+    try {
+      client.findMany(new An5Query().where(where));
+      equals(label + " throws IllegalArgumentException", true, false);
+    } catch (IllegalArgumentException expected) {
+      equals(label + " throws IllegalArgumentException", true, true);
+    } catch (Exception other) {
+      equals(label + " throws IllegalArgumentException (got " + other + ")", true, false);
+    }
+  }
+
+  private static List<Object> sortedValues(List<Map<String, Object>> rows, String key) {
+    List<String> values = new ArrayList<String>();
+    for (Map<String, Object> row : rows) {
+      Object raw = row.get(key);
+      if (raw != null) {
+        values.add(String.valueOf(raw));
+      }
+    }
+    Collections.sort(values);
+    return new ArrayList<Object>(values);
+  }
+
+  private static An5Adapter openRelational() throws Exception {
+    Map<String, Object> fields = new LinkedHashMap<String, Object>();
+    fields.put("User", list(field("id", true), field("name", false), field("score", false)));
+    fields.put("Post", list(field("id", true), field("title", false), field("published", false), field("authorId", false)));
+    fields.put("Profile", list(field("id", true), field("bio", false), field("userId", false)));
+
+    Map<String, Object> userRels = new LinkedHashMap<String, Object>();
+    userRels.put("posts", map("modelName", "Post", "relationType", "many", "foreignKey", "authorId", "localKey", "id"));
+    userRels.put("profile", map("modelName", "Profile", "relationType", "one", "foreignKey", "userId", "localKey", "id"));
+    Map<String, Object> postRels = new LinkedHashMap<String, Object>();
+    postRels.put("author", map("modelName", "User", "relationType", "one", "foreignKey", "authorId", "localKey", "id"));
+    Map<String, Object> profileRels = new LinkedHashMap<String, Object>();
+    profileRels.put("user", map("modelName", "User", "relationType", "one", "foreignKey", "userId", "localKey", "id"));
+
+    Map<String, Object> relations = new LinkedHashMap<String, Object>();
+    relations.put("User", userRels);
+    relations.put("Post", postRels);
+    relations.put("Profile", profileRels);
+
+    Map<String, Object> tables = new LinkedHashMap<String, Object>();
+    tables.put("User", "users");
+    tables.put("Post", "posts");
+    tables.put("Profile", "profiles");
+
+    Metadata.setAdapterMetadata(map("modelToTable", tables, "modelFields", fields, "relationMap", relations));
+    An5Adapter adapter = new An5Adapter(":memory:");
+    adapter.executeRaw("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, score INTEGER)");
+    adapter.executeRaw("CREATE TABLE posts (id TEXT PRIMARY KEY, title TEXT, published INTEGER, authorId TEXT)");
+    adapter.executeRaw("CREATE TABLE profiles (id TEXT PRIMARY KEY, bio TEXT, userId TEXT)");
+
+    adapter.table("User").create(map("id", "u1", "name", "Alice", "score", Integer.valueOf(100)));
+    adapter.table("User").create(map("id", "u2", "name", "Bob", "score", Integer.valueOf(50)));
+    adapter.table("User").create(map("id", "u3", "name", "Charlie", "score", Integer.valueOf(10)));
+
+    adapter.table("Profile").create(map("id", "pr1", "bio", "Systems engineer", "userId", "u1"));
+    adapter.table("Profile").create(map("id", "pr2", "bio", "Draft writer", "userId", "u2"));
+
+    adapter.table("Post").create(map("id", "p1", "title", "Published One", "published", Integer.valueOf(1), "authorId", "u1"));
+    adapter.table("Post").create(map("id", "p2", "title", "Draft One", "published", Integer.valueOf(0), "authorId", "u1"));
+    adapter.table("Post").create(map("id", "p3", "title", "All Published", "published", Integer.valueOf(1), "authorId", "u2"));
+    adapter.table("Post").create(map("id", "p4", "title", "Orphan Post", "published", Integer.valueOf(1)));
+    return adapter;
   }
 
   // ─── Aggregation ────────────────────────────────────────────────────────────────

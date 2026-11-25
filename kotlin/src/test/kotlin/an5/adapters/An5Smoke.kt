@@ -18,6 +18,7 @@ object An5Smoke {
         filters()
         aggregates()
         relations()
+        relationFiltersAndValidation()
         transactions()
         vectorFallback()
         sqliteVectorSearch()
@@ -155,6 +156,66 @@ object An5Smoke {
         }
     }
 
+    private fun relationFiltersAndValidation() {
+        val db = openRelational()
+        db.use {
+            val users = it.table("User")
+            val posts = it.table("Post")
+
+            check("kotlin some") {
+                users.findMany { where("posts" some ("published" eq 1)) }
+                    .mapNotNull { row -> row.string("name") }.sorted() == listOf("Alice", "Bob")
+            }
+            check("kotlin some()") {
+                users.findMany { where("posts".some()) }
+                    .mapNotNull { row -> row.string("name") }.sorted() == listOf("Alice", "Bob")
+            }
+            check("kotlin none") {
+                users.findMany { where("posts" none ("published" eq 0)) }
+                    .mapNotNull { row -> row.string("name") }.sorted() == listOf("Bob", "Charlie")
+            }
+            check("kotlin every") {
+                users.findMany { where("posts" every ("published" eq 1)) }
+                    .mapNotNull { row -> row.string("name") }.sorted() == listOf("Bob", "Charlie")
+            }
+            check("kotlin isRelated") {
+                posts.findMany { where("author" isRelated ("name" eq "Alice")) }
+                    .mapNotNull { row -> row.string("title") }.sorted() == listOf("Draft One", "Published One")
+            }
+            check("kotlin isRelated null") {
+                posts.findMany { where("author" isRelated null) }
+                    .mapNotNull { row -> row.string("title") } == listOf("Orphan Post")
+            }
+            check("kotlin isNotRelated") {
+                posts.findMany { where("author" isNotRelated ("name" eq "Alice")) }
+                    .mapNotNull { row -> row.string("title") }.sorted() == listOf("All Published", "Orphan Post")
+            }
+            check("kotlin inverse 1-to-1 isRelated & include") {
+                val alice = users.findMany {
+                    where("profile" isRelated ("bio" contains "Systems"))
+                    include(mapOf("profile" to true))
+                }
+                alice.single().string("name") == "Alice" &&
+                    alice.single().relatedOne("profile")?.string("bio") == "Systems engineer"
+            }
+            check("kotlin to-one include") {
+                val p1 = posts.findMany {
+                    where("id" eq "p1")
+                    include(mapOf("author" to true))
+                }
+                p1.single().relatedOne("author")?.string("name") == "Alice"
+            }
+            check("kotlin strict unknown scalar op") {
+                runCatching { users.findMany(where = mapOf("name" to mapOf("bogus" to "Alice"))) }
+                    .exceptionOrNull() is IllegalArgumentException
+            }
+            check("kotlin strict mismatched relation op") {
+                runCatching { users.findMany(where = "posts" isRelated emptyMap()) }
+                    .exceptionOrNull() is IllegalArgumentException
+            }
+        }
+    }
+
     private fun transactions() {
         val db = open()
         db.use {
@@ -282,6 +343,45 @@ object An5Smoke {
         db.executeRaw("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, score INTEGER, nickname TEXT)")
         db.executeRaw("CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT, embedding TEXT)")
         db.executeRaw("CREATE TABLE posts (id TEXT PRIMARY KEY, title TEXT, userId TEXT)")
+        return db
+    }
+
+    private fun openRelational(): An5 {
+        val meta = mutableMapOf<String, Any?>(
+            "modelToTable" to mutableMapOf("User" to "users", "Post" to "posts", "Profile" to "profiles"),
+            "modelFields" to mutableMapOf(
+                "User" to listOf(field("id", true), field("name", false), field("score", false)),
+                "Post" to listOf(field("id", true), field("title", false), field("published", false), field("authorId", false)),
+                "Profile" to listOf(field("id", true), field("bio", false), field("userId", false)),
+            ),
+            "relationMap" to mutableMapOf(
+                "User" to mutableMapOf(
+                    "posts" to mapOf("modelName" to "Post", "relationType" to "many", "foreignKey" to "authorId", "localKey" to "id"),
+                    "profile" to mapOf("modelName" to "Profile", "relationType" to "one", "foreignKey" to "userId", "localKey" to "id"),
+                ),
+                "Post" to mutableMapOf(
+                    "author" to mapOf("modelName" to "User", "relationType" to "one", "foreignKey" to "authorId", "localKey" to "id"),
+                ),
+                "Profile" to mutableMapOf(
+                    "user" to mapOf("modelName" to "User", "relationType" to "one", "foreignKey" to "userId", "localKey" to "id"),
+                ),
+            ),
+        )
+        an5.adapters.base.Metadata.setAdapterMetadata(meta)
+        val db = An5(":memory:")
+        db.executeRaw("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, score INTEGER)")
+        db.executeRaw("CREATE TABLE posts (id TEXT PRIMARY KEY, title TEXT, published INTEGER, authorId TEXT)")
+        db.executeRaw("CREATE TABLE profiles (id TEXT PRIMARY KEY, bio TEXT, userId TEXT)")
+
+        db.table("User").create(mapOf("id" to "u1", "name" to "Alice", "score" to 100))
+        db.table("User").create(mapOf("id" to "u2", "name" to "Bob", "score" to 50))
+        db.table("User").create(mapOf("id" to "u3", "name" to "Charlie", "score" to 10))
+        db.table("Profile").create(mapOf("id" to "pr1", "bio" to "Systems engineer", "userId" to "u1"))
+        db.table("Profile").create(mapOf("id" to "pr2", "bio" to "Draft writer", "userId" to "u2"))
+        db.table("Post").create(mapOf("id" to "p1", "title" to "Published One", "published" to 1, "authorId" to "u1"))
+        db.table("Post").create(mapOf("id" to "p2", "title" to "Draft One", "published" to 0, "authorId" to "u1"))
+        db.table("Post").create(mapOf("id" to "p3", "title" to "All Published", "published" to 1, "authorId" to "u2"))
+        db.table("Post").create(mapOf("id" to "p4", "title" to "Orphan Post", "published" to 1))
         return db
     }
 
