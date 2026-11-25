@@ -91,148 +91,455 @@ public enum SQLBuilder {
 
     /// The operator keys that make a map a filter rather than a nested condition.
     static let operatorKeys: Set<String> = [
-        "equals", "in", "notIn", "contains", "startsWith", "endsWith", "not", "gte", "lte", "gt", "lt",
+        "equals", "in", "notIn", "contains", "startsWith", "endsWith", "not", "gte", "lte", "gt", "lt", "mode",
     ]
+
+    /// Relation filter operator keys supported on to-many and to-one relations.
+    static let relationManyKeys: Set<String> = ["some", "none", "every"]
+    static let relationOneKeys: Set<String> = ["is", "isNot", "is_not"]
 
     /// Builds the `WHERE` clause and the parameters it binds, in order.
     ///
-    /// Every value reaches the database as a bind parameter; none is ever formatted into the
-    /// SQL. `AND`/`OR`/`NOT` groups are supported, and an empty `in: []` becomes `1=0` rather
-    /// than the invalid `IN ()`.
+    /// Kept as a non-throwing wrapper over ``buildWhere(_:dialect:model:metadata:prefix:)``
+    /// for callers that do not validate or use model relation metadata.
     public static func whereClause(_ filter: Where?, dialect: Dialect, prefix: String = "") -> WhereClause {
-        guard let filter, !filter.isEmpty else { return WhereClause() }
+        (try? buildWhere(filter, dialect: dialect, model: nil, metadata: .empty, prefix: prefix)) ?? WhereClause()
+    }
 
-        // A key with an underscore whose value is a map of plain columns is a flattened
-        // relation filter; hoisting it puts those conditions alongside the rest instead of
-        // quoting the whole thing as one column name.
-        var flattened: [String: Any?] = [:]
+    /// Builds a model-aware `WHERE` clause and validates all scalar and relation filter operators.
+    ///
+    /// Every value reaches the database as a bind parameter; none is ever formatted into the
+    /// SQL. `AND`/`OR`/`NOT` groups, relation filters (`some`/`none`/`every`/`is`/`isNot`),
+    /// and compound unique key flattening are supported, and an empty `in: []` becomes `1=0`
+    /// rather than the invalid `IN ()`.
+    public static func buildWhere(
+        _ filter: Where?,
+        dialect: Dialect,
+        model: String? = nil,
+        metadata: Metadata = .empty,
+        prefix: String = ""
+    ) throws -> WhereClause {
+        guard let filter, !filter.isEmpty else { return WhereClause() }
+        var parameters: [SQLValue] = []
+        let cleaned = cleanWhere(filter, model: model, metadata: metadata)
+        let sql = try buildWhereRec(
+            cleaned,
+            dialect: dialect,
+            model: model,
+            metadata: metadata,
+            prefix: prefix,
+            selfRef: "",
+            colPrefix: "",
+            parameters: &parameters
+        )
+        return WhereClause(sql: sql, parameters: parameters)
+    }
+
+    /// Hoists compound-key objects (`id_score: {id: ..., score: ...}`) without flattening
+    /// scalar operator maps or relation filter maps.
+    private static func cleanWhere(_ filter: Where, model: String?, metadata: Metadata) -> Where {
+        let hasFields = model.map { metadata.hasFields($0) } ?? false
+        var flattened: Where = [:]
         for (key, value) in filter {
-            if key.contains("_"), let nested = value as? Where, !isOperatorValue(nested) {
-                for (nestedKey, nestedValue) in nested { flattened[nestedKey] = nestedValue }
+            let isCompoundCandidate: Bool = {
+                guard key.contains("_") else { return false }
+                guard let model else { return true }
+                return !metadata.hasField(model, key) && metadata.relation(model, key) == nil
+            }()
+            if isCompoundCandidate,
+               let nested = asFilterMap(value),
+               !nested.isEmpty,
+               !isOperatorValue(nested),
+               !isRelationOperatorValue(nested),
+               (!hasFields || nested.keys.allSatisfy { metadata.hasField(model!, $0) }) {
+                for (nestedKey, nestedValue) in nested {
+                    flattened[nestedKey] = nestedValue
+                }
             } else {
                 flattened[key] = value
             }
         }
+        return flattened
+    }
+
+    private static func buildWhereRec(
+        _ filter: Where,
+        dialect: Dialect,
+        model: String?,
+        metadata: Metadata,
+        prefix: String,
+        selfRef: String,
+        colPrefix: String,
+        parameters: inout [SQLValue]
+    ) throws -> String {
+        guard !filter.isEmpty else { return "" }
 
         var conditions: [String] = []
-        var parameters: [SQLValue] = []
-        for (key, value) in flattened {
+        for key in filter.keys.sorted() {
+            let value = filter[key] ?? nil
             switch key {
             case "OR":
-                guard let branches = value as? [Where] else { continue }
+                guard let branches = asFilterList(value) else {
+                    throw An5Error.invalidQuery("'OR' filter must be an array of filter dictionaries")
+                }
                 var sub: [String] = []
                 for (index, branch) in branches.enumerated() {
-                    let clause = self.whereClause(branch, dialect: dialect, prefix: "\(prefix)or\(index)_")
-                    sub.append(clause.isEmpty ? "1=1" : clause.sql)
-                    parameters.append(contentsOf: clause.parameters)
+                    let sql = try buildWhereRec(
+                        cleanWhere(branch, model: model, metadata: metadata),
+                        dialect: dialect,
+                        model: model,
+                        metadata: metadata,
+                        prefix: "\(prefix)or\(index)_",
+                        selfRef: selfRef,
+                        colPrefix: colPrefix,
+                        parameters: &parameters
+                    )
+                    sub.append(sql.isEmpty ? "1=1" : sql)
                 }
                 conditions.append(sub.isEmpty ? "1=0" : "(\(sub.joined(separator: " OR ")))")
             case "AND":
-                let items = value as? [Where] ?? [value as? Where ?? [:]]
+                let items: [Where]
+                if let list = asFilterList(value) {
+                    items = list
+                } else if let single = asFilterMap(value) {
+                    items = [single]
+                } else {
+                    throw An5Error.invalidQuery("'AND' filter must be a filter dictionary or array of filter dictionaries")
+                }
                 var sub: [String] = []
                 for (index, item) in items.enumerated() {
-                    let clause = self.whereClause(item, dialect: dialect, prefix: "\(prefix)and\(index)_")
-                    parameters.append(contentsOf: clause.parameters)
-                    if !clause.isEmpty { sub.append(clause.sql) }
+                    let sql = try buildWhereRec(
+                        cleanWhere(item, model: model, metadata: metadata),
+                        dialect: dialect,
+                        model: model,
+                        metadata: metadata,
+                        prefix: "\(prefix)and\(index)_",
+                        selfRef: selfRef,
+                        colPrefix: colPrefix,
+                        parameters: &parameters
+                    )
+                    if !sql.isEmpty { sub.append(sql) }
                 }
                 if !sub.isEmpty { conditions.append("(\(sub.joined(separator: " AND ")))") }
             case "NOT":
-                let items = value as? [Where] ?? [value as? Where ?? [:]]
+                let items: [Where]
+                if let list = asFilterList(value) {
+                    items = list
+                } else if let single = asFilterMap(value) {
+                    items = [single]
+                } else {
+                    throw An5Error.invalidQuery("'NOT' filter must be a filter dictionary or array of filter dictionaries")
+                }
                 var sub: [String] = []
                 for (index, item) in items.enumerated() {
-                    let clause = self.whereClause(item, dialect: dialect, prefix: "\(prefix)not\(index)_")
-                    sub.append(clause.isEmpty ? "1=1" : clause.sql)
-                    parameters.append(contentsOf: clause.parameters)
+                    let sql = try buildWhereRec(
+                        cleanWhere(item, model: model, metadata: metadata),
+                        dialect: dialect,
+                        model: model,
+                        metadata: metadata,
+                        prefix: "\(prefix)not\(index)_",
+                        selfRef: selfRef,
+                        colPrefix: colPrefix,
+                        parameters: &parameters
+                    )
+                    sub.append(sql.isEmpty ? "1=1" : sql)
                 }
                 if !sub.isEmpty { conditions.append("NOT (\(sub.joined(separator: " OR ")))") }
             default:
-                conditions.append(
-                    condition(key: key, value: value, dialect: dialect, prefix: prefix, parameters: &parameters)
-                )
+                if let model, let relation = metadata.relation(model, key) {
+                    let relSql = try relationCondition(
+                        model: model,
+                        relationName: key,
+                        relation: relation,
+                        value: value,
+                        dialect: dialect,
+                        metadata: metadata,
+                        prefix: "\(prefix)\(key)_",
+                        selfRef: selfRef,
+                        parameters: &parameters
+                    )
+                    if !relSql.isEmpty { conditions.append(relSql) }
+                } else {
+                    let sql = try scalarCondition(
+                        key: key,
+                        value: value,
+                        dialect: dialect,
+                        model: model,
+                        metadata: metadata,
+                        prefix: prefix,
+                        selfRef: selfRef,
+                        colPrefix: colPrefix,
+                        parameters: &parameters
+                    )
+                    if !sql.isEmpty { conditions.append(sql) }
+                }
             }
         }
-        return WhereClause(sql: conditions.filter { !$0.isEmpty }.joined(separator: " AND "), parameters: parameters)
+        return conditions.filter { !$0.isEmpty }.joined(separator: " AND ")
     }
 
-    private static func condition(
+    private static func relationCondition(
+        model: String,
+        relationName: String,
+        relation: RelationDef,
+        value: Any?,
+        dialect: Dialect,
+        metadata: Metadata,
+        prefix: String,
+        selfRef: String,
+        parameters: inout [SQLValue]
+    ) throws -> String {
+        guard let map = asFilterMap(value) else {
+            throw An5Error.invalidQuery("relation filter for '\(relationName)' on '\(model)' must be a filter dictionary")
+        }
+
+        let isMany = relation.isMany
+        var normalized: Where = [:]
+        for op in map.keys.sorted() {
+            let canonical = op == "is_not" ? "isNot" : op
+            let allowed = isMany
+                ? relationManyKeys.contains(canonical)
+                : (canonical == "is" || canonical == "isNot")
+            guard allowed else {
+                throw An5Error.invalidQuery("unsupported relation filter operator '\(op)' for relation '\(relationName)'")
+            }
+            normalized[canonical] = map[op] ?? nil
+        }
+
+        let childTable = quoteTable(metadata.table(relation.modelName), dialect: dialect)
+        let (childKey, parentKey) = metadata.relationKeys(model, relation)
+        let childCol = dialect.quote(childKey)
+        let parentCol = dialect.quote(parentKey)
+        let parentRef = selfRef.isEmpty ? "\(quoteTable(metadata.table(model), dialect: dialect))." : "\(selfRef)."
+
+        func makeAlias(_ op: String) -> String {
+            "r_\(sanitizeParameterName("\(prefix)\(op)_"))"
+        }
+
+        func buildExists(alias: String, innerWhere: String) -> String {
+            let correlation = "\(alias).\(childCol) = \(parentRef)\(parentCol)"
+            let inner = innerWhere.isEmpty ? "" : " AND (\(innerWhere))"
+            return "EXISTS (SELECT 1 FROM \(childTable) AS \(alias) WHERE \(correlation)\(inner))"
+        }
+
+        func buildChildWhere(_ rawInner: Any?, op: String, alias: String, allowNull: Bool) throws -> String? {
+            if isNullValue(rawInner) {
+                if allowNull { return nil }
+                throw An5Error.invalidQuery("'\(op)' filter on relation '\(relationName)' must be a filter dictionary")
+            }
+            guard let innerMap = asFilterMap(rawInner) else {
+                let suffix = allowNull ? " or nil" : ""
+                throw An5Error.invalidQuery("'\(op)' filter on relation '\(relationName)' must be a filter dictionary\(suffix)")
+            }
+            return try buildWhereRec(
+                cleanWhere(innerMap, model: relation.modelName, metadata: metadata),
+                dialect: dialect,
+                model: relation.modelName,
+                metadata: metadata,
+                prefix: "\(prefix)\(op)_",
+                selfRef: alias,
+                colPrefix: "\(alias).",
+                parameters: &parameters
+            )
+        }
+
+        var parts: [String] = []
+        if isMany {
+            for op in ["some", "none", "every"] where normalized.keys.contains(op) {
+                let rawInner = normalized[op] ?? nil
+                if isNullValue(rawInner) { continue }
+                let alias = makeAlias(op)
+                guard let inner = try buildChildWhere(rawInner, op: op, alias: alias, allowNull: false) else {
+                    continue
+                }
+                if op == "some" {
+                    parts.append(buildExists(alias: alias, innerWhere: inner))
+                } else if op == "none" {
+                    parts.append("NOT " + buildExists(alias: alias, innerWhere: inner))
+                } else {
+                    let correlation = "\(alias).\(childCol) = \(parentRef)\(parentCol)"
+                    let violatedWhere = inner.isEmpty ? " AND 1=0" : " AND NOT (\(inner))"
+                    let violated = "EXISTS (SELECT 1 FROM \(childTable) AS \(alias) WHERE \(correlation)\(violatedWhere))"
+                    parts.append("NOT \(violated)")
+                }
+            }
+        } else {
+            if normalized.keys.contains("is") {
+                let rawInner = normalized["is"] ?? nil
+                let alias = makeAlias("is")
+                if let inner = try buildChildWhere(rawInner, op: "is", alias: alias, allowNull: true) {
+                    parts.append(buildExists(alias: alias, innerWhere: inner))
+                } else {
+                    parts.append("NOT " + buildExists(alias: alias, innerWhere: ""))
+                }
+            }
+            if normalized.keys.contains("isNot") {
+                let rawInner = normalized["isNot"] ?? nil
+                let alias = makeAlias("isNot")
+                if let inner = try buildChildWhere(rawInner, op: "isNot", alias: alias, allowNull: true) {
+                    parts.append("NOT " + buildExists(alias: alias, innerWhere: inner))
+                } else {
+                    parts.append(buildExists(alias: alias, innerWhere: ""))
+                }
+            }
+        }
+
+        return parts.joined(separator: " AND ")
+    }
+
+    private static func scalarCondition(
         key: String,
         value: Any?,
         dialect: Dialect,
+        model: String?,
+        metadata: Metadata,
         prefix: String,
+        selfRef: String,
+        colPrefix: String,
         parameters: inout [SQLValue]
-    ) -> String {
-        let column = dialect.quote(key)
+    ) throws -> String {
+        let column = "\(colPrefix)\(dialect.quote(key))"
         let placeholder = dialect.placeholder
 
-        if value == nil || value is NSNull {
+        if isNullValue(value) {
             return "\(column) IS NULL"
         }
-        guard let operators = value as? Where else {
+        guard let operators = asFilterMap(value) else {
             parameters.append(SQLValue.encode(value) ?? .null)
             return "\(column) = \(placeholder)"
         }
 
         var conditions: [String] = []
-        if let inner = operators["not"] {
-            if inner == nil || inner is NSNull {
-                conditions.append("\(column) IS NOT NULL")
-            } else if let nested = inner as? Where {
-                let clause = self.whereClause([key: nested], dialect: dialect, prefix: prefix + key + "_not_")
-                parameters.append(contentsOf: clause.parameters)
-                if !clause.isEmpty { conditions.append("NOT (\(clause.sql))") }
-            } else {
-                parameters.append(SQLValue.encode(inner) ?? .null)
-                conditions.append("\(column) <> \(placeholder)")
-            }
-        }
-        if operators.keys.contains("equals") {
-            // Flattened: a lookup on a `[String: Any?]` yields `Any??`, and letting the
-            // compiler coerce it is how a `NULL` operand stops reading as "is null".
-            let equals = operators["equals"] ?? nil
-            if equals == nil || equals is NSNull {
-                conditions.append("\(column) IS NULL")
-            } else {
-                parameters.append(SQLValue.encode(equals) ?? .null)
-                conditions.append("\(column) = \(placeholder)")
-            }
-        }
-        for (op, template) in [("contains", "%@%"), ("startsWith", "@%"), ("endsWith", "%@")] {
-            guard let operand = operators[op] else { continue }
-            // Rendered through `encode` rather than interpolated directly: a filter built
-            // from a `[String: Any?]` dictionary hands the operand over wrapped in an
-            // `Optional`, and interpolating that would search for the text "Optional(da)".
-            parameters.append(.text(template.replacingOccurrences(of: "@", with: literal(operand))))
-            conditions.append("\(column) LIKE \(placeholder)")
-        }
-        for (op, sql) in [("gte", ">="), ("lte", "<="), ("gt", ">"), ("lt", "<")] {
-            guard let operand = operators[op] else { continue }
-            parameters.append(SQLValue.encode(operand) ?? .null)
-            conditions.append("\(column) \(sql) \(placeholder)")
-        }
-        for (op, sql, emptyResult) in [("in", " IN (", "1=0"), ("notIn", " NOT IN (", "1=1")] {
-            guard let raw = operators[op] else { continue }
-            // Accepts an untyped list whatever element type it was built with: a caller that
-            // wrote `["Ada", "Grace"]` produced a `[String]`, and a cast straight to
-            // `[Any?]` does not always see through that, which would silently turn an
-            // `in` filter into "match nothing".
-            let values: [Any?]
-            if let typed = raw as? [Any?] {
-                values = typed
-            } else if let list = raw as? [Any] {
-                values = list.map { $0 }
-            } else {
-                values = []
-            }
-            if values.isEmpty {
-                // `IN ()` is a syntax error in every dialect. An empty set can match nothing,
-                // so it becomes 1=0; the negated form is true of every row, so 1=1.
-                conditions.append(emptyResult)
+        for op in operators.keys.sorted() {
+            let operand = operators[op] ?? nil
+            switch op {
+            case "not":
+                if isNullValue(operand) {
+                    conditions.append("\(column) IS NOT NULL")
+                } else if let nested = asFilterMap(operand) {
+                    let innerSql = try buildWhereRec(
+                        [key: nested],
+                        dialect: dialect,
+                        model: model,
+                        metadata: metadata,
+                        prefix: "\(prefix)\(key)_not_",
+                        selfRef: selfRef,
+                        colPrefix: colPrefix,
+                        parameters: &parameters
+                    )
+                    if !innerSql.isEmpty { conditions.append("NOT (\(innerSql))") }
+                } else {
+                    parameters.append(SQLValue.encode(operand) ?? .null)
+                    conditions.append("\(column) <> \(placeholder)")
+                }
+            case "equals":
+                if isNullValue(operand) {
+                    conditions.append("\(column) IS NULL")
+                } else {
+                    parameters.append(SQLValue.encode(operand) ?? .null)
+                    conditions.append("\(column) = \(placeholder)")
+                }
+            case "contains":
+                parameters.append(.text("%\(literal(operand))%"))
+                conditions.append("\(column) LIKE \(placeholder)")
+            case "startsWith":
+                parameters.append(.text("\(literal(operand))%"))
+                conditions.append("\(column) LIKE \(placeholder)")
+            case "endsWith":
+                parameters.append(.text("%\(literal(operand))"))
+                conditions.append("\(column) LIKE \(placeholder)")
+            case "gte":
+                parameters.append(SQLValue.encode(operand) ?? .null)
+                conditions.append("\(column) >= \(placeholder)")
+            case "lte":
+                parameters.append(SQLValue.encode(operand) ?? .null)
+                conditions.append("\(column) <= \(placeholder)")
+            case "gt":
+                parameters.append(SQLValue.encode(operand) ?? .null)
+                conditions.append("\(column) > \(placeholder)")
+            case "lt":
+                parameters.append(SQLValue.encode(operand) ?? .null)
+                conditions.append("\(column) < \(placeholder)")
+            case "in", "notIn":
+                guard let values = asValueList(operand) else {
+                    throw An5Error.invalidQuery("'\(op)' operator for field '\(key)' requires an array")
+                }
+                if values.isEmpty {
+                    // `IN ()` is a syntax error in every dialect. An empty set can match nothing,
+                    // so it becomes 1=0; the negated form is true of every row, so 1=1.
+                    conditions.append(op == "in" ? "1=0" : "1=1")
+                } else {
+                    let sqlOp = op == "in" ? " IN (" : " NOT IN ("
+                    conditions.append(column + sqlOp + values.map { _ in placeholder }.joined(separator: ", ") + ")")
+                    parameters.append(contentsOf: values.map { SQLValue.encode($0) ?? .null })
+                }
+            case "mode":
+                // Collation/case-sensitivity mode is accepted for parity across generated clients.
                 continue
+            default:
+                throw An5Error.invalidQuery("unsupported filter operator '\(op)' for field '\(key)'")
             }
-            conditions.append(column + sql + values.map { _ in placeholder }.joined(separator: ", ") + ")")
-            parameters.append(contentsOf: values.map { SQLValue.encode($0) ?? .null })
         }
         return conditions.joined(separator: " AND ")
+    }
+
+    private static func isNullValue(_ value: Any?) -> Bool {
+        guard let value else { return true }
+        if value is NSNull { return true }
+        let mirror = Mirror(reflecting: value)
+        return mirror.displayStyle == .optional && mirror.children.isEmpty
+    }
+
+    private static func asFilterMap(_ value: Any?) -> Where? {
+        guard !isNullValue(value), let value else { return nil }
+        if let dict = value as? Where { return dict }
+        if let dict = value as? [String: Any] {
+            return dict.mapValues { $0 as Any? }
+        }
+        if let ns = value as? NSDictionary {
+            var out: Where = [:]
+            for (k, v) in ns {
+                guard let key = k as? String else { return nil }
+                out[key] = v
+            }
+            return out
+        }
+        return nil
+    }
+
+    private static func asFilterList(_ value: Any?) -> [Where]? {
+        guard !isNullValue(value), let value else { return nil }
+        if let list = value as? [Where] { return list }
+        if let list = value as? [[String: Any]] {
+            return list.map { $0.mapValues { $0 as Any? } }
+        }
+        if let rawList = value as? [Any] {
+            var out: [Where] = []
+            out.reserveCapacity(rawList.count)
+            for item in rawList {
+                guard let mapped = asFilterMap(item) else { return nil }
+                out.append(mapped)
+            }
+            return out
+        }
+        if let ns = value as? NSArray {
+            var out: [Where] = []
+            out.reserveCapacity(ns.count)
+            for item in ns {
+                guard let mapped = asFilterMap(item) else { return nil }
+                out.append(mapped)
+            }
+            return out
+        }
+        return nil
+    }
+
+    private static func asValueList(_ value: Any?) -> [Any?]? {
+        guard !isNullValue(value), let value else { return nil }
+        if let typed = value as? [Any?] { return typed }
+        if let list = value as? [Any] { return list.map { $0 as Any? } }
+        if let ns = value as? NSArray { return ns.map { $0 as Any? } }
+        return nil
     }
 
     /// A bind value as the text a `LIKE` operand needs.
@@ -355,5 +662,9 @@ public enum SQLBuilder {
 
     private static func isOperatorValue(_ value: Where) -> Bool {
         value.keys.contains { operatorKeys.contains($0) }
+    }
+
+    private static func isRelationOperatorValue(_ value: Where) -> Bool {
+        value.keys.contains { relationManyKeys.contains($0) || relationOneKeys.contains($0) }
     }
 }

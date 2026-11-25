@@ -32,7 +32,7 @@ public struct TableClient {
 
     /// The rows matching `query`.
     public func findMany(_ query: Query) throws -> [Row] {
-        let clause = SQLBuilder.whereClause(query.filter, dialect: dialect)
+        let clause = try SQLBuilder.buildWhere(query.filter, dialect: dialect, model: model, metadata: metadata)
         let orderBy = SQLBuilder.orderBy(query.orderBy, dialect: dialect)
         let relations = metadata.relations(model)
         let selected = query.select ?? []
@@ -51,11 +51,11 @@ public struct TableClient {
 
         var rows = try adapter.query(sql, parameters(clause.parameters))
         if let include = query.include, !include.isEmpty {
-            try resolveIncludes(relations, rows: &rows, include: include)
+            try resolveIncludes(for: model, relations, rows: &rows, include: include)
         }
         if let select = query.select {
             if hasRelationSelect(select, relations) {
-                try resolveIncludes(relations, rows: &rows, include: relationSelect(select, relations))
+                try resolveIncludes(for: model, relations, rows: &rows, include: relationSelect(select, relations))
             }
             rows = rows.map { project($0, selected: select) }
         }
@@ -85,7 +85,7 @@ public struct TableClient {
 
     /// How many rows match.
     public func count(_ filter: Where? = nil) throws -> Int {
-        let clause = SQLBuilder.whereClause(filter, dialect: dialect)
+        let clause = try SQLBuilder.buildWhere(filter, dialect: dialect, model: model, metadata: metadata)
         var sql = "SELECT COUNT(*) AS cnt FROM \(tableSQL)\(noLock)"
         if !clause.isEmpty { sql += " WHERE \(clause.sql)" }
         let rows = try adapter.query(sql, parameters(clause.parameters))
@@ -160,7 +160,7 @@ public struct TableClient {
     /// Updates the matching rows and returns the first of them re-read.
     @discardableResult
     public func update(filter: Where, data: Values, query: Query = Query()) throws -> Row? {
-        let clause = SQLBuilder.whereClause(filter, dialect: dialect, prefix: "w_")
+        let clause = try SQLBuilder.buildWhere(filter, dialect: dialect, model: model, metadata: metadata, prefix: "w_")
         var scalars = data
         let relationWrites = splitRelationWrites(scalars)
         for key in relationWrites.keys { scalars.removeValue(forKey: key) }
@@ -186,7 +186,7 @@ public struct TableClient {
     /// Updates every matching row and gives back how many changed.
     @discardableResult
     public func updateMany(filter: Where?, data: Values) throws -> Int {
-        let clause = SQLBuilder.whereClause(filter, dialect: dialect, prefix: "w_")
+        let clause = try SQLBuilder.buildWhere(filter, dialect: dialect, model: model, metadata: metadata, prefix: "w_")
         var setParts: [String] = []
         var setValues: [SQLValue] = []
         for (column, value) in encodeVectorFields(data) {
@@ -211,7 +211,7 @@ public struct TableClient {
     /// Deletes every matching row, or the whole table when `filter` is `nil`.
     @discardableResult
     public func deleteMany(filter: Where? = nil) throws -> Int {
-        let clause = SQLBuilder.whereClause(filter, dialect: dialect)
+        let clause = try SQLBuilder.buildWhere(filter, dialect: dialect, model: model, metadata: metadata)
         var sql = "DELETE FROM \(tableSQL)"
         if !clause.isEmpty { sql += " WHERE \(clause.sql)" }
         return try adapter.execute(sql, parameters(clause.parameters))
@@ -234,7 +234,7 @@ public struct TableClient {
         guard !expressions.isEmpty else {
             throw An5Error.invalidQuery("aggregate requires at least one aggregator column")
         }
-        let clause = SQLBuilder.whereClause(aggregate.filter, dialect: dialect)
+        let clause = try SQLBuilder.buildWhere(aggregate.filter, dialect: dialect, model: model, metadata: metadata)
         var sql = "SELECT \(expressions.joined(separator: ", ")) FROM \(tableSQL)"
         if !clause.isEmpty { sql += " WHERE \(clause.sql)" }
         return try adapter.query(sql, parameters(clause.parameters)).first ?? [:]
@@ -245,7 +245,7 @@ public struct TableClient {
         guard !aggregate.by.isEmpty else {
             throw An5Error.invalidQuery("groupBy requires at least one 'by' column")
         }
-        let clause = SQLBuilder.whereClause(aggregate.filter, dialect: dialect)
+        let clause = try SQLBuilder.buildWhere(aggregate.filter, dialect: dialect, model: model, metadata: metadata)
         let byColumns = aggregate.by.map { dialect.quote($0) }.joined(separator: ", ")
         // Counted unconditionally: a group is only useful next to its size, and a group whose
         // rows were all filtered out still has to come back as a zero rather than disappear.
@@ -296,7 +296,7 @@ public struct TableClient {
         metric: DistanceMetric = .cosine
     ) throws -> [Row] {
         let field = vectorField.isEmpty ? "embedding" : vectorField
-        let clause = SQLBuilder.whereClause(filter, dialect: dialect)
+        let clause = try SQLBuilder.buildWhere(filter, dialect: dialect, model: model, metadata: metadata)
         let quotedField = dialect.quote(field)
 
         if dialect == .sqlite {
@@ -449,6 +449,7 @@ public struct TableClient {
 
     /// Eager-loads relations onto rows already fetched.
     private func resolveIncludes(
+        for modelName: String,
         _ relations: [String: RelationDef],
         rows: inout [Row],
         include: Include
@@ -465,12 +466,17 @@ public struct TableClient {
             guard let relation = relations[key] else { continue }
 
             let isMany = relation.isMany
-            let joinKey = isMany ? relation.localKey : relation.foreignKey
-            let matchKey = isMany ? relation.foreignKey : relation.localKey
+            let (matchKey, joinKey) = metadata.relationKeys(modelName, relation)
 
             let uniqueKeys = uniqueValues(rows, column: joinKey)
             guard !uniqueKeys.isEmpty else {
-                for index in rows.indices { rows[index][key] = isMany ? [Row]() : nil }
+                for index in rows.indices {
+                    if isMany {
+                        rows[index][key] = [Row]()
+                    } else {
+                        rows[index].updateValue(nil, forKey: key)
+                    }
+                }
                 continue
             }
 
@@ -487,22 +493,33 @@ public struct TableClient {
 
             var related = try adapter.table(relation.modelName).findMany(nested)
             if let nestedInclude = options["include"] as? Include {
-                try resolveIncludes(metadata.relations(relation.modelName), rows: &related, include: nestedInclude)
+                try resolveIncludes(
+                    for: relation.modelName,
+                    metadata.relations(relation.modelName),
+                    rows: &related,
+                    include: nestedInclude
+                )
             }
             var projected = related
             if let nestedSelect = options["select"] as? [String] {
                 projected = related.map { project($0, selected: nestedSelect) }
             }
 
-            let groupColumn = isMany ? relation.foreignKey : relation.localKey
+            let groupColumn = matchKey
             var groups: [String: [Row]] = [:]
             for (index, row) in related.enumerated() {
                 groups[groupKey(cell(row, groupColumn)), default: []].append(projected[index])
             }
-            let rowColumn = isMany ? relation.localKey : relation.foreignKey
+            let rowColumn = joinKey
             for index in rows.indices {
                 let matches = groups[groupKey(cell(rows[index], rowColumn))] ?? []
-                rows[index][key] = isMany ? matches : matches.first
+                if isMany {
+                    rows[index][key] = matches
+                } else if let first = matches.first {
+                    rows[index][key] = first
+                } else {
+                    rows[index].updateValue(nil, forKey: key)
+                }
             }
         }
     }
@@ -590,10 +607,10 @@ public struct TableClient {
         var rows = [row]
         let relations = metadata.relations(model)
         if let include = query.include, !include.isEmpty {
-            try resolveIncludes(relations, rows: &rows, include: include)
+            try resolveIncludes(for: model, relations, rows: &rows, include: include)
         }
         if let select = query.select {
-            try resolveIncludes(relations, rows: &rows, include: relationSelect(select, relations))
+            try resolveIncludes(for: model, relations, rows: &rows, include: relationSelect(select, relations))
             return project(rows[0], selected: select)
         }
         return rows[0]

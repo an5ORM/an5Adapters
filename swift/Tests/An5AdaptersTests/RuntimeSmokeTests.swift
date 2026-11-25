@@ -464,6 +464,182 @@ final class RuntimeSmokeTests: XCTestCase {
         XCTAssertEqual(try adapter.table("User").count(), 1)
     }
 
+    // MARK: - Relation filters & strict validation
+
+    private func makeRelationalAdapter() throws -> An5Adapter {
+        let relationalMetadata = Metadata(
+            modelToTable: ["User": "users", "Post": "posts", "Profile": "profiles"],
+            modelFields: [
+                "User": [
+                    FieldMeta(name: "id", type: "string", sqlType: "TEXT", isId: true),
+                    FieldMeta(name: "name", type: "string", sqlType: "TEXT"),
+                    FieldMeta(name: "score", type: "number", sqlType: "INTEGER"),
+                ],
+                "Post": [
+                    FieldMeta(name: "id", type: "string", sqlType: "TEXT", isId: true),
+                    FieldMeta(name: "title", type: "string", sqlType: "TEXT"),
+                    FieldMeta(name: "published", type: "boolean", sqlType: "INTEGER"),
+                    FieldMeta(name: "authorId", type: "string", sqlType: "TEXT", isOptional: true),
+                ],
+                "Profile": [
+                    FieldMeta(name: "id", type: "string", sqlType: "TEXT", isId: true),
+                    FieldMeta(name: "bio", type: "string", sqlType: "TEXT"),
+                    FieldMeta(name: "userId", type: "string", sqlType: "TEXT"),
+                ],
+            ],
+            relationMap: [
+                "User": [
+                    "posts": RelationDef(modelName: "Post", relationType: "many", foreignKey: "authorId", localKey: "id"),
+                    "profile": RelationDef(modelName: "Profile", relationType: "one", foreignKey: "userId", localKey: "id"),
+                ],
+                "Post": [
+                    "author": RelationDef(modelName: "User", relationType: "one", foreignKey: "authorId", localKey: "id"),
+                ],
+                "Profile": [
+                    "user": RelationDef(modelName: "User", relationType: "one", foreignKey: "userId", localKey: "id"),
+                ],
+            ]
+        )
+        let adapter = try An5Adapter(path: ":memory:", metadata: relationalMetadata)
+        try adapter.execute("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, score INTEGER)")
+        try adapter.execute("CREATE TABLE posts (id TEXT PRIMARY KEY, title TEXT, published INTEGER, authorId TEXT)")
+        try adapter.execute("CREATE TABLE profiles (id TEXT PRIMARY KEY, bio TEXT, userId TEXT)")
+
+        let users = adapter.table("User")
+        let posts = adapter.table("Post")
+        let profiles = adapter.table("Profile")
+
+        try users.create(["id": "u1", "name": "Alice", "score": 100])
+        try users.create(["id": "u2", "name": "Bob", "score": 50])
+        try users.create(["id": "u3", "name": "Charlie", "score": 10])
+
+        try profiles.create(["id": "pr1", "bio": "Systems engineer", "userId": "u1"])
+        try profiles.create(["id": "pr2", "bio": "Draft writer", "userId": "u2"])
+
+        try posts.create(["id": "p1", "title": "Published One", "published": true, "authorId": "u1"])
+        try posts.create(["id": "p2", "title": "Draft One", "published": false, "authorId": "u1"])
+        try posts.create(["id": "p3", "title": "All Published", "published": true, "authorId": "u2"])
+        try posts.create(["id": "p4", "title": "Orphan Post", "published": true, "authorId": NSNull()])
+
+        return adapter
+    }
+
+    func testRelationFiltersAndIncludes() throws {
+        let adapter = try makeRelationalAdapter()
+        let users = adapter.table("User")
+        let posts = adapter.table("Post")
+
+        func names(_ rows: [Row]) -> [String] {
+            rows.compactMap { $0["name"] as? String }.sorted()
+        }
+        func titles(_ rows: [Row]) -> [String] {
+            rows.compactMap { $0["title"] as? String }.sorted()
+        }
+
+        // To-many: some / none / every
+        XCTAssertEqual(names(try users.findMany(filter: Query.some("posts", ["published": true]))), ["Alice", "Bob"])
+        XCTAssertEqual(names(try users.findMany(filter: Query.some("posts"))), ["Alice", "Bob"])
+        XCTAssertEqual(names(try users.findMany(filter: Query.some("posts", ["title": ["not": ["contains": "Published"]]]))), ["Alice"])
+        XCTAssertEqual(names(try users.findMany(filter: Query.none("posts", ["published": false]))), ["Bob", "Charlie"])
+        XCTAssertEqual(names(try users.findMany(filter: Query.none("posts"))), ["Charlie"])
+        // Vacuous truth for `every`: Bob (all published) + Charlie (no posts)
+        XCTAssertEqual(names(try users.findMany(filter: Query.every("posts", ["published": true]))), ["Bob", "Charlie"])
+        XCTAssertEqual(names(try users.findMany(filter: Query.every("posts", [:]))), ["Alice", "Bob", "Charlie"])
+        // Combined operators on the same relation key (distinct subquery aliases)
+        XCTAssertEqual(
+            names(try users.findMany(filter: ["posts": ["some": ["published": true], "none": ["published": false]]])),
+            ["Bob"]
+        )
+
+        // To-one (FK on querying side: Post.author)
+        XCTAssertEqual(
+            titles(try posts.findMany(filter: Query.`is`("author", ["name": "Alice"]))),
+            ["Draft One", "Published One"]
+        )
+        XCTAssertEqual(titles(try posts.findMany(filter: Query.`is`("author", nil))), ["Orphan Post"])
+        XCTAssertEqual(
+            titles(try posts.findMany(filter: Query.isNot("author", ["name": "Alice"]))),
+            ["All Published", "Orphan Post"]
+        )
+        XCTAssertEqual(
+            titles(try posts.findMany(filter: ["author": ["is_not": NSNull()]])),
+            ["All Published", "Draft One", "Published One"]
+        )
+
+        // Inverse one-to-one (FK on related table: User.profile)
+        XCTAssertEqual(names(try users.findMany(filter: Query.`is`("profile", ["bio": ["contains": "Systems"]]))), ["Alice"])
+        XCTAssertEqual(names(try users.findMany(filter: Query.`is`("profile", nil))), ["Charlie"])
+        XCTAssertEqual(names(try users.findMany(filter: Query.isNot("profile", nil))), ["Alice", "Bob"])
+
+        // Multi-level nested relation filter: User -> posts.some -> author.is
+        XCTAssertEqual(
+            names(try users.findMany(filter: [
+                "posts": [
+                    "some": [
+                        "author": [
+                            "is": ["score": ["gte": 100]],
+                        ],
+                    ],
+                ],
+            ])),
+            ["Alice"]
+        )
+
+        // Include on to-one FK-holding side and inverse 1-to-1 side
+        let postWithAuthor = try posts.findMany(Query(filter: ["id": "p1"], include: ["author": true]))
+        XCTAssertEqual((postWithAuthor.first?["author"] as? Row)?["name"] as? String, "Alice")
+        let userWithProfile = try users.findMany(Query(filter: ["id": "u1"], include: ["profile": true]))
+        XCTAssertEqual((userWithProfile.first?["profile"] as? Row)?["bio"] as? String, "Systems engineer")
+
+        // Count & updateMany & deleteMany with relation filters
+        XCTAssertEqual(try users.count(Query.some("posts", ["published": false])), 1)
+        XCTAssertEqual(try posts.updateMany(filter: Query.`is`("author", ["name": "Bob"]), data: ["title": "Updated Bob Post"]), 1)
+        XCTAssertEqual(try posts.findMany(filter: ["id": "p3"]).first?["title"] as? String, "Updated Bob Post")
+        XCTAssertEqual(try posts.deleteMany(filter: Query.`is`("author", nil)), 1)
+        XCTAssertEqual(try posts.count(), 3)
+
+        // Multi-dialect SQL generation check
+        let mssqlClause = try SQLBuilder.buildWhere(
+            ["posts": ["some": ["published": true]]],
+            dialect: .mssql,
+            model: "User",
+            metadata: adapter.metadata
+        )
+        XCTAssertTrue(mssqlClause.sql.contains("EXISTS (SELECT 1 FROM [posts] AS r_posts_some_ WHERE r_posts_some_.[authorId] = [users].[id]"))
+        let pgClause = try SQLBuilder.buildWhere(
+            ["author": ["is": ["score": ["gte": 50]]]],
+            dialect: .postgres,
+            model: "Post",
+            metadata: adapter.metadata
+        )
+        XCTAssertTrue(pgClause.sql.contains("EXISTS (SELECT 1 FROM \"users\" AS r_author_is_ WHERE r_author_is_.\"id\" = \"posts\".\"authorId\""))
+    }
+
+    func testStrictFilterValidation() throws {
+        let adapter = try makeRelationalAdapter()
+        let users = adapter.table("User")
+        let posts = adapter.table("Post")
+
+        func assertInvalidQuery(_ filter: Where, client: TableClient, _ message: String) {
+            XCTAssertThrowsError(try client.findMany(filter: filter), message) { error in
+                guard case .invalidQuery = error as? An5Error else {
+                    return XCTFail("expected An5Error.invalidQuery for \(message), got \(error)")
+                }
+            }
+        }
+
+        assertInvalidQuery(["name": ["bogus": "Ada"]], client: users, "unknown scalar operator")
+        assertInvalidQuery(["ghosts": ["some": ["title": "x"]]], client: users, "unregistered relation")
+        assertInvalidQuery(["posts": ["is": ["title": "x"]]], client: users, "to-one operator on to-many relation")
+        assertInvalidQuery(["author": ["some": ["name": "Alice"]]], client: posts, "to-many operator on to-one relation")
+        assertInvalidQuery(["posts": ["bogus": ["title": "x"]]], client: users, "unknown relation operator")
+        assertInvalidQuery(["posts": "not-a-dict"], client: users, "non-dictionary relation filter")
+        assertInvalidQuery(["posts": ["some": "not-a-dict"]], client: users, "non-dictionary some body")
+        assertInvalidQuery(["author": ["is": 123]], client: posts, "non-dictionary is body")
+        assertInvalidQuery(["OR": "invalid"], client: users, "non-array OR filter")
+        assertInvalidQuery(["score": ["in": "not-an-array"]], client: users, "non-array in operand")
+    }
+
     // MARK: - Fixtures
 
     static let metadata = Metadata(

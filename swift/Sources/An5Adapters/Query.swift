@@ -76,6 +76,35 @@ public struct Query {
     public static func and(_ filters: Where...) -> Where { ["AND": filters] }
     /// None of `filters`; an empty list matches everything.
     public static func not(_ filters: Where...) -> Where { ["NOT": filters] }
+
+    // ─── Relation filter building ───────────────────────────────────────────────
+
+    /// At least one related record matches `filter`.
+    public static func some(_ relation: String, _ filter: Where = [:]) -> Where {
+        [relation: ["some": filter]]
+    }
+
+    /// No related record matches `filter`.
+    public static func none(_ relation: String, _ filter: Where = [:]) -> Where {
+        [relation: ["none": filter]]
+    }
+
+    /// Every related record matches `filter` (vacuously true when zero related records exist).
+    public static func every(_ relation: String, _ filter: Where) -> Where {
+        [relation: ["every": filter]]
+    }
+
+    /// To-one related record matches `filter`, or does not exist when `filter` is `nil`.
+    public static func `is`(_ relation: String, _ filter: Where?) -> Where {
+        let payload: Any = filter.map { $0 as Any } ?? NSNull()
+        return [relation: ["is": payload]]
+    }
+
+    /// To-one related record does not match `filter`, or exists when `filter` is `nil`.
+    public static func isNot(_ relation: String, _ filter: Where?) -> Where {
+        let payload: Any = filter.map { $0 as Any } ?? NSNull()
+        return [relation: ["isNot": payload]]
+    }
 }
 
 /// Which aggregates a query computes.

@@ -155,12 +155,19 @@ public struct Metadata: Sendable {
     /// keys them in camelCase. A plain lookup would find no columns at all and silently skip
     /// `isId` — never generating the primary key.
     public func modelKey(_ modelName: String) -> String {
-        if modelToTable[modelName] != nil || modelFields[modelName] != nil { return modelName }
+        if hasKey(modelName) { return modelName }
         let camel = modelName.prefix(1).lowercased() + modelName.dropFirst()
-        if modelToTable[camel] != nil || modelFields[camel] != nil { return camel }
+        if hasKey(camel) { return camel }
         let lower = modelName.lowercased()
-        if modelToTable[lower] != nil || modelFields[lower] != nil { return lower }
+        if hasKey(lower) { return lower }
+        for key in modelToTable.keys where key.lowercased() == lower { return key }
+        for key in modelFields.keys where key.lowercased() == lower { return key }
+        for key in relationMap.keys where key.lowercased() == lower { return key }
         return modelName
+    }
+
+    private func hasKey(_ key: String) -> Bool {
+        modelToTable[key] != nil || modelFields[key] != nil || relationMap[key] != nil
     }
 
     /// The table a model maps to, or the model name when the schema declared none.
@@ -172,6 +179,16 @@ public struct Metadata: Sendable {
         modelFields[modelKey(modelName)] ?? modelFields[modelName] ?? []
     }
 
+    /// True when the metadata defines at least one field for `modelName`.
+    public func hasFields(_ modelName: String) -> Bool {
+        !fields(modelName).isEmpty
+    }
+
+    /// True when `modelName` declares a column named `fieldName`.
+    public func hasField(_ modelName: String, _ fieldName: String) -> Bool {
+        fields(modelName).contains { $0.name == fieldName }
+    }
+
     /// The primary key column, or `nil` when the schema marked none.
     public func idField(_ modelName: String) -> FieldMeta? {
         fields(modelName).first { $0.isId }
@@ -179,5 +196,34 @@ public struct Metadata: Sendable {
 
     public func relations(_ modelName: String) -> [String: RelationDef] {
         relationMap[modelName] ?? relationMap[modelKey(modelName)] ?? [:]
+    }
+
+    /// Looks up a single named relation declared on `modelName`.
+    public func relation(_ modelName: String, _ relationName: String) -> RelationDef? {
+        relations(modelName)[relationName]
+    }
+
+    /// Resolves `(childKey, parentKey)` join column names for a relation on `modelName`.
+    ///
+    /// To-many relations store `foreignKey` on the related child model and `localKey` on
+    /// `modelName`. To-one relations generated from `@relation(fields: [fk], references: [lk])`
+    /// record `foreignKey` on `modelName` and `localKey` on the related model, whereas an
+    /// inverse one-to-one holds `foreignKey` on the related model instead. Disambiguating via
+    /// `modelFields` handles both without breaking legacy metadata lacking fields.
+    public func relationKeys(_ modelName: String, _ relation: RelationDef) -> (childKey: String, parentKey: String) {
+        let fk = relation.foreignKey.isEmpty ? "id" : relation.foreignKey
+        let lk = relation.localKey.isEmpty ? "id" : relation.localKey
+        if relation.isMany {
+            return (childKey: fk, parentKey: lk)
+        }
+        let parentHasFk = hasField(modelName, fk)
+        let childHasFk = hasField(relation.modelName, fk)
+        if parentHasFk && !childHasFk {
+            return (childKey: lk, parentKey: fk)
+        }
+        if childHasFk && !parentHasFk {
+            return (childKey: fk, parentKey: lk)
+        }
+        return (childKey: lk, parentKey: fk)
     }
 }

@@ -40,7 +40,9 @@ final class QuerySemanticsTests: XCTestCase {
             let filter = testCase["where"] as? [String: Any?] ?? [:]
             let expected = (testCase["ids"] as? [Int]) ?? []
 
-            let clause = SQLBuilder.whereClause(filter, dialect: .sqlite)
+            let clause = try SQLBuilder.buildWhere(filter, dialect: .sqlite)
+            let legacyClause = SQLBuilder.whereClause(filter, dialect: .sqlite)
+            XCTAssertEqual(clause.sql, legacyClause.sql, name)
             let sql = "SELECT id FROM users" + (clause.isEmpty ? "" : " WHERE \(clause.sql)") + " ORDER BY id"
             let found = try adapter.query(sql, clause.parameters.map { $0 as Any? })
             let actual = found.compactMap { ($0["id"] as? NSNumber)?.intValue }
