@@ -10,9 +10,9 @@ use sqlx::{Any, AnyConnection, AnyPool, Row};
 use std::collections::HashMap;
 
 use crate::base::{
-    build_order_by, decode_vector, encode_vector, get_fields_for_model, is_vector_field,
-    needs_vector_encoding, resolve_relation_for_model, resolve_relation_keys, resolve_table,
-    set_adapter_metadata, try_build_having_with_model, try_build_where_with_model,
+    build_order_by, decode_vector, encode_vector, get_fields_for_model, get_relations_for_model,
+    is_vector_field, needs_vector_encoding, resolve_relation_for_model, resolve_relation_keys,
+    resolve_table, set_adapter_metadata, try_build_having_with_model, try_build_where_with_model,
     vector_distance, AdapterMetadata, Dialect, Where,
 };
 use crate::base::vectors::{
@@ -556,8 +556,8 @@ impl TableClient {
             .map(|o| build_order_by(o, self.adapter.dialect))
             .unwrap_or_default();
 
-        let (cols, has_rel_select) = selected_fields(args.select.as_ref());
-        let cols = if !cols.is_empty() && !has_rel_select {
+        let (cols, has_rel_select) = selected_fields(&self.table_name, args.select.as_ref());
+        let cols = if !cols.is_empty() && !has_rel_select && args.include.is_none() {
             cols
                 .iter()
                 .map(|c| self.adapter.dialect.quote_identifier(c))
@@ -620,12 +620,14 @@ impl TableClient {
             if has_rel_select {
                 self.resolve_select_relations(&mut rows, sel).await?;
             }
-            for row in rows.iter_mut() {
-                project_fields(row, sel);
-            }
         }
         if let Some(inc) = &args.include {
             self.resolve_includes(&mut rows, inc).await?;
+        }
+        if let Some(sel) = &args.select {
+            for row in rows.iter_mut() {
+                project_fields(row, sel, args.include.as_ref());
+            }
         }
         Ok(self.decode_vector_rows(rows))
     }
@@ -767,19 +769,42 @@ impl TableClient {
 
     /// Update when a match exists, otherwise insert.
     pub async fn upsert(&self, args: &UpsertArgs) -> Result<RowMap> {
-        let existing = self.find_first(&FindManyArgs {
-            r#where: args.r#where.clone(),
-            take: 1,
-            ..Default::default()
-        })
-        .await?;
-        if existing.is_some() {
+        let existing = self
+            .find_first(&FindManyArgs {
+                r#where: args.r#where.clone(),
+                take: 1,
+                ..Default::default()
+            })
+            .await?;
+        if let Some(prev) = existing {
             self.update(&UpdateArgs {
                 r#where: args.r#where.clone(),
                 data: args.update.clone(),
             })
             .await?;
-            Ok(existing.unwrap())
+            if let Some(refetched) = self
+                .find_first(&FindManyArgs {
+                    r#where: args.r#where.clone(),
+                    take: 1,
+                    ..Default::default()
+                })
+                .await?
+            {
+                return Ok(refetched);
+            }
+            if let Some(id_val) = prev.get("id").filter(|v| !v.is_null()).cloned() {
+                if let Some(refetched_by_id) = self
+                    .find_first(&FindManyArgs {
+                        r#where: Some(serde_json::json!({ "id": id_val })),
+                        take: 1,
+                        ..Default::default()
+                    })
+                    .await?
+                {
+                    return Ok(refetched_by_id);
+                }
+            }
+            Ok(prev)
         } else {
             self.create(&args.create).await
         }
@@ -1244,27 +1269,10 @@ impl TableClient {
     }
 
     async fn resolve_includes(&self, rows: &mut [RowMap], include: &Value) -> Result<()> {
-        let requested = match include {
-            Value::Array(items) => items.clone(),
-            Value::Object(m) => m
-                .iter()
-                .filter(|(_, v)| matches!(v, Value::Bool(true)))
-                .map(|(k, _)| Value::String(k.clone()))
-                .collect(),
-            _ => Vec::new(),
-        };
-        for key in requested {
-            let key = match key.as_str() {
-                Some(k) => k.to_string(),
-                None => continue,
-            };
-            self.resolve_select_relations(rows, &Value::Array(vec![Value::String(key)]))
-                .await?;
-        }
-        Ok(())
+        self.resolve_select_relations(rows, include).await
     }
 
-    /// Eager-loads the requested relations onto each row.
+    /// Eager-loads the requested relations and `_count` summaries onto each row.
     ///
     /// Boxed because eager loading re-enters `find_many` on the related table,
     /// which would otherwise make this future infinitely sized.
@@ -1274,59 +1282,161 @@ impl TableClient {
         select: &'a Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-        let requested: Vec<String> = match select {
-            Value::Array(items) => items
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect(),
-            Value::Object(m) => m
-                .iter()
-                .filter(|(_, v)| matches!(v, Value::Bool(true)))
-                .map(|(k, _)| k.clone())
-                .collect(),
-            _ => Vec::new(),
-        };
-
-        for key in requested {
-            if key == "_count" {
-                continue;
-            }
-            let def = match resolve_relation_for_model(&self.table_name, &key) {
-                Some((_, d)) => d,
-                None => continue,
+            let requested: Vec<(String, Value)> = match select {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| (s.to_string(), Value::Bool(true))))
+                    .collect(),
+                Value::Object(m) => m
+                    .iter()
+                    .filter(|(_, v)| !matches!(v, Value::Bool(false) | Value::Null))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                _ => Vec::new(),
             };
-            let target = self.adapter.table(&def.model_name);
-            let (child_key, parent_key) = resolve_relation_keys(&self.table_name, &def);
 
-            for row in rows.iter_mut() {
-                let parent_value = match row.get(&parent_key) {
-                    Some(v) if !v.is_null() => v.clone(),
-                    _ => continue,
+            for (key, spec) in requested {
+                if key == "_count" {
+                    let all_relations = get_relations_for_model(&self.table_name);
+                    if all_relations.is_empty() {
+                        continue;
+                    }
+                    let count_targets: Vec<(String, Option<Value>)> = match &spec {
+                        Value::Bool(true) => {
+                            let mut names: Vec<String> = all_relations.keys().cloned().collect();
+                            names.sort();
+                            names.into_iter().map(|n| (n, None)).collect()
+                        }
+                        Value::Object(obj) => {
+                            let selection = obj
+                                .get("select")
+                                .and_then(Value::as_object)
+                                .unwrap_or(obj);
+                            selection
+                                .iter()
+                                .filter(|(_, v)| !matches!(v, Value::Bool(false) | Value::Null))
+                                .map(|(rel_key, rel_spec)| {
+                                    let nested_where = rel_spec
+                                        .as_object()
+                                        .and_then(|o| o.get("where").cloned());
+                                    (rel_key.clone(), nested_where)
+                                })
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    };
+
+                    for row in rows.iter_mut() {
+                        let mut count_map = row
+                            .get("_count")
+                            .and_then(Value::as_object)
+                            .cloned()
+                            .unwrap_or_default();
+                        for (rel_key, nested_where) in &count_targets {
+                            let Some((_, def)) =
+                                resolve_relation_for_model(&self.table_name, rel_key)
+                            else {
+                                continue;
+                            };
+                            let (child_key, parent_key) =
+                                resolve_relation_keys(&self.table_name, &def);
+                            let Some(parent_value) =
+                                row.get(&parent_key).filter(|v| !v.is_null()).cloned()
+                            else {
+                                count_map.insert(rel_key.clone(), Value::from(0));
+                                continue;
+                            };
+                            let target = self.adapter.table(&def.model_name);
+                            let mut eq_obj = Map::new();
+                            eq_obj.insert(child_key, parent_value);
+                            let where_val = match nested_where {
+                                Some(nw) => serde_json::json!({ "AND": [Value::Object(eq_obj), nw] }),
+                                None => Value::Object(eq_obj),
+                            };
+                            let cnt = target
+                                .count(&CountArgs {
+                                    r#where: Some(where_val),
+                                })
+                                .await?;
+                            count_map.insert(rel_key.clone(), Value::from(cnt));
+                        }
+                        row.insert("_count".to_string(), Value::Object(count_map));
+                    }
+                    continue;
+                }
+
+                let def = match resolve_relation_for_model(&self.table_name, &key) {
+                    Some((_, d)) => d,
+                    None => continue,
                 };
-                let child_rows = target
-                    .find_many(&FindManyArgs {
-                        r#where: Some(serde_json::json!({ child_key.clone(): parent_value })),
-                        ..Default::default()
-                    })
-                    .await?;
-                if def.relation_type == "many" {
-                    row.insert(
-                        key.clone(),
-                        Value::Array(child_rows.into_iter().map(Value::Object).collect()),
-                    );
-                } else {
-                    row.insert(
-                        key.clone(),
-                        child_rows
-                            .into_iter()
-                            .next()
-                            .map(Value::Object)
-                            .unwrap_or(Value::Null),
-                    );
+                let target = self.adapter.table(&def.model_name);
+                let (child_key, parent_key) = resolve_relation_keys(&self.table_name, &def);
+
+                let opts = spec.as_object();
+                let nested_where = opts.and_then(|o| o.get("where")).cloned();
+                let nested_order_by = opts
+                    .and_then(|o| o.get("orderBy").or_else(|| o.get("order_by")))
+                    .cloned();
+                let nested_skip = opts
+                    .and_then(|o| o.get("skip"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let nested_take = opts
+                    .and_then(|o| o.get("take"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let nested_select = opts.and_then(|o| o.get("select")).cloned();
+                let nested_include = opts.and_then(|o| o.get("include")).cloned();
+
+                for row in rows.iter_mut() {
+                    let parent_value = match row.get(&parent_key) {
+                        Some(v) if !v.is_null() => v.clone(),
+                        _ => {
+                            row.insert(
+                                key.clone(),
+                                if def.relation_type == "many" {
+                                    Value::Array(Vec::new())
+                                } else {
+                                    Value::Null
+                                },
+                            );
+                            continue;
+                        }
+                    };
+                    let mut eq_obj = Map::new();
+                    eq_obj.insert(child_key.clone(), parent_value);
+                    let child_where = match &nested_where {
+                        Some(nw) => serde_json::json!({ "AND": [Value::Object(eq_obj), nw] }),
+                        None => Value::Object(eq_obj),
+                    };
+                    let child_rows = target
+                        .find_many(&FindManyArgs {
+                            r#where: Some(child_where),
+                            order_by: nested_order_by.clone(),
+                            skip: nested_skip,
+                            take: nested_take,
+                            select: nested_select.clone(),
+                            include: nested_include.clone(),
+                        })
+                        .await?;
+                    if def.relation_type == "many" {
+                        row.insert(
+                            key.clone(),
+                            Value::Array(child_rows.into_iter().map(Value::Object).collect()),
+                        );
+                    } else {
+                        row.insert(
+                            key.clone(),
+                            child_rows
+                                .into_iter()
+                                .next()
+                                .map(Value::Object)
+                                .unwrap_or(Value::Null),
+                        );
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
         })
     }
 }
@@ -1392,24 +1502,34 @@ fn suffix_where(nolock: &str, w: &Where) -> String {
 }
 
 /// Extracts scalar column names from a select value, reporting whether any
-/// relation key was requested.
-fn selected_fields(select: Option<&Value>) -> (Vec<String>, bool) {
+/// relation key or `_count` was requested.
+fn selected_fields(model: &str, select: Option<&Value>) -> (Vec<String>, bool) {
     match select {
-        Some(Value::Array(items)) => (
-            items
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect(),
-            false,
-        ),
+        Some(Value::Array(items)) => {
+            let mut cols = Vec::new();
+            let mut has_rel = false;
+            for item in items {
+                let Some(k) = item.as_str() else {
+                    continue;
+                };
+                if k == "_count" || resolve_relation_for_model(model, k).is_some() {
+                    has_rel = true;
+                } else {
+                    cols.push(k.to_string());
+                }
+            }
+            (cols, has_rel)
+        }
         Some(Value::Object(m)) => {
             let mut cols = Vec::new();
             let mut has_rel = false;
             for (k, v) in m {
-                if matches!(v, Value::Bool(true)) {
-                    if k == "_count" || k.contains('_') {
-                        has_rel = true;
-                    }
+                if matches!(v, Value::Bool(false) | Value::Null) {
+                    continue;
+                }
+                if k == "_count" || resolve_relation_for_model(model, k).is_some() {
+                    has_rel = true;
+                } else {
                     cols.push(k.clone());
                 }
             }
@@ -1419,20 +1539,34 @@ fn selected_fields(select: Option<&Value>) -> (Vec<String>, bool) {
     }
 }
 
-/// Keeps only the selected keys on a row, mirroring `projectFields` in Go/TS.
-fn project_fields(row: &mut RowMap, select: &Value) {
-    let keys: Vec<String> = match select {
+fn collect_selected_keys(val: &Value) -> Vec<String> {
+    match val {
         Value::Array(items) => items
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect(),
         Value::Object(m) => m
             .iter()
-            .filter(|(_, v)| matches!(v, Value::Bool(true)))
+            .filter(|(_, v)| !matches!(v, Value::Bool(false) | Value::Null))
             .map(|(k, _)| k.clone())
             .collect(),
-        _ => return,
-    };
+        _ => Vec::new(),
+    }
+}
+
+/// Keeps only the selected keys (plus requested `include` keys) on a row.
+fn project_fields(row: &mut RowMap, select: &Value, include: Option<&Value>) {
+    let mut keys = collect_selected_keys(select);
+    if keys.is_empty() && !matches!(select, Value::Object(_)) {
+        return;
+    }
+    if let Some(inc) = include {
+        for k in collect_selected_keys(inc) {
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+    }
     let count = row.get("_count").cloned();
     let projected: RowMap = keys
         .iter()
@@ -1629,20 +1763,50 @@ mod tests {
 
     #[test]
     fn selected_fields_detects_relations() {
-        let (cols, has_rel) = selected_fields(Some(&json!({ "id": true, "user_email": true })));
-        assert_eq!(cols, vec!["id".to_string(), "user_email".to_string()]);
-        assert!(has_rel);
+        let _guard = crate::base::metadata::TEST_METADATA_LOCK.lock().unwrap();
+        crate::base::set_adapter_metadata(AdapterMetadata {
+            relation_map: HashMap::from([(
+                "User".to_string(),
+                HashMap::from([(
+                    "orders".to_string(),
+                    RelationDef {
+                        model_name: "Order".to_string(),
+                        relation_type: "many".to_string(),
+                        foreign_key: "user_id".to_string(),
+                        local_key: "id".to_string(),
+                    },
+                )]),
+            )]),
+            ..Default::default()
+        });
+
+        let (scalar_cols, scalar_has_rel) =
+            selected_fields("User", Some(&json!({ "id": true, "created_at": true })));
+        assert!(!scalar_has_rel);
+        assert!(scalar_cols.contains(&"created_at".to_string()));
+
+        let (rel_cols, rel_has_rel) = selected_fields(
+            "User",
+            Some(&json!({ "id": true, "orders": { "take": 1 }, "_count": true })),
+        );
+        assert!(rel_has_rel);
+        assert_eq!(rel_cols, vec!["id".to_string()]);
     }
 
     #[test]
     fn project_fields_keeps_selection() {
-        let mut row = json!({ "id": 1, "name": "a", "email": "b" })
+        let mut row = json!({ "id": 1, "name": "a", "email": "b", "orders": [1] })
             .as_object()
             .unwrap()
             .clone();
-        project_fields(&mut row, &json!({ "id": true }));
-        assert_eq!(row.len(), 1);
+        project_fields(
+            &mut row,
+            &json!({ "id": true }),
+            Some(&json!({ "orders": true })),
+        );
+        assert_eq!(row.len(), 2);
         assert!(row.contains_key("id"));
+        assert!(row.contains_key("orders"));
     }
 
     #[test]

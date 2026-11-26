@@ -6,7 +6,7 @@
 
 use an5_adapters::{
     AdapterMetadata, An5Adapter, CountArgs, DeleteManyArgs, FindManyArgs, GroupByArgs, RelationDef,
-    UpdateArgs,
+    UpdateArgs, UpsertArgs,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -651,4 +651,148 @@ async fn group_by_having_per_field_count_mode_insensitive_and_offset_pagination(
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn upsert_returns_updated_row_and_include_supports_nested_options_and_count() {
+    let _guard = METADATA_GUARD.lock().await;
+    let (db, _tmp) = adapter().await;
+    db.execute_raw(
+        "CREATE TABLE orders (id TEXT PRIMARY KEY, user_id TEXT NULL, total INTEGER NOT NULL)",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    db.set_metadata(AdapterMetadata {
+        model_to_table: HashMap::from([
+            ("User".to_string(), "users".to_string()),
+            ("Order".to_string(), "orders".to_string()),
+        ]),
+        model_fields: HashMap::from([
+            ("User".to_string(), json!({ "id": {}, "email": {}, "name": {}, "age": {} })),
+            ("Order".to_string(), json!({ "id": {}, "user_id": {}, "total": {} })),
+        ]),
+        relation_map: HashMap::from([
+            (
+                "User".to_string(),
+                HashMap::from([(
+                    "orders".to_string(),
+                    RelationDef {
+                        model_name: "Order".to_string(),
+                        relation_type: "many".to_string(),
+                        foreign_key: "user_id".to_string(),
+                        local_key: "id".to_string(),
+                    },
+                )]),
+            ),
+            (
+                "Order".to_string(),
+                HashMap::from([(
+                    "user".to_string(),
+                    RelationDef {
+                        model_name: "User".to_string(),
+                        relation_type: "one".to_string(),
+                        foreign_key: "user_id".to_string(),
+                        local_key: "id".to_string(),
+                    },
+                )]),
+            ),
+        ]),
+    });
+
+    let users = db.table("User");
+    let orders = db.table("Order");
+
+    // Upsert insert path
+    let inserted = users
+        .upsert(&UpsertArgs {
+            r#where: Some(json!({ "id": "u1" })),
+            create: json!({ "id": "u1", "email": "alice@example.com", "name": "Alice", "age": 30 })
+                .as_object()
+                .unwrap()
+                .clone(),
+            update: json!({ "age": 31 }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(inserted["age"].as_i64(), Some(30));
+
+    // Upsert update path must return the updated row, not stale pre-update values
+    let updated = users
+        .upsert(&UpsertArgs {
+            r#where: Some(json!({ "id": "u1" })),
+            create: json!({ "id": "u1", "email": "alice@example.com", "name": "Alice", "age": 30 })
+                .as_object()
+                .unwrap()
+                .clone(),
+            update: json!({ "age": 42, "name": "Alice Updated" }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated["age"].as_i64(), Some(42));
+    assert_eq!(updated["name"].as_str(), Some("Alice Updated"));
+
+    db.execute_raw(
+        "INSERT INTO orders (id, user_id, total) VALUES ('o1', 'u1', 50), ('o2', 'u1', 200), ('o3', 'u1', 150), ('o4', NULL, 25)",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    // Nested include options + _count
+    let u1 = users
+        .find_many(&FindManyArgs {
+            r#where: Some(json!({ "id": "u1" })),
+            include: Some(json!({
+                "orders": {
+                    "where": { "total": { "gte": 100 } },
+                    "orderBy": { "total": "desc" },
+                    "take": 1
+                },
+                "_count": true
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(u1.len(), 1);
+    let top_orders = u1[0]["orders"].as_array().unwrap();
+    assert_eq!(top_orders.len(), 1);
+    assert_eq!(top_orders[0]["id"].as_str(), Some("o2"));
+    assert_eq!(u1[0]["_count"]["orders"].as_i64(), Some(3));
+
+    // Relation select map (excluding 'orders' from scalar SQL columns and projecting id + orders + filtered _count)
+    let selected = users
+        .find_many(&FindManyArgs {
+            r#where: Some(json!({ "id": "u1" })),
+            select: Some(json!({
+                "id": true,
+                "orders": {
+                    "orderBy": { "total": "asc" },
+                    "select": { "id": true }
+                },
+                "_count": { "select": { "orders": { "where": { "total": { "gte": 150 } } } } }
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert!(selected[0].get("email").is_none());
+    assert_eq!(selected[0]["orders"].as_array().unwrap().len(), 3);
+    assert_eq!(selected[0]["orders"][0]["id"].as_str(), Some("o1"));
+    assert_eq!(selected[0]["_count"]["orders"].as_i64(), Some(2));
+
+    // Nullable to-one include sets null for missing foreign key
+    let orphan = orders
+        .find_first(&FindManyArgs {
+            r#where: Some(json!({ "id": "o4" })),
+            include: Some(json!({ "user": true })),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(orphan["user"].is_null());
 }
