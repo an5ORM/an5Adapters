@@ -526,3 +526,129 @@ async fn relation_filters_and_strict_operator_rejection() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn group_by_having_per_field_count_mode_insensitive_and_offset_pagination() {
+    let _guard = METADATA_GUARD.lock().await;
+    let (db, _tmp) = adapter().await;
+    db.execute_raw(
+        "CREATE TABLE orders (id TEXT PRIMARY KEY, user_id TEXT NULL, total INTEGER NOT NULL, note TEXT NULL)",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    db.set_metadata(AdapterMetadata {
+        model_to_table: HashMap::from([
+            ("User".to_string(), "users".to_string()),
+            ("Order".to_string(), "orders".to_string()),
+        ]),
+        model_fields: HashMap::from([
+            ("User".to_string(), json!({ "id": {}, "email": {}, "name": {}, "age": {} })),
+            ("Order".to_string(), json!({ "id": {}, "user_id": {}, "total": {}, "note": {} })),
+        ]),
+        ..Default::default()
+    });
+
+    db.execute_raw(
+        "INSERT INTO users (id, email, name, age) VALUES ('u1', 'Alice@Example.com', 'Alice', 30), ('u2', 'bob@example.com', 'Bob', 25), ('u3', 'carol@example.com', 'Carol', 28)",
+        &[],
+    )
+    .await
+    .unwrap();
+    db.execute_raw(
+        "INSERT INTO orders (id, user_id, total, note) VALUES ('o1', 'u1', 100, 'first'), ('o2', 'u1', 250, NULL), ('o3', 'u2', 50, 'small'), ('o4', 'u3', 400, 'big')",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let users = db.table("User");
+    let orders = db.table("Order");
+
+    // mode: "insensitive" works on SQLite contains & in
+    let ci_alice = users
+        .find_many(&FindManyArgs {
+            r#where: Some(json!({ "email": { "contains": "alice", "mode": "insensitive" } })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(ci_alice.len(), 1);
+    assert_eq!(ci_alice[0]["id"].as_str(), Some("u1"));
+
+    let ci_in = users
+        .find_many(&FindManyArgs {
+            r#where: Some(json!({ "email": { "in": ["ALICE@EXAMPLE.COM"], "mode": "insensitive" } })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(ci_in.len(), 1);
+
+    // SQLite offset-only pagination in find_many (LIMIT -1 OFFSET 1)
+    let paged_users = users
+        .find_many(&FindManyArgs {
+            order_by: Some(json!({ "id": "asc" })),
+            skip: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        paged_users.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["u2", "u3"]
+    );
+
+    // group_by with WHERE + HAVING + per-field _count + offset-only pagination
+    let grouped = orders
+        .group_by(&GroupByArgs {
+            by: Some(json!(["user_id"])),
+            r#where: Some(json!({ "total": { "gte": 50 } })),
+            having: Some(json!({
+                "OR": [
+                    { "_count": { "_all": { "gte": 2 } }, "_sum": { "total": { "gte": 300 } } },
+                    { "user_id": "u3" }
+                ]
+            })),
+            order_by: Some(json!({ "user_id": "asc" })),
+            count: Some(json!({ "_all": true, "note": true })),
+            sum: Some(json!(["total"])),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(grouped.len(), 2);
+    assert_eq!(grouped[0]["user_id"].as_str(), Some("u1"));
+    assert_eq!(grouped[0]["_count"].as_i64(), Some(2));
+    assert_eq!(grouped[0]["_count_note"].as_i64(), Some(1));
+    assert_eq!(grouped[0]["sum_total"].as_i64(), Some(350));
+    assert_eq!(grouped[1]["user_id"].as_str(), Some("u3"));
+
+    // group_by offset-only pagination on SQLite
+    let paged_groups = orders
+        .group_by(&GroupByArgs {
+            by: Some(json!(["user_id"])),
+            order_by: Some(json!({ "user_id": "asc" })),
+            skip: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        paged_groups.iter().map(|r| r["user_id"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["u2", "u3"]
+    );
+
+    // Invalid having rejects before query
+    assert!(
+        orders
+            .group_by(&GroupByArgs {
+                by: Some(json!(["user_id"])),
+                having: Some(json!({ "total": { "gt": 10 } })),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+    );
+}

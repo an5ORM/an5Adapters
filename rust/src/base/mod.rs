@@ -23,5 +23,6 @@ pub use vectors::{
     STRATEGY_UDF,
 };
 pub use where_builder::{
-    build_order_by, build_where, build_where_with_model, try_build_where_with_model, SqlArg, Where,
+    build_order_by, build_where, build_where_with_model, try_build_having,
+    try_build_having_with_model, try_build_where_with_model, SqlArg, Where,
 };

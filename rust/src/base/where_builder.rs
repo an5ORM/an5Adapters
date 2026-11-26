@@ -5,11 +5,12 @@
 //! everywhere.
 
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 
 use super::dialect::Dialect;
 use super::metadata::{
     model_has_field, model_has_fields_metadata, resolve_relation_for_model, resolve_relation_keys,
-    resolve_table, RelationDef,
+    resolve_table, to_snake_case, RelationDef,
 };
 
 /// Comparison operators understood inside a filter object.
@@ -57,20 +58,6 @@ fn as_object(v: &Value) -> Option<&Map<String, Value>> {
     match v {
         Value::Object(m) => Some(m),
         _ => None,
-    }
-}
-
-fn to_list(v: &Value) -> Vec<Value> {
-    match v {
-        Value::Array(items) => items.clone(),
-        other => vec![other.clone()],
-    }
-}
-
-fn to_string_value(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
     }
 }
 
@@ -155,6 +142,8 @@ pub fn try_build_where_with_model(
     if let Some(obj) = as_object(where_obj) {
         let cleaned = clean_where(obj, model_name);
         out.clause = build_where_rec(&cleaned, model_name, dialect, &mut out.args, ph, "", "", "")?;
+    } else if !where_obj.is_null() {
+        return Err("where clause must be an object".to_string());
     }
     Ok(out)
 }
@@ -338,6 +327,47 @@ fn parse_relation_filter(
     Ok(parts.join(" AND "))
 }
 
+fn build_logical_group(
+    key: &str,
+    value: &Value,
+    mut recurse: impl FnMut(&Map<String, Value>, &str) -> std::result::Result<String, String>,
+    prefix: &str,
+) -> std::result::Result<Option<String>, String> {
+    let items: Vec<&Value> = match (key, value) {
+        ("OR", Value::Array(arr)) => arr.iter().collect(),
+        ("OR", _) => return Err("'OR' filter must be an array of filter objects".to_string()),
+        (_, Value::Array(arr)) => arr.iter().collect(),
+        (_, Value::Object(_)) => vec![value],
+        _ => {
+            return Err(format!(
+                "'{}' filter must be an object or array of objects",
+                key
+            ))
+        }
+    };
+
+    let mut subs: Vec<String> = Vec::with_capacity(items.len());
+    for (i, item) in items.into_iter().enumerate() {
+        let obj = as_object(item)
+            .ok_or_else(|| format!("'{}' filter entries must be filter objects", key))?;
+        let sub_prefix = format!("{}{}{}_", prefix, key, i);
+        let s = recurse(obj, &sub_prefix)?;
+        subs.push(if s.is_empty() { "1=1".to_string() } else { s });
+    }
+
+    if subs.is_empty() {
+        return Ok(if key == "OR" {
+            Some("1=0".to_string())
+        } else {
+            None
+        });
+    }
+
+    let joiner = if key == "AND" { " AND " } else { " OR " };
+    let negation = if key == "NOT" { "NOT " } else { "" };
+    Ok(Some(format!("{}({})", negation, subs.join(joiner))))
+}
+
 fn build_where_rec(
     where_obj: &Map<String, Value>,
     model_name: &str,
@@ -352,6 +382,7 @@ fn build_where_rec(
         return Ok(String::new());
     }
     let mut conditions: Vec<String> = Vec::new();
+    let has_fields = !model_name.is_empty() && model_has_fields_metadata(model_name);
 
     // Deterministic key order so the generated SQL is stable.
     let mut keys: Vec<&String> = where_obj.keys().collect();
@@ -362,31 +393,24 @@ fn build_where_rec(
 
         match key.as_str() {
             "AND" | "OR" | "NOT" => {
-                let mut subs: Vec<String> = Vec::new();
-                for (i, item) in to_list(value).into_iter().enumerate() {
-                    if let Some(m) = as_object(&item) {
-                        let sub_prefix = format!("{}{}{}_", prefix, key, i);
-                        let s = build_where_rec(
+                if let Some(clause) = build_logical_group(
+                    key,
+                    value,
+                    |m, sub_prefix| {
+                        build_where_rec(
                             &clean_where(m, model_name),
                             model_name,
                             dialect,
                             args,
                             ph,
-                            &sub_prefix,
+                            sub_prefix,
                             self_ref,
                             col_prefix,
-                        )?;
-                        subs.push(if s.is_empty() { "1=1".to_string() } else { s });
-                    }
-                }
-                if subs.is_empty() {
-                    if key == "OR" {
-                        conditions.push("1=0".to_string());
-                    }
-                } else {
-                    let joiner = if key == "AND" { " AND " } else { " OR " };
-                    let negation = if key == "NOT" { "NOT " } else { "" };
-                    conditions.push(format!("{}({})", negation, subs.join(joiner)));
+                        )
+                    },
+                    prefix,
+                )? {
+                    conditions.push(clause);
                 }
                 continue;
             }
@@ -412,46 +436,68 @@ fn build_where_rec(
                 }
                 continue;
             }
+            if has_fields && !model_has_field(model_name, key) {
+                return Err(format!("unknown field '{}' on model '{}'", key, model_name));
+            }
         }
 
-        conditions.extend(build_field_condition(
-            key,
-            value,
-            model_name,
-            dialect,
-            args,
-            ph,
-            prefix,
-            self_ref,
-            col_prefix,
-        )?);
+        let col = format!("{}{}", col_prefix, dialect.quote_identifier(key));
+        conditions.extend(build_expr_conditions(&col, key, value, dialect, args, ph)?);
     }
 
     Ok(conditions.join(" AND "))
 }
 
-fn build_field_condition(
-    key: &str,
+fn format_pattern_condition(
+    expr: &str,
+    placeholder: &str,
+    dialect: Dialect,
+    insensitive: bool,
+) -> String {
+    if !insensitive {
+        format!("{} LIKE {}", expr, placeholder)
+    } else if dialect == Dialect::Postgres {
+        format!("{} ILIKE {}", expr, placeholder)
+    } else {
+        format!("LOWER({}) LIKE LOWER({})", expr, placeholder)
+    }
+}
+
+fn build_expr_conditions(
+    expr: &str,
+    label: &str,
     value: &Value,
-    model_name: &str,
     dialect: Dialect,
     args: &mut Vec<SqlArg>,
     ph: &dyn Fn(usize) -> String,
-    prefix: &str,
-    self_ref: &str,
-    col_prefix: &str,
 ) -> std::result::Result<Vec<String>, String> {
-    let col = format!("{}{}", col_prefix, dialect.quote_identifier(key));
-
     if value.is_null() {
-        return Ok(vec![format!("{} IS NULL", col)]);
+        return Ok(vec![format!("{} IS NULL", expr)]);
+    }
+    if value.is_array() {
+        return Err(format!(
+            "invalid array filter value for '{}'; use {{\"in\": [...]}} instead",
+            label
+        ));
     }
 
     let map = match as_object(value) {
         Some(m) => m,
         None => {
             let p = push_arg(args, value.clone(), ph);
-            return Ok(vec![format!("{} = {}", col, p)]);
+            return Ok(vec![format!("{} = {}", expr, p)]);
+        }
+    };
+
+    let insensitive = match map.get("mode") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) if s == "default" => false,
+        Some(Value::String(s)) if s == "insensitive" => true,
+        Some(other) => {
+            return Err(format!(
+                "invalid filter mode {} on '{}'; expected 'default' or 'insensitive'",
+                other, label
+            ))
         }
     };
 
@@ -465,98 +511,105 @@ fn build_field_condition(
         match op.as_str() {
             "not" => {
                 if val.is_null() {
-                    parts.push(format!("{} IS NOT NULL", col));
+                    parts.push(format!("{} IS NOT NULL", expr));
+                } else if val.is_array() {
+                    return Err(format!(
+                        "'not' operator on '{}' cannot be an array; use 'notIn' instead",
+                        label
+                    ));
                 } else if val.is_object() {
-                    let mut nested = Map::new();
-                    nested.insert(key.to_string(), val.clone());
-                    let cond = build_where_rec(
-                        &nested,
-                        model_name,
-                        dialect,
-                        args,
-                        ph,
-                        &format!("{}{}_not_", prefix, key),
-                        self_ref,
-                        col_prefix,
-                    )?;
-                    if !cond.is_empty() {
-                        parts.push(format!("NOT ({})", cond));
+                    let nested_parts =
+                        build_expr_conditions(expr, label, val, dialect, args, ph)?;
+                    if !nested_parts.is_empty() {
+                        parts.push(format!("NOT ({})", nested_parts.join(" AND ")));
                     }
                 } else {
                     let phs = p(args);
-                    parts.push(format!("{} <> {}", col, phs));
+                    if insensitive && val.is_string() {
+                        parts.push(format!("LOWER({}) <> LOWER({})", expr, phs));
+                    } else {
+                        parts.push(format!("{} <> {}", expr, phs));
+                    }
                 }
             }
             "equals" => {
                 if val.is_null() {
-                    parts.push(format!("{} IS NULL", col));
+                    parts.push(format!("{} IS NULL", expr));
+                } else if val.is_array() || val.is_object() {
+                    return Err(format!(
+                        "'equals' operator on '{}' must be a scalar value or null",
+                        label
+                    ));
                 } else {
                     let phs = p(args);
-                    parts.push(format!("{} = {}", col, phs));
+                    if insensitive && val.is_string() {
+                        parts.push(format!("LOWER({}) = LOWER({})", expr, phs));
+                    } else {
+                        parts.push(format!("{} = {}", expr, phs));
+                    }
                 }
             }
-            "contains" => {
-                let phs = p(args);
-                parts.push(format!("{} LIKE {}", col, phs));
-                wrap_last_arg(args, |a| format!("%{}%", to_string_value(a)));
+            "contains" | "startsWith" | "endsWith" => {
+                let s = val.as_str().ok_or_else(|| {
+                    format!("'{}' operator on '{}' requires a string value", op, label)
+                })?;
+                let wrapped = match op.as_str() {
+                    "startsWith" => format!("{}%", s),
+                    "endsWith" => format!("%{}", s),
+                    _ => format!("%{}%", s),
+                };
+                let phs = push_arg(args, Value::String(wrapped), ph);
+                parts.push(format_pattern_condition(expr, &phs, dialect, insensitive));
             }
-            "startsWith" => {
+            "gte" | "lte" | "gt" | "lt" => {
+                if val.is_null() || val.is_array() || val.is_object() {
+                    return Err(format!(
+                        "'{}' operator on '{}' must be a scalar comparison value",
+                        op, label
+                    ));
+                }
+                let sql_op = match op.as_str() {
+                    "gte" => ">=",
+                    "lte" => "<=",
+                    "gt" => ">",
+                    _ => "<",
+                };
                 let phs = p(args);
-                parts.push(format!("{} LIKE {}", col, phs));
-                wrap_last_arg(args, |a| format!("{}%", to_string_value(a)));
+                parts.push(format!("{} {} {}", expr, sql_op, phs));
             }
-            "endsWith" => {
-                let phs = p(args);
-                parts.push(format!("{} LIKE {}", col, phs));
-                wrap_last_arg(args, |a| format!("%{}", to_string_value(a)));
-            }
-            "gte" => {
-                let phs = p(args);
-                parts.push(format!("{} >= {}", col, phs));
-            }
-            "lte" => {
-                let phs = p(args);
-                parts.push(format!("{} <= {}", col, phs));
-            }
-            "gt" => {
-                let phs = p(args);
-                parts.push(format!("{} > {}", col, phs));
-            }
-            "lt" => {
-                let phs = p(args);
-                parts.push(format!("{} < {}", col, phs));
-            }
-            "in" => {
-                let items = to_list(val);
+            "in" | "notIn" => {
+                let items = val.as_array().ok_or_else(|| {
+                    format!("'{}' operator on '{}' requires an array", op, label)
+                })?;
                 if items.is_empty() {
-                    parts.push("1=0".to_string());
+                    parts.push(if op == "in" { "1=0" } else { "1=1" }.to_string());
                 } else {
+                    let lower = insensitive && items.iter().any(|it| it.is_string());
                     let phs: Vec<String> = items
                         .iter()
-                        .map(|it| push_arg(args, it.clone(), ph))
+                        .map(|it| {
+                            let ps = push_arg(args, it.clone(), ph);
+                            if lower && it.is_string() {
+                                format!("LOWER({})", ps)
+                            } else {
+                                ps
+                            }
+                        })
                         .collect();
-                    parts.push(format!("{} IN ({})", col, phs.join(", ")));
+                    let lhs = if lower {
+                        format!("LOWER({})", expr)
+                    } else {
+                        expr.to_string()
+                    };
+                    let sql_kw = if op == "in" { "IN" } else { "NOT IN" };
+                    parts.push(format!("{} {} ({})", lhs, sql_kw, phs.join(", ")));
                 }
             }
-            "notIn" => {
-                let items = to_list(val);
-                if items.is_empty() {
-                    parts.push("1=1".to_string());
-                } else {
-                    let phs: Vec<String> = items
-                        .iter()
-                        .map(|it| push_arg(args, it.clone(), ph))
-                        .collect();
-                    parts.push(format!("{} NOT IN ({})", col, phs.join(", ")));
-                }
-            }
-            // `mode: "insensitive"` is accepted and ignored: collation is a
-            // database concern, matching the Go adapter's tolerance.
             "mode" => {}
             unknown => {
                 return Err(format!(
                     "unsupported filter operator '{}' for field '{}'",
-                    unknown, key
+                    unknown, label
                 ));
             }
         }
@@ -565,19 +618,152 @@ fn build_field_condition(
     Ok(parts)
 }
 
+/// Build a SQL HAVING clause from `group_by` `having` filters without model metadata.
+pub fn try_build_having(
+    having: &Value,
+    by_fields: &[String],
+    dialect: Dialect,
+    ph: &dyn Fn(usize) -> String,
+) -> std::result::Result<Where, String> {
+    try_build_having_with_model(having, by_fields, "", dialect, ph)
+}
+
+/// Build a SQL HAVING clause supporting `_count`, `_sum`, `_avg`, `_min`, `_max`,
+/// grouped scalar fields, and `AND`/`OR`/`NOT` with model field validation.
+pub fn try_build_having_with_model(
+    having: &Value,
+    by_fields: &[String],
+    model_name: &str,
+    dialect: Dialect,
+    ph: &dyn Fn(usize) -> String,
+) -> std::result::Result<Where, String> {
+    let mut out = Where::default();
+    if having.is_null() {
+        return Ok(out);
+    }
+    let obj = as_object(having).ok_or_else(|| "having clause must be an object".to_string())?;
+    if obj.is_empty() {
+        return Ok(out);
+    }
+    let mut by_set = HashSet::with_capacity(by_fields.len() * 2);
+    for f in by_fields {
+        by_set.insert(f.to_lowercase());
+        by_set.insert(to_snake_case(f));
+    }
+    out.clause = build_having_rec(obj, &by_set, model_name, dialect, &mut out.args, ph, "having_")?;
+    Ok(out)
+}
+
+fn having_aggregate_fn(key: &str) -> Option<&'static str> {
+    match key {
+        "_count" => Some("COUNT"),
+        "_sum" => Some("SUM"),
+        "_avg" => Some("AVG"),
+        "_min" => Some("MIN"),
+        "_max" => Some("MAX"),
+        _ => None,
+    }
+}
+
+fn build_having_rec(
+    having_obj: &Map<String, Value>,
+    by_set: &HashSet<String>,
+    model_name: &str,
+    dialect: Dialect,
+    args: &mut Vec<SqlArg>,
+    ph: &dyn Fn(usize) -> String,
+    prefix: &str,
+) -> std::result::Result<String, String> {
+    if having_obj.is_empty() {
+        return Ok(String::new());
+    }
+    let mut conditions: Vec<String> = Vec::new();
+    let has_fields = !model_name.is_empty() && model_has_fields_metadata(model_name);
+
+    let mut keys: Vec<&String> = having_obj.keys().collect();
+    keys.sort();
+
+    for key in keys {
+        let value = &having_obj[key];
+        match key.as_str() {
+            "AND" | "OR" | "NOT" => {
+                if let Some(clause) = build_logical_group(
+                    key,
+                    value,
+                    |m, sub_prefix| {
+                        build_having_rec(m, by_set, model_name, dialect, args, ph, sub_prefix)
+                    },
+                    prefix,
+                )? {
+                    conditions.push(clause);
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(sql_fn) = having_aggregate_fn(key) {
+            let agg_map = as_object(value)
+                .ok_or_else(|| format!("having '{}' filter must be an object", key))?;
+            let mut fields: Vec<&String> = agg_map.keys().collect();
+            fields.sort();
+            for field in fields {
+                let expr = if field == "_all" {
+                    if key != "_count" {
+                        return Err(format!(
+                            "having '{}' does not support '_all'; specify a field name",
+                            key
+                        ));
+                    }
+                    "COUNT(*)".to_string()
+                } else {
+                    if has_fields && !model_has_field(model_name, field) {
+                        return Err(format!(
+                            "unknown field '{}' in having.{} on model '{}'",
+                            field, key, model_name
+                        ));
+                    }
+                    format!("{}({})", sql_fn, dialect.quote_identifier(field))
+                };
+                let label = format!("{}.{}", key, field);
+                conditions.extend(build_expr_conditions(
+                    &expr,
+                    &label,
+                    &agg_map[field],
+                    dialect,
+                    args,
+                    ph,
+                )?);
+            }
+            continue;
+        }
+
+        if key.starts_with('_') {
+            return Err(format!("unknown having aggregate key '{}'", key));
+        }
+        if has_fields && !model_has_field(model_name, key) {
+            return Err(format!("unknown field '{}' on model '{}'", key, model_name));
+        }
+        if !by_set.is_empty()
+            && !by_set.contains(&key.to_lowercase())
+            && !by_set.contains(&to_snake_case(key))
+        {
+            return Err(format!(
+                "field '{}' in having must be included in group_by 'by' fields or wrapped in an aggregate (_count, _sum, _avg, _min, _max)",
+                key
+            ));
+        }
+        let col = dialect.quote_identifier(key);
+        conditions.extend(build_expr_conditions(&col, key, value, dialect, args, ph)?);
+    }
+
+    Ok(conditions.join(" AND "))
+}
+
 fn push_arg(args: &mut Vec<SqlArg>, value: SqlArg, ph: &dyn Fn(usize) -> String) -> String {
     let n = args.len() + 1;
     args.push(value);
     ph(n)
-}
-
-/// Rewrites the most recently pushed arg, used by the LIKE operators which need
-/// to wrap the value in wildcards after the placeholder has been allocated.
-fn wrap_last_arg(args: &mut Vec<SqlArg>, f: impl Fn(&SqlArg) -> String) {
-    if let Some(last) = args.last_mut() {
-        let wrapped = f(last);
-        *last = Value::String(wrapped);
-    }
 }
 
 fn normalize_sort_direction(dir: &Value) -> &'static str {
@@ -798,6 +984,103 @@ mod tests {
         });
         let w_rev = try_build_where_with_model(&json!({ "user": { "is": { "id": "u1" } } }), "Order", Dialect::Sqlite, &q).unwrap();
         assert!(w_rev.clause.contains("r_user_.\"id\" = \"orders\".\"user_id\""));
+
+        set_adapter_metadata(AdapterMetadata::default());
+    }
+
+    #[test]
+    fn mode_insensitive_and_having_builders() {
+        use super::super::metadata::{set_adapter_metadata, AdapterMetadata, TEST_METADATA_LOCK};
+        let _guard = TEST_METADATA_LOCK.lock().unwrap();
+        setup_relation_metadata();
+
+        let pg_ph = |n: usize| format!("${}", n);
+        let pg_pattern = try_build_where_with_model(
+            &json!({ "email": { "contains": "Alice", "mode": "insensitive" } }),
+            "User",
+            Dialect::Postgres,
+            &pg_ph,
+        )
+        .unwrap();
+        assert_eq!(pg_pattern.clause, "\"email\" ILIKE $1");
+        assert_eq!(pg_pattern.args, vec![json!("%Alice%")]);
+
+        let sqlite_in = try_build_where_with_model(
+            &json!({ "email": { "in": ["ALICE@EXAMPLE.COM"], "mode": "insensitive" } }),
+            "User",
+            Dialect::Sqlite,
+            &q,
+        )
+        .unwrap();
+        assert_eq!(sqlite_in.clause, "LOWER(\"email\") IN (LOWER(?1))");
+
+        let mssql_sw = try_build_where_with_model(
+            &json!({ "email": { "startsWith": "Bob", "mode": "insensitive" } }),
+            "User",
+            Dialect::Mssql,
+            &q,
+        )
+        .unwrap();
+        assert_eq!(mssql_sw.clause, "LOWER([email]) LIKE LOWER(?1)");
+
+        // HAVING builder across dialects
+        let pg_having = try_build_having_with_model(
+            &json!({
+                "OR": [
+                    { "_count": { "_all": { "gte": 2 } }, "_sum": { "total": { "gt": 100 } } },
+                    { "userId": "u1" }
+                ]
+            }),
+            &["userId".to_string()],
+            "Order",
+            Dialect::Postgres,
+            &|n| format!("${}", n + 1),
+        )
+        .unwrap();
+        assert_eq!(
+            pg_having.clause,
+            "(COUNT(*) >= $2 AND SUM(\"total\") > $3 OR \"userId\" = $4)"
+        );
+        assert_eq!(pg_having.args, vec![json!(2), json!(100), json!("u1")]);
+
+        // Strict validation errors
+        for bad in [
+            json!({ "missingCol": "x" }),
+            json!({ "email": ["a"] }),
+            json!({ "email": { "mode": "fuzzy", "contains": "a" } }),
+            json!({ "email": { "not": ["a"] } }),
+            json!({ "email": { "equals": { "x": 1 } } }),
+            json!({ "email": { "contains": 123 } }),
+            json!({ "email": { "in": "not-array" } }),
+            json!({ "OR": "not-array" }),
+        ] {
+            assert!(
+                try_build_where_with_model(&bad, "User", Dialect::Sqlite, &q).is_err(),
+                "expected error for {}",
+                bad
+            );
+        }
+
+        for bad_having in [
+            json!({ "total": { "gt": 10 } }),
+            json!({ "_sum": { "_all": 10 } }),
+            json!({ "_median": { "total": 10 } }),
+            json!({ "_sum": { "unknownField": 10 } }),
+            json!({ "_count": 5 }),
+        ] {
+            assert!(
+                try_build_having_with_model(
+                    &bad_having,
+                    &["userId".to_string()],
+                    "Order",
+                    Dialect::Sqlite,
+                    &q,
+                )
+                .is_err(),
+                "expected having error for {}",
+                bad_having
+            );
+        }
 
         set_adapter_metadata(AdapterMetadata::default());
     }

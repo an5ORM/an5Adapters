@@ -40,8 +40,8 @@ pub use base::{
     add_table_override, build_order_by, build_where, build_where_with_model, cosine_similarity,
     dot_product, euclidean_distance, get_fields_for_model, get_model_to_table,
     get_relations_for_model, resolve_relation_for_model, resolve_relation_keys, resolve_table,
-    set_adapter_metadata, to_snake_case, try_build_where_with_model, vector_distance,
-    AdapterMetadata, Dialect, RelationDef, Where,
+    set_adapter_metadata, to_snake_case, try_build_having, try_build_having_with_model,
+    try_build_where_with_model, vector_distance, AdapterMetadata, Dialect, RelationDef, Where,
 };
 pub use vector::{
     detect_vector_provider, is_vector_connection_string, HttpVectorClient, StdHttpTransport,

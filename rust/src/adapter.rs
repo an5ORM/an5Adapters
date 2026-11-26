@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use crate::base::{
     build_order_by, decode_vector, encode_vector, get_fields_for_model, is_vector_field,
     needs_vector_encoding, resolve_relation_for_model, resolve_relation_keys, resolve_table,
-    set_adapter_metadata, try_build_where_with_model, vector_distance, AdapterMetadata, Dialect,
-    Where,
+    set_adapter_metadata, try_build_having_with_model, try_build_where_with_model,
+    vector_distance, AdapterMetadata, Dialect, Where,
 };
 use crate::base::vectors::{
     distance_function, normalize_metric, plan_vector_strategies, STRATEGY_SQLITE_VEC, STRATEGY_UDF,
@@ -190,9 +190,11 @@ pub struct GroupByArgs {
     /// Column name or list of column names.
     pub by: Option<Value>,
     pub r#where: Option<Value>,
+    pub having: Option<Value>,
     pub order_by: Option<Value>,
     pub skip: i64,
     pub take: i64,
+    pub count: Option<Value>,
     pub sum: Option<Value>,
     pub avg: Option<Value>,
     pub min: Option<Value>,
@@ -588,6 +590,8 @@ impl TableClient {
                 push_clauses(&mut sql, &w, &order, "");
                 if args.take > 0 {
                     sql.push_str(&format!(" LIMIT {}", args.take));
+                } else if d == Dialect::Sqlite {
+                    sql.push_str(" LIMIT -1");
                 } else {
                     sql.push_str(" LIMIT ALL");
                 }
@@ -781,52 +785,52 @@ impl TableClient {
         }
     }
 
+    fn build_having(
+        &self,
+        having_value: &Option<Value>,
+        by_fields: &[String],
+        offset: usize,
+    ) -> Result<Where> {
+        match having_value {
+            Some(v) => try_build_having_with_model(
+                v,
+                by_fields,
+                &self.table_name,
+                self.adapter.dialect,
+                &|n| self.ph(n + offset),
+            )
+            .map_err(|e| e.into()),
+            None => Ok(Where::default()),
+        }
+    }
+
     /// Aggregations over matching rows.
     pub async fn aggregate(&self, args: &AggregateArgs) -> Result<RowMap> {
         let w = self.build_where(&args.r#where)?;
         let mut select = String::from("COUNT(*) AS _count");
-        if let Some(Value::Array(cols)) = &args.sum {
-            for c in cols {
-                if let Some(name) = c.as_str() {
-                    select.push_str(&format!(
-                        ", SUM({}) AS _sum_{}",
-                        self.adapter.dialect.quote_identifier(name),
-                        name
-                    ));
-                }
+        for name in selected_aggregate_fields(&args.count) {
+            if name != "_all" {
+                select.push_str(&format!(
+                    ", COUNT({}) AS _count_{}",
+                    self.adapter.dialect.quote_identifier(&name),
+                    name
+                ));
             }
         }
-        if let Some(Value::Array(cols)) = &args.avg {
-            for c in cols {
-                if let Some(name) = c.as_str() {
-                    select.push_str(&format!(
-                        ", AVG({}) AS _avg_{}",
-                        self.adapter.dialect.quote_identifier(name),
-                        name
-                    ));
-                }
-            }
-        }
-        if let Some(Value::Array(cols)) = &args.min {
-            for c in cols {
-                if let Some(name) = c.as_str() {
-                    select.push_str(&format!(
-                        ", MIN({}) AS _min_{}",
-                        self.adapter.dialect.quote_identifier(name),
-                        name
-                    ));
-                }
-            }
-        }
-        if let Some(Value::Array(cols)) = &args.max {
-            for c in cols {
-                if let Some(name) = c.as_str() {
-                    select.push_str(&format!(
-                        ", MAX({}) AS _max_{}",
-                        self.adapter.dialect.quote_identifier(name),
-                        name
-                    ));
-                }
+        for (agg, values) in [
+            ("SUM", &args.sum),
+            ("AVG", &args.avg),
+            ("MIN", &args.min),
+            ("MAX", &args.max),
+        ] {
+            for name in selected_aggregate_fields(values) {
+                select.push_str(&format!(
+                    ", {}({}) AS _{}_{}",
+                    agg,
+                    self.adapter.dialect.quote_identifier(&name),
+                    agg.to_lowercase(),
+                    name
+                ));
             }
         }
 
@@ -857,32 +861,40 @@ impl TableClient {
             return Err("group_by requires at least one column".into());
         }
 
-        let mut select: Vec<String> = cols
+        let by_cols: Vec<String> = cols
             .iter()
             .map(|c| self.adapter.dialect.quote_identifier(c))
             .collect();
+        let mut select = by_cols.clone();
+        select.push("COUNT(*) AS _count".to_string());
+        for name in selected_aggregate_fields(&args.count) {
+            if name != "_all" {
+                select.push(format!(
+                    "COUNT({}) AS _count_{}",
+                    self.adapter.dialect.quote_identifier(&name),
+                    name
+                ));
+            }
+        }
         for (agg, values) in [
             ("SUM", &args.sum),
             ("AVG", &args.avg),
             ("MIN", &args.min),
             ("MAX", &args.max),
         ] {
-            if let Some(Value::Array(items)) = values {
-                for item in items {
-                    if let Some(name) = item.as_str() {
-                        select.push(format!(
-                            "{}({}) AS {}_{}",
-                            agg,
-                            self.adapter.dialect.quote_identifier(name),
-                            agg.to_lowercase(),
-                            name
-                        ));
-                    }
-                }
+            for name in selected_aggregate_fields(values) {
+                select.push(format!(
+                    "{}({}) AS {}_{}",
+                    agg,
+                    self.adapter.dialect.quote_identifier(&name),
+                    agg.to_lowercase(),
+                    name
+                ));
             }
         }
 
-        let w = self.build_where(&args.r#where)?;
+        let mut w = self.build_where(&args.r#where)?;
+        let h = self.build_having(&args.having, &cols, w.args.len())?;
         let mut sql = format!(
             "SELECT {} FROM {}{}",
             select.join(", "),
@@ -892,27 +904,45 @@ impl TableClient {
         if !w.is_empty() {
             sql.push_str(&format!(" WHERE {}", w.clause));
         }
-        sql.push_str(&format!(
-            " GROUP BY {}",
-            cols
-                .iter()
-                .map(|c| self.adapter.dialect.quote_identifier(c))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        if let Some(ob) = &args.order_by {
-            let order = build_order_by(ob, self.adapter.dialect);
-            if !order.is_empty() {
-                sql.push(' ');
-                sql.push_str(&order);
-            }
+        sql.push_str(&format!(" GROUP BY {}", by_cols.join(", ")));
+        if !h.is_empty() {
+            sql.push_str(&format!(" HAVING {}", h.clause));
+            w.args.extend(h.args);
         }
-        if self.adapter.dialect.supports_limit_offset() {
-            if args.take > 0 {
-                sql.push_str(&format!(" LIMIT {}", args.take));
-            }
-            if args.skip > 0 {
-                sql.push_str(&format!(" OFFSET {}", args.skip));
+
+        let order = args
+            .order_by
+            .as_ref()
+            .map(|ob| build_order_by(ob, self.adapter.dialect))
+            .unwrap_or_default();
+        if !order.is_empty() {
+            sql.push(' ');
+            sql.push_str(&order);
+        } else if args.take > 0 || args.skip > 0 {
+            sql.push_str(&format!(" ORDER BY {}", by_cols.join(", ")));
+        }
+
+        if args.take > 0 || args.skip > 0 {
+            let skip = args.skip.max(0);
+            let d = self.adapter.dialect;
+            if d.supports_limit_offset() {
+                if args.take > 0 {
+                    sql.push_str(&format!(" LIMIT {}", args.take));
+                } else if skip > 0 {
+                    sql.push_str(if d == Dialect::Sqlite {
+                        " LIMIT -1"
+                    } else {
+                        " LIMIT ALL"
+                    });
+                }
+                if skip > 0 {
+                    sql.push_str(&format!(" OFFSET {}", skip));
+                }
+            } else {
+                sql.push_str(&format!(" OFFSET {} ROWS", skip));
+                if args.take > 0 {
+                    sql.push_str(&format!(" FETCH NEXT {} ROWS ONLY", args.take));
+                }
             }
         }
 
@@ -1411,6 +1441,29 @@ fn project_fields(row: &mut RowMap, select: &Value) {
     *row = projected;
     if let Some(c) = count {
         row.insert("_count".to_string(), c);
+    }
+}
+
+/// Extracts selected field names from an array, string, or truthy object map.
+fn selected_aggregate_fields(value: &Option<Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()))
+            .collect(),
+        Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+        Some(Value::Object(m)) => {
+            let mut keys: Vec<String> = m
+                .iter()
+                .filter_map(|(k, v)| match v {
+                    Value::Bool(true) => Some(k.clone()),
+                    _ => None,
+                })
+                .collect();
+            keys.sort();
+            keys
+        }
+        _ => Vec::new(),
     }
 }
 
