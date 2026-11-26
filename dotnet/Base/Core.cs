@@ -549,23 +549,45 @@ public enum Dialect
             return parts.Count > 0 ? string.Join(" AND ", parts) : null;
         }
 
+        private static readonly Dictionary<string, string> AggregateHavingOps = new(StringComparer.Ordinal)
+        {
+            { "_count", "COUNT" },
+            { "_sum", "SUM" },
+            { "_avg", "AVG" },
+            { "_min", "MIN" },
+            { "_max", "MAX" },
+        };
+
+        private static bool IsNonScalarCollection(object value)
+        {
+            if (value == null || value is string || value is byte[]) return false;
+            return value is System.Collections.IEnumerable;
+        }
+
         private static List<string> BuildFieldConditions(string col, string key, object value, Dictionary<string, object> parameters, Dialect dialect, string prefix, string modelName, string selfRef, string colPrefix)
         {
-            if (value == null)
-                return new List<string> { $"{col} IS NULL" };
+            return BuildExprConditions(col, key, value, parameters, dialect, prefix);
+        }
 
-            var baseName = SanitizeParamName($"{prefix}{key}");
+        private static List<string> BuildExprConditions(string expr, string label, object value, Dictionary<string, object> parameters, Dialect dialect, string prefix, bool inheritedInsensitive = false)
+        {
+            if (value == null)
+                return new List<string> { $"{expr} IS NULL" };
+
+            var baseName = SanitizeParamName($"{prefix}{label}");
             if (!(value is Dictionary<string, object> opMap))
             {
+                if (IsNonScalarCollection(value))
+                    throw new ArgumentException($"Filter value for '{label}' must be a scalar value, not a collection.");
                 parameters[baseName] = value;
-                return new List<string> { $"{col} = {Placeholder(baseName)}" };
+                return new List<string> { $"{expr} = {Placeholder(baseName)}" };
             }
 
-            var insensitive = false;
+            var insensitive = inheritedInsensitive;
             if (opMap.TryGetValue("mode", out var modeVal))
             {
                 if (!(modeVal is string modeStr) || (modeStr != "default" && modeStr != "insensitive"))
-                    throw new ArgumentException($"Invalid filter mode '{modeVal}' for field '{key}'.");
+                    throw new ArgumentException($"Invalid filter mode '{modeVal}' for field '{label}'.");
                 insensitive = modeStr == "insensitive";
             }
 
@@ -573,7 +595,7 @@ public enum Dialect
             foreach (var op in SortedKeys(opMap))
             {
                 if (!OperatorKeySet.Contains(op))
-                    throw new ArgumentException($"Unsupported filter operator '{op}' for field '{key}'.");
+                    throw new ArgumentException($"Unsupported filter operator '{op}' for field '{label}'.");
                 if (op == "mode") continue;
 
                 var opVal = opMap[op];
@@ -582,110 +604,226 @@ public enum Dialect
                     case "not":
                         if (opVal == null)
                         {
-                            conditions.Add($"{col} IS NOT NULL");
+                            conditions.Add($"{expr} IS NOT NULL");
                         }
                         else if (opVal is Dictionary<string, object> nested)
                         {
-                            var nestedConds = BuildFieldConditions(col, key, nested, parameters, dialect, $"{prefix}{key}_not_", modelName, selfRef, colPrefix);
+                            var nestedConds = BuildExprConditions(expr, label, nested, parameters, dialect, $"{prefix}{SanitizeParamName(label)}_not_", insensitive);
                             if (nestedConds.Count > 0)
                                 conditions.Add("NOT (" + string.Join(" AND ", nestedConds) + ")");
+                        }
+                        else if (IsNonScalarCollection(opVal))
+                        {
+                            throw new ArgumentException($"'not' operator on '{label}' requires a scalar value or operator dictionary.");
                         }
                         else if (insensitive && opVal is string sNot)
                         {
                             parameters[baseName + "_not"] = sNot;
-                            conditions.Add($"LOWER({col}) <> LOWER({Placeholder(baseName + "_not")})");
+                            conditions.Add($"LOWER({expr}) <> LOWER({Placeholder(baseName + "_not")})");
                         }
                         else
                         {
                             parameters[baseName + "_not"] = opVal;
-                            conditions.Add($"{col} <> {Placeholder(baseName + "_not")}");
+                            conditions.Add($"{expr} <> {Placeholder(baseName + "_not")}");
                         }
                         break;
                     case "equals":
                         if (opVal == null)
                         {
-                            conditions.Add($"{col} IS NULL");
+                            conditions.Add($"{expr} IS NULL");
+                        }
+                        else if (opVal is System.Collections.IDictionary || IsNonScalarCollection(opVal))
+                        {
+                            throw new ArgumentException($"'equals' operator on '{label}' requires a scalar value.");
                         }
                         else if (insensitive && opVal is string sEq)
                         {
                             parameters[baseName + "_eq"] = sEq;
-                            conditions.Add($"LOWER({col}) = LOWER({Placeholder(baseName + "_eq")})");
+                            conditions.Add($"LOWER({expr}) = LOWER({Placeholder(baseName + "_eq")})");
                         }
                         else
                         {
                             parameters[baseName + "_eq"] = opVal;
-                            conditions.Add($"{col} = {Placeholder(baseName + "_eq")}");
+                            conditions.Add($"{expr} = {Placeholder(baseName + "_eq")}");
                         }
                         break;
                     case "contains":
                         if (!(opVal is string sContains))
-                            throw new ArgumentException($"'contains' operator on field '{key}' requires a string value.");
+                            throw new ArgumentException($"'contains' operator on field '{label}' requires a string value.");
                         parameters[baseName + "_co"] = "%" + sContains + "%";
                         conditions.Add(insensitive
-                            ? $"LOWER({col}) LIKE LOWER({Placeholder(baseName + "_co")})"
-                            : $"{col} LIKE {Placeholder(baseName + "_co")}");
+                            ? $"LOWER({expr}) LIKE LOWER({Placeholder(baseName + "_co")})"
+                            : $"{expr} LIKE {Placeholder(baseName + "_co")}");
                         break;
                     case "startsWith":
                         if (!(opVal is string sStarts))
-                            throw new ArgumentException($"'startsWith' operator on field '{key}' requires a string value.");
+                            throw new ArgumentException($"'startsWith' operator on field '{label}' requires a string value.");
                         parameters[baseName + "_sw"] = sStarts + "%";
                         conditions.Add(insensitive
-                            ? $"LOWER({col}) LIKE LOWER({Placeholder(baseName + "_sw")})"
-                            : $"{col} LIKE {Placeholder(baseName + "_sw")}");
+                            ? $"LOWER({expr}) LIKE LOWER({Placeholder(baseName + "_sw")})"
+                            : $"{expr} LIKE {Placeholder(baseName + "_sw")}");
                         break;
                     case "endsWith":
                         if (!(opVal is string sEnds))
-                            throw new ArgumentException($"'endsWith' operator on field '{key}' requires a string value.");
+                            throw new ArgumentException($"'endsWith' operator on field '{label}' requires a string value.");
                         parameters[baseName + "_ew"] = "%" + sEnds;
                         conditions.Add(insensitive
-                            ? $"LOWER({col}) LIKE LOWER({Placeholder(baseName + "_ew")})"
-                            : $"{col} LIKE {Placeholder(baseName + "_ew")}");
+                            ? $"LOWER({expr}) LIKE LOWER({Placeholder(baseName + "_ew")})"
+                            : $"{expr} LIKE {Placeholder(baseName + "_ew")}");
                         break;
                     case "gte":
-                        parameters[baseName + "_gte"] = opVal;
-                        conditions.Add($"{col} >= {Placeholder(baseName + "_gte")}");
-                        break;
                     case "lte":
-                        parameters[baseName + "_lte"] = opVal;
-                        conditions.Add($"{col} <= {Placeholder(baseName + "_lte")}");
-                        break;
                     case "gt":
-                        parameters[baseName + "_gt"] = opVal;
-                        conditions.Add($"{col} > {Placeholder(baseName + "_gt")}");
-                        break;
                     case "lt":
-                        parameters[baseName + "_lt"] = opVal;
-                        conditions.Add($"{col} < {Placeholder(baseName + "_lt")}");
+                    {
+                        if (opVal == null || opVal is System.Collections.IDictionary || IsNonScalarCollection(opVal))
+                            throw new ArgumentException($"'{op}' operator on '{label}' requires a scalar value.");
+                        var sqlOp = op == "gte" ? ">=" : op == "lte" ? "<=" : op == "gt" ? ">" : "<";
+                        parameters[baseName + "_" + op] = opVal;
+                        conditions.Add($"{expr} {sqlOp} {Placeholder(baseName + "_" + op)}");
                         break;
+                    }
                     case "in":
                     case "notIn":
                     {
-                        if (opVal == null || opVal is string || opVal is System.Collections.IDictionary || !(opVal is System.Collections.IEnumerable seq))
-                            throw new ArgumentException($"'{op}' operator on field '{key}' requires a collection.");
-                        var phs = new List<string>();
-                        var idx = 0;
+                        if (opVal == null || opVal is string || opVal is byte[] || opVal is System.Collections.IDictionary || !(opVal is System.Collections.IEnumerable seq))
+                            throw new ArgumentException($"'{op}' operator on field '{label}' requires a collection.");
+                        var items = new List<object>();
+                        var allStrings = true;
                         foreach (var v in seq)
                         {
-                            var pn = op == "in" ? $"{baseName}_in{idx}" : $"{baseName}_notin{idx}";
-                            parameters[pn] = v;
-                            phs.Add(Placeholder(pn));
-                            idx++;
+                            if (!(v is string)) allStrings = false;
+                            items.Add(v);
                         }
-                        if (phs.Count > 0)
-                        {
-                            conditions.Add(op == "in"
-                                ? $"{col} IN ({string.Join(", ", phs)})"
-                                : $"{col} NOT IN ({string.Join(", ", phs)})");
-                        }
-                        else
+                        if (items.Count == 0)
                         {
                             conditions.Add(op == "in" ? "1=0" : "1=1");
+                            break;
                         }
+                        var useLower = insensitive && allStrings;
+                        var phs = new List<string>(items.Count);
+                        for (var idx = 0; idx < items.Count; idx++)
+                        {
+                            var pn = op == "in" ? $"{baseName}_in{idx}" : $"{baseName}_notin{idx}";
+                            parameters[pn] = items[idx];
+                            var ph = Placeholder(pn);
+                            phs.Add(useLower ? $"LOWER({ph})" : ph);
+                        }
+                        var lhs = useLower ? $"LOWER({expr})" : expr;
+                        conditions.Add(op == "in"
+                            ? $"{lhs} IN ({string.Join(", ", phs)})"
+                            : $"{lhs} NOT IN ({string.Join(", ", phs)})");
                         break;
                     }
                 }
             }
             return conditions;
+        }
+
+        private static string BuildLogicalCondition(
+            string key,
+            object value,
+            string prefix,
+            Func<Dictionary<string, object>, string, string> recurse)
+        {
+            if (value == null)
+                throw new ArgumentException($"'{key}' filter payload must not be null.");
+            System.Collections.IList list;
+            if (key == "OR")
+            {
+                if (!(value is System.Collections.IList orSeq))
+                    throw new ArgumentException("'OR' filter must be a list of dictionaries.");
+                list = orSeq;
+            }
+            else if (value is Dictionary<string, object> singleMap)
+            {
+                list = new object[] { singleMap };
+            }
+            else if (value is System.Collections.IList seq)
+            {
+                list = seq;
+            }
+            else
+            {
+                throw new ArgumentException($"'{key}' filter must be a dictionary or list of dictionaries.");
+            }
+
+            var subs = new List<string>();
+            var i = 0;
+            foreach (var item in list)
+            {
+                if (!(item is Dictionary<string, object> subMap))
+                    throw new ArgumentException($"'{key}' filter entry must be a Dictionary<string, object>.");
+                var s = recurse(subMap, $"{prefix}{key}{i++}_");
+                subs.Add(string.IsNullOrEmpty(s) ? "1=1" : s);
+            }
+            if (subs.Count == 0)
+                return key == "OR" ? "1=0" : "";
+
+            var joiner = key == "AND" ? " AND " : " OR ";
+            var negation = key == "NOT" ? "NOT " : "";
+            return negation + "(" + string.Join(joiner, subs) + ")";
+        }
+
+        public static string BuildHaving(
+            object having,
+            Dictionary<string, object> parameters,
+            Dialect dialect,
+            List<string> byFields,
+            string prefix = "h_",
+            string modelName = null)
+        {
+            if (having == null) return "";
+            if (!(having is Dictionary<string, object> dict))
+                throw new ArgumentException("HAVING clause must be a Dictionary<string, object>.");
+            if (dict.Count == 0) return "";
+
+            var bySet = new HashSet<string>(byFields ?? new List<string>(), StringComparer.OrdinalIgnoreCase);
+            var conditions = new List<string>();
+            foreach (var key in SortedKeys(dict))
+            {
+                var value = dict[key];
+                if (key == "OR" || key == "AND" || key == "NOT")
+                {
+                    var logical = BuildLogicalCondition(key, value, prefix, (sub, nextPrefix) =>
+                        BuildHaving(sub, parameters, dialect, byFields, nextPrefix, modelName));
+                    if (!string.IsNullOrEmpty(logical))
+                        conditions.Add(logical);
+                    continue;
+                }
+
+                if (AggregateHavingOps.TryGetValue(key, out var sqlFn))
+                {
+                    if (!(value is Dictionary<string, object> aggMap))
+                        throw new ArgumentException($"'{key}' having filter must be a Dictionary<string, object>.");
+                    foreach (var field in SortedKeys(aggMap))
+                    {
+                        string expr;
+                        if (field == "_all")
+                        {
+                            if (key != "_count")
+                                throw new ArgumentException($"'_all' is only valid inside '_count' having filter, not '{key}'.");
+                            expr = "COUNT(*)";
+                        }
+                        else
+                        {
+                            if (!string.IsNullOrEmpty(modelName) && An5Metadata.ModelHasFields(modelName) && !An5Metadata.ModelHasField(modelName, field))
+                                throw new ArgumentException($"Unknown field '{field}' on model '{modelName}' in '{key}' having filter.");
+                            expr = $"{sqlFn}({SqlQuote.QuoteName(field, dialect)})";
+                        }
+                        conditions.AddRange(BuildExprConditions(expr, $"{key}_{field}", aggMap[field], parameters, dialect, prefix));
+                    }
+                    continue;
+                }
+
+                if (!string.IsNullOrEmpty(modelName) && An5Metadata.ModelHasFields(modelName) && !An5Metadata.ModelHasField(modelName, key))
+                    throw new ArgumentException($"Unknown field '{key}' on model '{modelName}' in having clause.");
+                if (!bySet.Contains(key))
+                    throw new ArgumentException($"Field '{key}' in having clause must be included in 'by' fields or wrapped in an aggregate filter (_count, _sum, _avg, _min, _max).");
+
+                conditions.AddRange(BuildExprConditions(SqlQuote.QuoteName(key, dialect), key, value, parameters, dialect, prefix));
+            }
+            return string.Join(" AND ", conditions);
         }
 
         public static string ParseWhere(object where, Dictionary<string, object> parameters, Dialect dialect, string prefix = "", string modelName = null, string selfRef = "", string colPrefix = "")
@@ -726,35 +864,10 @@ public enum Dialect
                 var value = clean[key];
                 if (key == "OR" || key == "AND" || key == "NOT")
                 {
-                    if (value == null)
-                        throw new ArgumentException($"'{key}' filter payload must not be null.");
-                    System.Collections.IList list;
-                    if (value is Dictionary<string, object> singleMap)
-                        list = new object[] { singleMap };
-                    else if (value is System.Collections.IList seq)
-                        list = seq;
-                    else
-                        throw new ArgumentException($"'{key}' filter must be a dictionary or list of dictionaries.");
-
-                    var subs = new List<string>();
-                    var i = 0;
-                    foreach (var item in list)
-                    {
-                        if (!(item is Dictionary<string, object> subMap))
-                            throw new ArgumentException($"'{key}' filter entry must be a Dictionary<string, object>.");
-                        var s = ParseWhere(subMap, parameters, dialect, $"{prefix}{key}{i++}_", modelName, selfRef, colPrefix);
-                        subs.Add(string.IsNullOrEmpty(s) ? "1=1" : s);
-                    }
-                    if (subs.Count == 0)
-                    {
-                        if (key == "OR") conditions.Add("1=0");
-                    }
-                    else
-                    {
-                        var joiner = key == "AND" ? " AND " : " OR ";
-                        var negation = key == "NOT" ? "NOT " : "";
-                        conditions.Add(negation + "(" + string.Join(joiner, subs) + ")");
-                    }
+                    var logical = BuildLogicalCondition(key, value, prefix, (sub, nextPrefix) =>
+                        ParseWhere(sub, parameters, dialect, nextPrefix, modelName, selfRef, colPrefix));
+                    if (!string.IsNullOrEmpty(logical))
+                        conditions.Add(logical);
                     continue;
                 }
 

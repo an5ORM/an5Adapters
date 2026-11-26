@@ -221,7 +221,7 @@ namespace An5Orm
         public Dictionary<string, object> Aggregate(AggregateArgs args)
             => _tableClient.Aggregate(args);
 
-        public List<T> GroupBy(GroupByArgs args)
+        public List<Dictionary<string, object>> GroupBy(GroupByArgs args)
             => _tableClient.GroupBy(args);
 
         public T Create(T entity) => throw new NotSupportedException($"View '{ViewName}' is read-only. Create is not allowed.");
@@ -313,9 +313,11 @@ namespace An5Orm
     {
         public object By { get; set; }
         public object Where { get; set; }
+        public object Having { get; set; }
         public object OrderBy { get; set; }
         public int? Skip { get; set; }
         public int? Take { get; set; }
+        public object Count { get; set; }
         public object Sum { get; set; }
         public object Avg { get; set; }
         public object Min { get; set; }
@@ -844,19 +846,7 @@ namespace An5Orm
             var parameters = new Dictionary<string, object>();
             var whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect, "", _modelName);
             var aggs = new List<string>();
-            var countFields = ArgsHelper.SelectedAggregateFields(args.Count);
-            if (countFields.Count == 0 && args.Count != null && args.Count is not bool)
-            {
-                // noop
-            }
-            if (args.Count != null)
-            {
-                if (countFields.Count == 0)
-                    aggs.Add("COUNT(*) AS cnt_all");
-                else
-                    foreach (var f in countFields)
-                        aggs.Add($"COUNT({SqlQuote.QuoteName(f, _dialect)}) AS cnt_{ArgsHelper_Sanitize(f)}");
-            }
+            AddCountAggregates(aggs, args.Count, defaultAll: false, allAlias: "cnt_all");
             AddAggregates(aggs, "SUM", args.Sum);
             AddAggregates(aggs, "AVG", args.Avg);
             AddAggregates(aggs, "MIN", args.Min);
@@ -869,33 +859,100 @@ namespace An5Orm
             var rows = _adapter.QueryRaw(sql, parameters);
             var row = rows.Count > 0 ? rows[0] : new Dictionary<string, object>();
             var result = new Dictionary<string, object>();
-
-            if (args.Count != null)
-            {
-                var all = ToNumber(row.TryGetValue("cnt_all", out var ca) ? ca : row.TryGetValue("_count", out var cc) ? cc : 0);
-                var countRes = new Dictionary<string, object> { { "_all", all } };
-                foreach (var f in countFields)
-                {
-                    if (f == "_all") continue;
-                    var v = row.TryGetValue("cnt_" + ArgsHelper_Sanitize(f), out var cv) ? cv : all;
-                    countRes[f] = ToNumber(v);
-                }
-                result["_count"] = countRes;
-            }
-            AddAggregateResult(result, "sum", "SUM", args.Sum, row);
-            AddAggregateResult(result, "avg", "AVG", args.Avg, row);
-            AddAggregateResult(result, "min", "MIN", args.Min, row);
-            AddAggregateResult(result, "max", "MAX", args.Max, row);
+            ShapeAggregateResult(result, row, args.Count, args.Sum, args.Avg, args.Min, args.Max, isGroupBy: false);
             return result;
+        }
+
+        private void AddCountAggregates(List<string> aggs, object countSpec, bool defaultAll, string allAlias)
+        {
+            if (countSpec is bool bFalse && !bFalse) return;
+            if (countSpec == null)
+            {
+                if (defaultAll) aggs.Add($"COUNT(*) AS {allAlias}");
+                return;
+            }
+            var fields = ArgsHelper.SelectedAggregateFields(countSpec);
+            if (countSpec is bool || fields.Count == 0 || fields.Contains("_all") || defaultAll)
+                aggs.Add($"COUNT(*) AS {allAlias}");
+            foreach (var f in fields)
+            {
+                if (f == "_all") continue;
+                ValidateAggregateField(f, "_count");
+                aggs.Add($"COUNT({SqlQuote.QuoteName(f, _dialect)}) AS cnt_{ArgsHelper_Sanitize(f)}");
+            }
         }
 
         private void AddAggregates(List<string> aggs, string op, object fields)
         {
             foreach (var f in ArgsHelper.SelectedAggregateFields(fields))
+            {
+                ValidateAggregateField(f, "_" + op.ToLowerInvariant());
                 aggs.Add($"{op}({SqlQuote.QuoteName(f, _dialect)}) AS {op.ToLowerInvariant()}_{ArgsHelper_Sanitize(f)}");
+            }
         }
 
-        private void AddAggregateResult(Dictionary<string, object> result, string key, string op, object fields, Dictionary<string, object> row)
+        private void ValidateAggregateField(string field, string section)
+        {
+            if (An5Metadata.ModelHasFields(_modelName) && !An5Metadata.ModelHasField(_modelName, field))
+                throw new ArgumentException($"Unknown field '{field}' on model '{_modelName}' in '{section}'.");
+        }
+
+        private static bool TryGetRowValue(Dictionary<string, object> row, string key, out object value)
+        {
+            value = null;
+            if (row == null || string.IsNullOrEmpty(key)) return false;
+            if (row.TryGetValue(key, out value)) return true;
+            foreach (var kv in row)
+            {
+                if (string.Equals(kv.Key, key, StringComparison.OrdinalIgnoreCase))
+                {
+                    value = kv.Value;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void ShapeAggregateResult(
+            Dictionary<string, object> result,
+            Dictionary<string, object> row,
+            object countSpec,
+            object sumSpec,
+            object avgSpec,
+            object minSpec,
+            object maxSpec,
+            bool isGroupBy)
+        {
+            if (!(countSpec is bool bFalse && !bFalse) && (countSpec != null || isGroupBy))
+            {
+                var countFields = ArgsHelper.SelectedAggregateFields(countSpec);
+                var hasAll = TryGetRowValue(row, "cnt_all", out var ca) || TryGetRowValue(row, "_count", out ca);
+                var all = ToNumber(hasAll ? ca : 0);
+                if (countFields.Count > 0)
+                {
+                    var countRes = new Dictionary<string, object> { { "_all", all } };
+                    foreach (var f in countFields)
+                    {
+                        if (f == "_all") continue;
+                        var v = TryGetRowValue(row, "cnt_" + ArgsHelper_Sanitize(f), out var cv) ? cv : all;
+                        countRes[f] = ToNumber(v);
+                    }
+                    result["_count"] = countRes;
+                }
+                else
+                {
+                    result["_count"] = isGroupBy
+                        ? (object)all
+                        : new Dictionary<string, object> { { "_all", all } };
+                }
+            }
+            AddAggregateResult(result, "sum", sumSpec, row, coerceNumber: true);
+            AddAggregateResult(result, "avg", avgSpec, row, coerceNumber: true);
+            AddAggregateResult(result, "min", minSpec, row, coerceNumber: false);
+            AddAggregateResult(result, "max", maxSpec, row, coerceNumber: false);
+        }
+
+        private void AddAggregateResult(Dictionary<string, object> result, string key, object fields, Dictionary<string, object> row, bool coerceNumber)
         {
             var list = ArgsHelper.SelectedAggregateFields(fields);
             if (list.Count == 0) return;
@@ -903,8 +960,8 @@ namespace An5Orm
             foreach (var f in list)
             {
                 var kk = key + "_" + ArgsHelper_Sanitize(f);
-                var v = row.TryGetValue(kk, out var rv) ? rv : null;
-                sub[f] = v == null ? null : ToNumber(v);
+                var v = TryGetRowValue(row, kk, out var rv) ? rv : null;
+                sub[f] = v == null ? null : (coerceNumber ? (object)ToNumber(v) : v);
             }
             result["_" + key] = sub;
         }
@@ -917,25 +974,37 @@ namespace An5Orm
             try { return Convert.ToDouble(v); } catch { return 0; }
         }
 
-        public List<T> GroupBy(GroupByArgs args)
+        public List<Dictionary<string, object>> GroupBy(GroupByArgs args)
         {
             args ??= new GroupByArgs();
             var byFields = ArgsHelper.NormalizeByFields(args.By);
             if (byFields.Count == 0)
                 throw new InvalidOperationException("groupBy requires 'by' fields");
+            if (An5Metadata.ModelHasFields(_modelName))
+            {
+                foreach (var f in byFields)
+                {
+                    if (!An5Metadata.ModelHasField(_modelName, f))
+                        throw new ArgumentException($"Unknown field '{f}' on model '{_modelName}' in groupBy 'by'.");
+                }
+            }
 
             var parameters = new Dictionary<string, object>();
             var whereSql = SqlBuilder.ParseWhere(args.Where, parameters, _dialect, "", _modelName);
+            var havingSql = SqlBuilder.BuildHaving(args.Having, parameters, _dialect, byFields, "h_", _modelName);
             var byCols = string.Join(", ", byFields.ConvertAll(f => SqlQuote.QuoteName(f, _dialect)));
-            var aggs = new List<string> { "COUNT(*) AS _count" };
+            var aggs = new List<string>();
+            AddCountAggregates(aggs, args.Count, defaultAll: true, allAlias: "_count");
             AddAggregates(aggs, "SUM", args.Sum);
             AddAggregates(aggs, "AVG", args.Avg);
             AddAggregates(aggs, "MIN", args.Min);
             AddAggregates(aggs, "MAX", args.Max);
 
-            var query = $"SELECT {byCols}, {string.Join(", ", aggs)} FROM {_tableName}";
+            var selectCols = aggs.Count > 0 ? $"{byCols}, {string.Join(", ", aggs)}" : byCols;
+            var query = $"SELECT {selectCols} FROM {_tableName}{Nolock}";
             if (!string.IsNullOrEmpty(whereSql)) query += $" WHERE {whereSql}";
             query += $" GROUP BY {byCols}";
+            if (!string.IsNullOrEmpty(havingSql)) query += $" HAVING {havingSql}";
 
             var orderSql = SqlBuilder.BuildOrderBy(args.OrderBy, _dialect);
             var hasSkip = args.Skip != null;
@@ -945,19 +1014,30 @@ namespace An5Orm
             if (hasSkip || hasTake)
             {
                 var skip = args.Skip ?? 0;
-                var take = args.Take ?? 1;
-                if (_dialect == Dialect.Postgres)
+                if (UsesLimitOffset)
                 {
-                    if (hasTake) query += $" LIMIT {take}";
-                    query += $" OFFSET {skip}";
+                    if (hasTake) query += $" LIMIT {args.Take.Value}";
+                    else if (hasSkip) query += _dialect == Dialect.Sqlite ? " LIMIT -1" : " LIMIT ALL";
+                    if (hasSkip) query += $" OFFSET {skip}";
                 }
                 else
                 {
                     query += $" OFFSET {skip} ROWS";
-                    if (hasTake) query += $" FETCH NEXT {take} ROWS ONLY";
+                    if (hasTake) query += $" FETCH NEXT {args.Take.Value} ROWS ONLY";
                 }
             }
-            return _adapter.QueryRaw<T>(query, parameters);
+
+            var rawRows = _adapter.QueryRaw(query, parameters);
+            var reshaped = new List<Dictionary<string, object>>(rawRows.Count);
+            foreach (var row in rawRows)
+            {
+                var item = new Dictionary<string, object>();
+                foreach (var f in byFields)
+                    item[f] = GetDictValue(row, f);
+                ShapeAggregateResult(item, row, args.Count, args.Sum, args.Avg, args.Min, args.Max, isGroupBy: true);
+                reshaped.Add(item);
+            }
+            return reshaped;
         }
 
         // ── ORM-standard VectorSearch ──────────────────────────────────────────

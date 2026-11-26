@@ -38,6 +38,14 @@ public class RelOrder
     public string Status { get; set; }
 }
 
+public class GrpOrder
+{
+    public int Id { get; set; }
+    public string Status { get; set; }
+    public int Total { get; set; }
+    public string Note { get; set; }
+}
+
 internal static class Program
 {
     private static int _failed;
@@ -379,6 +387,7 @@ internal static class Program
                 { "Order", "dbo.rel_orders" },
                 { "OrderItem", "dbo.rel_order_items" },
                 { "Profile", "dbo.rel_profiles" },
+                { "GrpOrder", "dbo.grp_orders" },
             },
             ModelFields = new Dictionary<string, object>
             {
@@ -386,6 +395,7 @@ internal static class Program
                 { "Order", new Dictionary<string, bool> { { "id", true }, { "user_id", true }, { "total", true }, { "status", true } } },
                 { "OrderItem", new Dictionary<string, bool> { { "id", true }, { "order_id", true }, { "sku", true } } },
                 { "Profile", new Dictionary<string, bool> { { "id", true }, { "user_id", true }, { "bio", true } } },
+                { "GrpOrder", new Dictionary<string, bool> { { "id", true }, { "status", true }, { "total", true }, { "note", true } } },
             },
             RelationMap = new Dictionary<string, Dictionary<string, RelationDef>>
             {
@@ -560,11 +570,162 @@ INSERT INTO rel_order_items VALUES (1000,100,'AN5-PRO'),(1001,102,'BASIC');";
                 usersTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "unknown_field", "x" } } }));
             CheckThrows<ArgumentException>("reject non-dict where", () =>
                 usersTbl.FindMany(new FindManyArgs { Where = "not-a-dict" }));
+
+            GroupByHavingAndInsensitiveFilters(adapter);
         }
         finally
         {
             An5AdapterMetadata.Set(new AdapterMetadata());
         }
+    }
+
+    private static void GroupByHavingAndInsensitiveFilters(An5Adapter adapter)
+    {
+        Console.WriteLine("\n[groupBy having, per-field count, insensitive in/notIn, strict scalar validation]");
+        adapter.ExecuteRaw(@"
+CREATE TABLE grp_orders (id INTEGER PRIMARY KEY, status TEXT, total INTEGER, note TEXT);
+INSERT INTO grp_orders VALUES
+  (1, 'paid', 150, 'vip'),
+  (2, 'paid', 50, NULL),
+  (3, 'open', 120, 'hold'),
+  (4, 'cancelled', 40, NULL);");
+
+        var grpTbl = adapter.Table<GrpOrder>("GrpOrder");
+
+        // Case-insensitive in / notIn
+        var inCi = grpTbl.FindMany(new FindManyArgs
+        {
+            Where = new Dictionary<string, object>
+            {
+                { "status", new Dictionary<string, object> { { "in", new List<object> { "PAID", "OPEN" } }, { "mode", "insensitive" } } },
+            },
+            OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+        });
+        Check("in mode=insensitive ids", string.Join(",", inCi.Select(r => r.Id)), "1,2,3");
+
+        var notInCi = grpTbl.FindMany(new FindManyArgs
+        {
+            Where = new Dictionary<string, object>
+            {
+                { "status", new Dictionary<string, object> { { "notIn", new List<object> { "PAID" } }, { "mode", "insensitive" } } },
+            },
+            OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+        });
+        Check("notIn mode=insensitive ids", string.Join(",", notInCi.Select(r => r.Id)), "3,4");
+
+        // Aggregate with per-field _count and string min/max preservation
+        var agg = grpTbl.Aggregate(new AggregateArgs
+        {
+            Count = new Dictionary<string, object> { { "_all", true }, { "note", true } },
+            Sum = new List<string> { "total" },
+            Avg = new List<string> { "total" },
+            Min = new List<string> { "status", "total" },
+            Max = new List<string> { "status", "total" },
+        });
+        var aggCount = (Dictionary<string, object>)agg["_count"];
+        var aggMin = (Dictionary<string, object>)agg["_min"];
+        var aggMax = (Dictionary<string, object>)agg["_max"];
+        var aggSum = (Dictionary<string, object>)agg["_sum"];
+        var aggAvg = (Dictionary<string, object>)agg["_avg"];
+        Check("aggregate _count._all", aggCount["_all"], 4);
+        Check("aggregate _count.note", aggCount["note"], 2);
+        Check("aggregate _min.status string", aggMin["status"], "cancelled");
+        Check("aggregate _max.status string", aggMax["status"], "paid");
+        Check("aggregate _sum.total", aggSum["total"], 360);
+        Check("aggregate _avg.total", aggAvg["total"], 90);
+
+        // GroupBy with Having (OR, NOT, _count._all, _sum), per-field _count, OrderBy
+        var grouped = grpTbl.GroupBy(new GroupByArgs
+        {
+            By = new List<string> { "status" },
+            Count = new Dictionary<string, object> { { "_all", true }, { "note", true } },
+            Sum = new List<string> { "total" },
+            Avg = new List<string> { "total" },
+            Min = new List<string> { "total" },
+            Max = new List<string> { "total" },
+            Having = new Dictionary<string, object>
+            {
+                { "OR", new List<object>
+                    {
+                        new Dictionary<string, object> { { "_count", new Dictionary<string, object> { { "_all", new Dictionary<string, object> { { "gte", 2 } } } } } },
+                        new Dictionary<string, object> { { "_sum", new Dictionary<string, object> { { "total", new Dictionary<string, object> { { "gte", 120 } } } } } },
+                    }
+                },
+                { "NOT", new Dictionary<string, object> { { "status", "cancelled" } } },
+            },
+            OrderBy = new Dictionary<string, object> { { "status", "asc" } },
+        });
+        Check("groupBy having statuses", string.Join(",", grouped.Select(r => r["status"])), "open,paid");
+        var paid = grouped[1];
+        var paidCount = (Dictionary<string, object>)paid["_count"];
+        var paidSum = (Dictionary<string, object>)paid["_sum"];
+        var paidAvg = (Dictionary<string, object>)paid["_avg"];
+        var paidMin = (Dictionary<string, object>)paid["_min"];
+        var paidMax = (Dictionary<string, object>)paid["_max"];
+        Check("paid _count._all", paidCount["_all"], 2);
+        Check("paid _count.note", paidCount["note"], 1);
+        Check("paid _sum.total", paidSum["total"], 200);
+        Check("paid _avg.total", paidAvg["total"], 100);
+        Check("paid _min.total", paidMin["total"], 50);
+        Check("paid _max.total", paidMax["total"], 150);
+
+        // GroupBy with grouped scalar field in Having using insensitive IN
+        var paidOnly = grpTbl.GroupBy(new GroupByArgs
+        {
+            By = new List<string> { "status" },
+            Having = new Dictionary<string, object>
+            {
+                { "status", new Dictionary<string, object> { { "in", new List<object> { "PAID" } }, { "mode", "insensitive" } } },
+                { "_count", new Dictionary<string, object> { { "note", 1 } } },
+                { "_min", new Dictionary<string, object> { { "total", new Dictionary<string, object> { { "lte", 50 } } } } },
+            },
+        });
+        Check("groupBy having grouped scalar + _count.note + _min", string.Join(",", paidOnly.Select(r => r["status"])), "paid");
+
+        // GroupBy offset-only pagination on SQLite (LIMIT -1 OFFSET 1)
+        var offsetOnly = grpTbl.GroupBy(new GroupByArgs
+        {
+            By = new List<string> { "status" },
+            OrderBy = new Dictionary<string, object> { { "status", "asc" } },
+            Skip = 1,
+        });
+        Check("groupBy skip-only statuses", string.Join(",", offsetOnly.Select(r => r["status"])), "open,paid");
+
+        // Strict validation rejections
+        CheckThrows<ArgumentException>("reject ungrouped scalar in having", () =>
+            grpTbl.GroupBy(new GroupByArgs
+            {
+                By = new List<string> { "status" },
+                Having = new Dictionary<string, object> { { "total", new Dictionary<string, object> { { "gte", 100 } } } },
+            }));
+        CheckThrows<ArgumentException>("reject _all inside _sum in having", () =>
+            grpTbl.GroupBy(new GroupByArgs
+            {
+                By = new List<string> { "status" },
+                Having = new Dictionary<string, object> { { "_sum", new Dictionary<string, object> { { "_all", 1 } } } },
+            }));
+        CheckThrows<ArgumentException>("reject unknown field in having", () =>
+            grpTbl.GroupBy(new GroupByArgs
+            {
+                By = new List<string> { "status" },
+                Having = new Dictionary<string, object> { { "_count", new Dictionary<string, object> { { "bogus", 1 } } } },
+            }));
+        CheckThrows<ArgumentException>("reject non-list OR in where", () =>
+            grpTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "OR", new Dictionary<string, object> { { "status", "paid" } } } } }));
+        CheckThrows<ArgumentException>("reject non-list OR in having", () =>
+            grpTbl.GroupBy(new GroupByArgs
+            {
+                By = new List<string> { "status" },
+                Having = new Dictionary<string, object> { { "OR", new Dictionary<string, object> { { "status", "paid" } } } },
+            }));
+        CheckThrows<ArgumentException>("reject collection on direct scalar field", () =>
+            grpTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "status", new List<object> { "paid" } } } }));
+        CheckThrows<ArgumentException>("reject collection on equals", () =>
+            grpTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "status", new Dictionary<string, object> { { "equals", new List<object> { "paid" } } } } } }));
+        CheckThrows<ArgumentException>("reject collection on not", () =>
+            grpTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "status", new Dictionary<string, object> { { "not", new List<object> { "paid" } } } } } }));
+        CheckThrows<ArgumentException>("reject collection on gt", () =>
+            grpTbl.FindMany(new FindManyArgs { Where = new Dictionary<string, object> { { "total", new Dictionary<string, object> { { "gt", new List<object> { 10 } } } } } }));
     }
 
     private static int Main()
