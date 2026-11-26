@@ -52,23 +52,51 @@ public struct Query {
     /// `"age" < 18`
     public static func lt(_ column: String, _ value: Any?) -> Where { [column: ["lt": value]] }
     /// `"name" == "Ada"`
-    public static func equals(_ column: String, _ value: Any?) -> Where { [column: ["equals": value]] }
+    public static func equals(_ column: String, _ value: Any?, mode: String? = nil) -> Where {
+        var ops: Where = ["equals": value]
+        if let mode { ops["mode"] = mode }
+        return [column: ops]
+    }
     /// `"name" != "Ada"`
-    public static func not(_ column: String, _ value: Any?) -> Where { [column: ["not": value]] }
+    public static func not(_ column: String, _ value: Any?, mode: String? = nil) -> Where {
+        var ops: Where = ["not": value]
+        if let mode { ops["mode"] = mode }
+        return [column: ops]
+    }
     /// `"name" contains "da"`
-    public static func contains(_ column: String, _ value: String) -> Where { [column: ["contains": value]] }
+    public static func contains(_ column: String, _ value: String, mode: String? = nil) -> Where {
+        var ops: Where = ["contains": value]
+        if let mode { ops["mode"] = mode }
+        return [column: ops]
+    }
     /// `"name" startsWith "Ad"`
-    public static func startsWith(_ column: String, _ value: String) -> Where { [column: ["startsWith": value]] }
+    public static func startsWith(_ column: String, _ value: String, mode: String? = nil) -> Where {
+        var ops: Where = ["startsWith": value]
+        if let mode { ops["mode"] = mode }
+        return [column: ops]
+    }
     /// `"name" endsWith "ce"`
-    public static func endsWith(_ column: String, _ value: String) -> Where { [column: ["endsWith": value]] }
+    public static func endsWith(_ column: String, _ value: String, mode: String? = nil) -> Where {
+        var ops: Where = ["endsWith": value]
+        if let mode { ops["mode"] = mode }
+        return [column: ops]
+    }
     /// `"id"` is `NULL`.
     public static func isNull(_ column: String) -> Where { [column: NSNull()] }
     /// `"id"` is not `NULL`.
     public static func isNotNull(_ column: String) -> Where { [column: ["not": NSNull()]] }
     /// `"id"` in `values`; an empty list matches nothing.
-    public static func `in`(_ column: String, _ values: [Any?]) -> Where { [column: ["in": values]] }
+    public static func `in`(_ column: String, _ values: [Any?], mode: String? = nil) -> Where {
+        var ops: Where = ["in": values]
+        if let mode { ops["mode"] = mode }
+        return [column: ops]
+    }
     /// `"id"` not in `values`; an empty list matches everything.
-    public static func notIn(_ column: String, _ values: [Any?]) -> Where { [column: ["notIn": values]] }
+    public static func notIn(_ column: String, _ values: [Any?], mode: String? = nil) -> Where {
+        var ops: Where = ["notIn": values]
+        if let mode { ops["mode"] = mode }
+        return [column: ops]
+    }
 
     /// Any of `filters`; an empty list matches nothing.
     public static func or(_ filters: Where...) -> Where { ["OR": filters] }
@@ -113,11 +141,13 @@ public struct Query {
 /// same; `by` is what makes it a group.
 public struct Aggregate {
     public var count = false
+    public var countFields: [String] = []
     public var sum: [String] = []
     public var average: [String] = []
     public var minimum: [String] = []
     public var maximum: [String] = []
     public var filter: Where?
+    public var having: Where?
     public var by: [String] = []
     public var orderBy: [[String: String]] = []
     public var skip = 0
@@ -125,7 +155,9 @@ public struct Aggregate {
 
     public init() {}
 
-    public var isEmpty: Bool { !count && sum.isEmpty && average.isEmpty && minimum.isEmpty && maximum.isEmpty }
+    public var isEmpty: Bool {
+        !count && countFields.isEmpty && sum.isEmpty && average.isEmpty && minimum.isEmpty && maximum.isEmpty
+    }
 }
 
 public enum SortDirection: String, Sendable {

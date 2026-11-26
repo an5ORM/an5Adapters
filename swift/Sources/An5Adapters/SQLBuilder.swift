@@ -57,12 +57,19 @@ public enum Dialect: String, CaseIterable, Sendable {
     /// SQLite has `LIMIT ... OFFSET` like PostgreSQL. Emitting the MSSQL
     /// `OFFSET ... FETCH NEXT` form against SQLite produces SQL it cannot parse.
     public func pagination(take: Int?, skip: Int, orderBy: String) -> String {
-        guard let take else { return "" }
+        let safeSkip = max(0, skip)
+        if take == nil && safeSkip <= 0 { return "" }
         if self == .mssql {
             let prefix = orderBy.isEmpty ? " ORDER BY (SELECT NULL)" : ""
-            return "\(prefix) OFFSET \(max(0, skip)) ROWS FETCH NEXT \(take) ROWS ONLY"
+            guard let take else {
+                return "\(prefix) OFFSET \(safeSkip) ROWS"
+            }
+            return "\(prefix) OFFSET \(safeSkip) ROWS FETCH NEXT \(take) ROWS ONLY"
         }
-        return " LIMIT \(take) OFFSET \(max(0, skip))"
+        guard let take else {
+            return (self == .postgres ? " LIMIT ALL OFFSET " : " LIMIT -1 OFFSET ") + "\(safeSkip)"
+        }
+        return " LIMIT \(take) OFFSET \(safeSkip)"
     }
 
     static func strip(_ value: String, left: String, right: String) -> String {
@@ -97,6 +104,13 @@ public enum SQLBuilder {
     /// Relation filter operator keys supported on to-many and to-one relations.
     static let relationManyKeys: Set<String> = ["some", "none", "every"]
     static let relationOneKeys: Set<String> = ["is", "isNot", "is_not"]
+    static let aggregateHavingOps: [String: String] = [
+        "_count": "COUNT",
+        "_sum": "SUM",
+        "_avg": "AVG",
+        "_min": "MIN",
+        "_max": "MAX",
+    ]
 
     /// Builds the `WHERE` clause and the parameters it binds, in order.
     ///
@@ -387,6 +401,159 @@ public enum SQLBuilder {
         return parts.joined(separator: " AND ")
     }
 
+    /// Builds a model-aware `HAVING` clause over grouped columns and aggregate filters.
+    public static func buildHaving(
+        _ having: Where?,
+        dialect: Dialect,
+        byFields: [String],
+        model: String? = nil,
+        metadata: Metadata = .empty
+    ) throws -> WhereClause {
+        guard let having, !having.isEmpty else { return WhereClause() }
+        let bySet = Set(byFields.map { $0.lowercased() })
+        var parameters: [SQLValue] = []
+        let sql = try buildHavingRec(
+            having,
+            dialect: dialect,
+            bySet: bySet,
+            model: model,
+            metadata: metadata,
+            parameters: &parameters
+        )
+        return WhereClause(sql: sql, parameters: parameters)
+    }
+
+    private static func buildHavingRec(
+        _ having: Where,
+        dialect: Dialect,
+        bySet: Set<String>,
+        model: String?,
+        metadata: Metadata,
+        parameters: inout [SQLValue]
+    ) throws -> String {
+        guard !having.isEmpty else { return "" }
+        let hasFields = model.map { metadata.hasFields($0) } ?? false
+        var conditions: [String] = []
+
+        for key in having.keys.sorted() {
+            let value = having[key] ?? nil
+            switch key {
+            case "OR":
+                guard let branches = asFilterList(value) else {
+                    throw An5Error.invalidQuery("'OR' filter in having must be an array of filter dictionaries")
+                }
+                var sub: [String] = []
+                for branch in branches {
+                    let sql = try buildHavingRec(
+                        branch,
+                        dialect: dialect,
+                        bySet: bySet,
+                        model: model,
+                        metadata: metadata,
+                        parameters: &parameters
+                    )
+                    sub.append(sql.isEmpty ? "1=1" : sql)
+                }
+                conditions.append(sub.isEmpty ? "1=0" : "(\(sub.joined(separator: " OR ")))")
+            case "AND":
+                let items: [Where]
+                if let list = asFilterList(value) {
+                    items = list
+                } else if let single = asFilterMap(value) {
+                    items = [single]
+                } else {
+                    throw An5Error.invalidQuery("'AND' filter in having must be a filter dictionary or array of filter dictionaries")
+                }
+                var sub: [String] = []
+                for item in items {
+                    let sql = try buildHavingRec(
+                        item,
+                        dialect: dialect,
+                        bySet: bySet,
+                        model: model,
+                        metadata: metadata,
+                        parameters: &parameters
+                    )
+                    if !sql.isEmpty { sub.append(sql) }
+                }
+                if !sub.isEmpty { conditions.append("(\(sub.joined(separator: " AND ")))") }
+            case "NOT":
+                let items: [Where]
+                if let list = asFilterList(value) {
+                    items = list
+                } else if let single = asFilterMap(value) {
+                    items = [single]
+                } else {
+                    throw An5Error.invalidQuery("'NOT' filter in having must be a filter dictionary or array of filter dictionaries")
+                }
+                var sub: [String] = []
+                for item in items {
+                    let sql = try buildHavingRec(
+                        item,
+                        dialect: dialect,
+                        bySet: bySet,
+                        model: model,
+                        metadata: metadata,
+                        parameters: &parameters
+                    )
+                    sub.append(sql.isEmpty ? "1=1" : sql)
+                }
+                if !sub.isEmpty { conditions.append("NOT (\(sub.joined(separator: " OR ")))") }
+            default:
+                if let sqlFn = aggregateHavingOps[key] {
+                    guard let aggMap = asFilterMap(value) else {
+                        throw An5Error.invalidQuery("'\(key)' having filter must be a dictionary of column conditions")
+                    }
+                    for field in aggMap.keys.sorted() {
+                        let expr: String
+                        if field == "_all" {
+                            guard key == "_count" else {
+                                throw An5Error.invalidQuery("'_all' is only valid inside '_count' having filter, not '\(key)'")
+                            }
+                            expr = "COUNT(*)"
+                        } else {
+                            if let model, hasFields, !metadata.hasField(model, field) {
+                                throw An5Error.invalidQuery("unknown field '\(field)' on model '\(model)' in '\(key)' having filter")
+                            }
+                            expr = "\(sqlFn)(\(dialect.quote(field)))"
+                        }
+                        let sql = try buildExprCondition(
+                            expr: expr,
+                            label: "\(key).\(field)",
+                            value: aggMap[field] ?? nil,
+                            dialect: dialect,
+                            parameters: &parameters
+                        )
+                        if !sql.isEmpty { conditions.append(sql) }
+                    }
+                } else {
+                    if let model, hasFields, !metadata.hasField(model, key) {
+                        throw An5Error.invalidQuery("unknown field '\(key)' on model '\(model)' in having clause")
+                    }
+                    guard bySet.contains(key.lowercased()) else {
+                        throw An5Error.invalidQuery("field '\(key)' in having clause must be included in 'by' fields or wrapped in an aggregate filter (_count, _sum, _avg, _min, _max)")
+                    }
+                    let sql = try buildExprCondition(
+                        expr: dialect.quote(key),
+                        label: key,
+                        value: value,
+                        dialect: dialect,
+                        parameters: &parameters
+                    )
+                    if !sql.isEmpty { conditions.append(sql) }
+                }
+            }
+        }
+        return conditions.filter { !$0.isEmpty }.joined(separator: " AND ")
+    }
+
+    private static func isNonScalarCollection(_ value: Any?) -> Bool {
+        guard !isNullValue(value), let value else { return false }
+        if value is String || value is Data { return false }
+        let style = Mirror(reflecting: value).displayStyle
+        return style == .collection || style == .set || value is [Any] || value is NSArray
+    }
+
     private static func scalarCondition(
         key: String,
         value: Any?,
@@ -398,86 +565,130 @@ public enum SQLBuilder {
         colPrefix: String,
         parameters: inout [SQLValue]
     ) throws -> String {
+        if let model, metadata.hasFields(model), !metadata.hasField(model, key) {
+            throw An5Error.invalidQuery("unknown field '\(key)' on model '\(model)'")
+        }
         let column = "\(colPrefix)\(dialect.quote(key))"
+        return try buildExprCondition(
+            expr: column,
+            label: key,
+            value: value,
+            dialect: dialect,
+            parameters: &parameters
+        )
+    }
+
+    private static func buildExprCondition(
+        expr: String,
+        label: String,
+        value: Any?,
+        dialect: Dialect,
+        parameters: inout [SQLValue],
+        inheritedInsensitive: Bool = false
+    ) throws -> String {
         let placeholder = dialect.placeholder
 
         if isNullValue(value) {
-            return "\(column) IS NULL"
+            return "\(expr) IS NULL"
         }
         guard let operators = asFilterMap(value) else {
+            if isNonScalarCollection(value) {
+                throw An5Error.invalidQuery("filter value for '\(label)' must be a scalar value, not an array")
+            }
             parameters.append(SQLValue.encode(value) ?? .null)
-            return "\(column) = \(placeholder)"
+            return "\(expr) = \(placeholder)"
+        }
+
+        var insensitive = inheritedInsensitive
+        if operators.keys.contains("mode") {
+            let rawMode = operators["mode"] ?? nil
+            guard let modeStr = rawMode as? String,
+                  modeStr == "default" || modeStr == "insensitive" else {
+                throw An5Error.invalidQuery("invalid filter mode '\(String(describing: rawMode))' for field '\(label)'")
+            }
+            insensitive = modeStr == "insensitive"
         }
 
         var conditions: [String] = []
         for op in operators.keys.sorted() {
+            if op == "mode" { continue }
             let operand = operators[op] ?? nil
             switch op {
             case "not":
                 if isNullValue(operand) {
-                    conditions.append("\(column) IS NOT NULL")
+                    conditions.append("\(expr) IS NOT NULL")
                 } else if let nested = asFilterMap(operand) {
-                    let innerSql = try buildWhereRec(
-                        [key: nested],
+                    let innerSql = try buildExprCondition(
+                        expr: expr,
+                        label: label,
+                        value: nested,
                         dialect: dialect,
-                        model: model,
-                        metadata: metadata,
-                        prefix: "\(prefix)\(key)_not_",
-                        selfRef: selfRef,
-                        colPrefix: colPrefix,
-                        parameters: &parameters
+                        parameters: &parameters,
+                        inheritedInsensitive: insensitive
                     )
                     if !innerSql.isEmpty { conditions.append("NOT (\(innerSql))") }
+                } else if isNonScalarCollection(operand) {
+                    throw An5Error.invalidQuery("'not' operator on '\(label)' requires a scalar value or operator dictionary")
+                } else if insensitive, let text = operand as? String {
+                    parameters.append(.text(text))
+                    conditions.append("LOWER(\(expr)) <> LOWER(\(placeholder))")
                 } else {
                     parameters.append(SQLValue.encode(operand) ?? .null)
-                    conditions.append("\(column) <> \(placeholder)")
+                    conditions.append("\(expr) <> \(placeholder)")
                 }
             case "equals":
                 if isNullValue(operand) {
-                    conditions.append("\(column) IS NULL")
+                    conditions.append("\(expr) IS NULL")
+                } else if asFilterMap(operand) != nil || isNonScalarCollection(operand) {
+                    throw An5Error.invalidQuery("'equals' operator on '\(label)' requires a scalar value")
+                } else if insensitive, let text = operand as? String {
+                    parameters.append(.text(text))
+                    conditions.append("LOWER(\(expr)) = LOWER(\(placeholder))")
                 } else {
                     parameters.append(SQLValue.encode(operand) ?? .null)
-                    conditions.append("\(column) = \(placeholder)")
+                    conditions.append("\(expr) = \(placeholder)")
                 }
-            case "contains":
-                parameters.append(.text("%\(literal(operand))%"))
-                conditions.append("\(column) LIKE \(placeholder)")
-            case "startsWith":
-                parameters.append(.text("\(literal(operand))%"))
-                conditions.append("\(column) LIKE \(placeholder)")
-            case "endsWith":
-                parameters.append(.text("%\(literal(operand))"))
-                conditions.append("\(column) LIKE \(placeholder)")
-            case "gte":
+            case "contains", "startsWith", "endsWith":
+                guard let text = operand as? String else {
+                    throw An5Error.invalidQuery("'\(op)' operator for field '\(label)' requires a string value")
+                }
+                let pattern = op == "contains" ? "%\(text)%" : (op == "startsWith" ? "\(text)%" : "%\(text)")
+                parameters.append(.text(pattern))
+                if insensitive {
+                    if dialect == .postgres {
+                        conditions.append("\(expr) ILIKE \(placeholder)")
+                    } else {
+                        conditions.append("LOWER(\(expr)) LIKE LOWER(\(placeholder))")
+                    }
+                } else {
+                    conditions.append("\(expr) LIKE \(placeholder)")
+                }
+            case "gte", "lte", "gt", "lt":
+                if isNullValue(operand) || asFilterMap(operand) != nil || isNonScalarCollection(operand) {
+                    throw An5Error.invalidQuery("'\(op)' operator on '\(label)' requires a scalar value")
+                }
+                let sqlOp = op == "gte" ? ">=" : (op == "lte" ? "<=" : (op == "gt" ? ">" : "<"))
                 parameters.append(SQLValue.encode(operand) ?? .null)
-                conditions.append("\(column) >= \(placeholder)")
-            case "lte":
-                parameters.append(SQLValue.encode(operand) ?? .null)
-                conditions.append("\(column) <= \(placeholder)")
-            case "gt":
-                parameters.append(SQLValue.encode(operand) ?? .null)
-                conditions.append("\(column) > \(placeholder)")
-            case "lt":
-                parameters.append(SQLValue.encode(operand) ?? .null)
-                conditions.append("\(column) < \(placeholder)")
+                conditions.append("\(expr) \(sqlOp) \(placeholder)")
             case "in", "notIn":
                 guard let values = asValueList(operand) else {
-                    throw An5Error.invalidQuery("'\(op)' operator for field '\(key)' requires an array")
+                    throw An5Error.invalidQuery("'\(op)' operator for field '\(label)' requires an array")
                 }
                 if values.isEmpty {
                     // `IN ()` is a syntax error in every dialect. An empty set can match nothing,
                     // so it becomes 1=0; the negated form is true of every row, so 1=1.
                     conditions.append(op == "in" ? "1=0" : "1=1")
                 } else {
+                    let allStrings = values.allSatisfy { $0 is String }
+                    let useLower = insensitive && allStrings
+                    let lhs = useLower ? "LOWER(\(expr))" : expr
+                    let ph = useLower ? "LOWER(\(placeholder))" : placeholder
                     let sqlOp = op == "in" ? " IN (" : " NOT IN ("
-                    conditions.append(column + sqlOp + values.map { _ in placeholder }.joined(separator: ", ") + ")")
+                    conditions.append(lhs + sqlOp + values.map { _ in ph }.joined(separator: ", ") + ")")
                     parameters.append(contentsOf: values.map { SQLValue.encode($0) ?? .null })
                 }
-            case "mode":
-                // Collation/case-sensitivity mode is accepted for parity across generated clients.
-                continue
             default:
-                throw An5Error.invalidQuery("unsupported filter operator '\(op)' for field '\(key)'")
+                throw An5Error.invalidQuery("unsupported filter operator '\(op)' for field '\(label)'")
             }
         }
         return conditions.joined(separator: " AND ")

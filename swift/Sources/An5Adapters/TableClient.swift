@@ -228,8 +228,38 @@ public struct TableClient {
 
     // ─── Aggregation ────────────────────────────────────────────────────────────
 
+    private func validateAggregateFields(_ aggregate: Aggregate) throws {
+        let hasFields = metadata.hasFields(model)
+        for field in aggregate.countFields {
+            try validateAggregateField(field, context: "_count", hasFields: hasFields)
+        }
+        for (context, fields) in [
+            ("_sum", aggregate.sum),
+            ("_avg", aggregate.average),
+            ("_min", aggregate.minimum),
+            ("_max", aggregate.maximum),
+        ] {
+            for field in fields {
+                try validateAggregateField(field, context: context, hasFields: hasFields)
+            }
+        }
+    }
+
+    private func validateAggregateField(_ field: String, context: String, hasFields: Bool) throws {
+        if field == "_all" {
+            guard context == "_count" else {
+                throw An5Error.invalidQuery("'_all' is only valid inside '_count', not '\(context)'")
+            }
+            return
+        }
+        if hasFields && !metadata.hasField(model, field) {
+            throw An5Error.invalidQuery("unknown field '\(field)' on model '\(model)' in \(context)")
+        }
+    }
+
     /// One row of aggregate values, keyed `_count`, `_sum_<field>` and so on.
     public func aggregate(_ aggregate: Aggregate) throws -> Row {
+        try validateAggregateFields(aggregate)
         let expressions = selectExpressions(aggregate, includeCount: aggregate.count)
         guard !expressions.isEmpty else {
             throw An5Error.invalidQuery("aggregate requires at least one aggregator column")
@@ -245,7 +275,14 @@ public struct TableClient {
         guard !aggregate.by.isEmpty else {
             throw An5Error.invalidQuery("groupBy requires at least one 'by' column")
         }
+        let hasFields = metadata.hasFields(model)
+        for byField in aggregate.by {
+            try validateAggregateField(byField, context: "by", hasFields: hasFields)
+        }
+        try validateAggregateFields(aggregate)
+
         let clause = try SQLBuilder.buildWhere(aggregate.filter, dialect: dialect, model: model, metadata: metadata)
+        let having = try SQLBuilder.buildHaving(aggregate.having, dialect: dialect, byFields: aggregate.by, model: model, metadata: metadata)
         let byColumns = aggregate.by.map { dialect.quote($0) }.joined(separator: ", ")
         // Counted unconditionally: a group is only useful next to its size, and a group whose
         // rows were all filtered out still has to come back as a zero rather than disappear.
@@ -255,6 +292,7 @@ public struct TableClient {
         var sql = "SELECT \(byColumns), \(expressions.joined(separator: ", ")) FROM \(tableSQL)"
         if !clause.isEmpty { sql += " WHERE \(clause.sql)" }
         sql += " GROUP BY \(byColumns)"
+        if !having.isEmpty { sql += " HAVING \(having.sql)" }
 
         var orderBy = SQLBuilder.orderBy(aggregate.orderBy, dialect: dialect)
         let paging = aggregate.take != nil || aggregate.skip > 0
@@ -265,14 +303,21 @@ public struct TableClient {
         }
         if !orderBy.isEmpty { sql += " \(orderBy)" }
         if paging {
-            sql += dialect.pagination(take: aggregate.take ?? 1, skip: aggregate.skip, orderBy: orderBy)
+            sql += dialect.pagination(take: aggregate.take, skip: aggregate.skip, orderBy: orderBy)
         }
-        return try adapter.query(sql, parameters(clause.parameters))
+        return try adapter.query(sql, parameters(clause.parameters + having.parameters))
     }
 
     private func selectExpressions(_ aggregate: Aggregate, includeCount: Bool) -> [String] {
         var expressions: [String] = []
-        if includeCount { expressions.append("COUNT(*) AS _count") }
+        let wantAll = includeCount || aggregate.countFields.contains("_all")
+        if wantAll { expressions.append("COUNT(*) AS _count") }
+        var seenCountFields: Set<String> = []
+        for field in aggregate.countFields where field != "_all" && !field.isEmpty {
+            if seenCountFields.insert(field).inserted {
+                expressions.append("COUNT(\(dialect.quote(field))) AS _count_\(field)")
+            }
+        }
         for (function, fields) in [("SUM", aggregate.sum), ("AVG", aggregate.average), ("MIN", aggregate.minimum), ("MAX", aggregate.maximum)] {
             for field in fields {
                 expressions.append("\(function)(\(dialect.quote(field))) AS _\(function.lowercased())_\(field)")

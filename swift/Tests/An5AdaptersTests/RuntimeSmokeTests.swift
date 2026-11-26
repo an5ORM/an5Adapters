@@ -46,7 +46,9 @@ final class RuntimeSmokeTests: XCTestCase {
             Dialect.mssql.pagination(take: 10, skip: 5, orderBy: ""),
             " ORDER BY (SELECT NULL) OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY"
         )
-        XCTAssertEqual(Dialect.sqlite.pagination(take: nil, skip: 5, orderBy: ""), "")
+        XCTAssertEqual(Dialect.sqlite.pagination(take: nil, skip: 5, orderBy: ""), " LIMIT -1 OFFSET 5")
+        XCTAssertEqual(Dialect.postgres.pagination(take: nil, skip: 5, orderBy: ""), " LIMIT ALL OFFSET 5")
+        XCTAssertEqual(Dialect.mssql.pagination(take: nil, skip: 5, orderBy: ""), " ORDER BY (SELECT NULL) OFFSET 5 ROWS")
     }
 
     // MARK: - Vectors
@@ -640,6 +642,136 @@ final class RuntimeSmokeTests: XCTestCase {
         assertInvalidQuery(["score": ["in": "not-an-array"]], client: users, "non-array in operand")
     }
 
+    func testInsensitiveGroupByHavingAndStrictValidation() throws {
+        let grpMeta = Metadata(
+            modelToTable: ["GrpOrder": "grp_orders"],
+            modelFields: [
+                "GrpOrder": [
+                    FieldMeta(name: "id", type: "string", sqlType: "TEXT", isId: true),
+                    FieldMeta(name: "status", type: "string", sqlType: "TEXT"),
+                    FieldMeta(name: "total", type: "number", sqlType: "INTEGER"),
+                    FieldMeta(name: "note", type: "string", sqlType: "TEXT", isOptional: true),
+                ]
+            ],
+            relationMap: [:]
+        )
+        let adapter = try An5Adapter(path: ":memory:", metadata: grpMeta)
+        try adapter.execute("CREATE TABLE grp_orders (id TEXT PRIMARY KEY, status TEXT, total INTEGER, note TEXT)")
+        let grp = adapter.table("GrpOrder")
+        try grp.create(["id": "1", "status": "paid", "total": 150, "note": "vip"])
+        try grp.create(["id": "2", "status": "paid", "total": 50, "note": NSNull()])
+        try grp.create(["id": "3", "status": "open", "total": 120, "note": "hold"])
+        try grp.create(["id": "4", "status": "cancelled", "total": 40, "note": NSNull()])
+
+        XCTAssertEqual(try grp.findMany(filter: Query.equals("status", "OPEN", mode: "insensitive")).count, 1)
+        XCTAssertEqual(try grp.findMany(filter: Query.not("status", "PAID", mode: "insensitive")).count, 2)
+        XCTAssertEqual(
+            try grp.findMany(filter: ["status": ["mode": "insensitive", "not": ["contains": "CANCEL"]]]).count,
+            3
+        )
+        XCTAssertEqual(try grp.findMany(filter: Query.startsWith("status", "PA", mode: "insensitive")).count, 2)
+        XCTAssertEqual(try grp.findMany(filter: Query.endsWith("status", "EN", mode: "insensitive")).count, 1)
+        XCTAssertEqual(try grp.findMany(filter: Query.`in`("status", ["PAID", "OPEN"], mode: "insensitive")).count, 3)
+        XCTAssertEqual(try grp.findMany(filter: Query.notIn("status", ["PAID"], mode: "insensitive")).count, 2)
+
+        let pgInsensitive = try SQLBuilder.buildWhere(
+            ["status": ["contains": "paid", "mode": "insensitive"]],
+            dialect: .postgres,
+            model: "GrpOrder",
+            metadata: grpMeta
+        )
+        XCTAssertTrue(pgInsensitive.sql.contains("ILIKE"))
+
+        var aggSpec = Aggregate()
+        aggSpec.countFields = ["_all", "note"]
+        aggSpec.sum = ["total"]
+        aggSpec.average = ["total"]
+        aggSpec.minimum = ["status", "total"]
+        aggSpec.maximum = ["status", "total"]
+        let agg = try grp.aggregate(aggSpec)
+        XCTAssertEqual((agg["_count"] as? NSNumber)?.intValue, 4)
+        XCTAssertEqual((agg["_count_note"] as? NSNumber)?.intValue, 2)
+        XCTAssertEqual(agg["_min_status"] as? String, "cancelled")
+        XCTAssertEqual(agg["_max_status"] as? String, "paid")
+
+        var grpSpec = Aggregate()
+        grpSpec.by = ["status"]
+        grpSpec.countFields = ["_all", "note"]
+        grpSpec.sum = ["total"]
+        grpSpec.average = ["total"]
+        grpSpec.minimum = ["total"]
+        grpSpec.maximum = ["total"]
+        grpSpec.having = [
+            "OR": [
+                ["_count": ["_all": ["gte": 2]]],
+                ["_sum": ["total": ["gte": 120]]],
+            ],
+            "NOT": ["status": "cancelled"],
+        ]
+        grpSpec.orderBy = [["status": "asc"]]
+        let grouped = try grp.groupBy(grpSpec)
+        XCTAssertEqual(grouped.compactMap { $0["status"] as? String }, ["open", "paid"])
+        XCTAssertEqual((grouped[1]["_count"] as? NSNumber)?.intValue, 2)
+        XCTAssertEqual((grouped[1]["_count_note"] as? NSNumber)?.intValue, 1)
+        XCTAssertEqual((grouped[1]["_sum_total"] as? NSNumber)?.doubleValue, 200.0)
+        XCTAssertEqual((grouped[1]["_avg_total"] as? NSNumber)?.doubleValue, 100.0)
+        XCTAssertEqual((grouped[1]["_min_total"] as? NSNumber)?.intValue, 50)
+        XCTAssertEqual((grouped[1]["_max_total"] as? NSNumber)?.intValue, 150)
+
+        // WHERE + HAVING placeholder ordering and grouped scalar filter
+        var combinedSpec = Aggregate()
+        combinedSpec.by = ["status"]
+        combinedSpec.filter = ["total": ["gte": 50]]
+        combinedSpec.having = [
+            "status": ["in": ["PAID"], "mode": "insensitive"],
+            "_sum": ["total": ["gte": 200]],
+        ]
+        let scoped = try grp.groupBy(combinedSpec)
+        XCTAssertEqual(scoped.compactMap { $0["status"] as? String }, ["paid"])
+
+        // Offset-only pagination (SQLite LIMIT -1 OFFSET 1)
+        var offsetSpec = Aggregate()
+        offsetSpec.by = ["status"]
+        offsetSpec.orderBy = [["status": "asc"]]
+        offsetSpec.skip = 1
+        let skipped = try grp.groupBy(offsetSpec)
+        XCTAssertEqual(skipped.compactMap { $0["status"] as? String }, ["open", "paid"])
+
+        // Strict rejections
+        XCTAssertThrowsError(try grp.findMany(filter: ["status": ["equals": "paid", "mode": "fuzzy"]]))
+        XCTAssertThrowsError(try grp.findMany(filter: ["bogus": "paid"]))
+        XCTAssertThrowsError(try grp.findMany(filter: ["status": ["paid"]]))
+        XCTAssertThrowsError(try grp.findMany(filter: ["status": ["equals": ["paid"]]]))
+        XCTAssertThrowsError(try grp.findMany(filter: ["status": ["not": ["paid"]]]))
+        XCTAssertThrowsError(try grp.findMany(filter: ["total": ["gt": [10]]]))
+        XCTAssertThrowsError(try grp.findMany(filter: ["status": ["contains": 42]]))
+
+        var badHavingScalar = Aggregate()
+        badHavingScalar.by = ["status"]
+        badHavingScalar.having = ["total": ["gte": 100]]
+        XCTAssertThrowsError(try grp.groupBy(badHavingScalar))
+
+        var badAllSum = Aggregate()
+        badAllSum.by = ["status"]
+        badAllSum.having = ["_sum": ["_all": 1]]
+        XCTAssertThrowsError(try grp.groupBy(badAllSum))
+
+        var badHavingField = Aggregate()
+        badHavingField.by = ["status"]
+        badHavingField.having = ["_count": ["bogus": 1]]
+        XCTAssertThrowsError(try grp.groupBy(badHavingField))
+
+        var badHavingOr = Aggregate()
+        badHavingOr.by = ["status"]
+        badHavingOr.having = ["OR": ["status": "paid"]]
+        XCTAssertThrowsError(try grp.groupBy(badHavingOr))
+
+        var badCountField = Aggregate()
+        badCountField.by = ["status"]
+        badCountField.countFields = ["bogus"]
+        XCTAssertThrowsError(try grp.groupBy(badCountField))
+    }
+
     // MARK: - Fixtures
 
     static let metadata = Metadata(
@@ -647,7 +779,8 @@ final class RuntimeSmokeTests: XCTestCase {
         modelFields: [
             "User": [FieldMeta(name: "id", type: "string", sqlType: "NVARCHAR(255)", isId: true),
                      FieldMeta(name: "name", type: "string", sqlType: "NVARCHAR(255)"),
-                     FieldMeta(name: "score", type: "number", sqlType: "INT")],
+                     FieldMeta(name: "score", type: "number", sqlType: "INT"),
+                     FieldMeta(name: "nickname", type: "string", sqlType: "NVARCHAR(255)", isOptional: true)],
             "Post": [FieldMeta(name: "id", type: "string", sqlType: "NVARCHAR(255)", isId: true),
                      FieldMeta(name: "title", type: "string", sqlType: "NVARCHAR(255)"),
                      FieldMeta(name: "userId", type: "string", sqlType: "NVARCHAR(255)")],
