@@ -36,6 +36,18 @@ public final class SqlBuilder {
   private static final Set<String> RELATION_ONE_KEYS =
       new HashSet<String>(Arrays.asList("is", "isNot", "is_not"));
 
+  private static final Map<String, String> AGGREGATE_HAVING_OPS = createAggregateHavingOps();
+
+  private static Map<String, String> createAggregateHavingOps() {
+    Map<String, String> ops = new LinkedHashMap<String, String>();
+    ops.put("_count", "COUNT");
+    ops.put("_sum", "SUM");
+    ops.put("_avg", "AVG");
+    ops.put("_min", "MIN");
+    ops.put("_max", "MAX");
+    return Collections.unmodifiableMap(ops);
+  }
+
   private SqlBuilder() {}
 
   /** Where parameters in bind order, with the SQL that reads them. */
@@ -403,6 +415,183 @@ public final class SqlBuilder {
     return join(parts, " AND ");
   }
 
+  /** Builds a model-aware {@code HAVING} clause over grouped scalar columns and aggregates. */
+  public static Where buildHaving(
+      Map<String, ?> having,
+      Dialect dialect,
+      List<String> byFields,
+      Map<String, Object> params) {
+    return buildHaving(having, dialect, byFields, params, "h_", null);
+  }
+
+  /** Builds a model-aware {@code HAVING} clause with strict grouped-field validation. */
+  public static Where buildHaving(
+      Map<String, ?> having,
+      Dialect dialect,
+      List<String> byFields,
+      Map<String, Object> params,
+      String prefix,
+      String modelName) {
+    Map<String, Object> targetParams =
+        params == null ? new LinkedHashMap<String, Object>() : params;
+    if (having == null || having.isEmpty()) {
+      return new Where("", targetParams);
+    }
+    Set<String> bySet = new HashSet<String>();
+    if (byFields != null) {
+      for (String field : byFields) {
+        if (field != null && !field.isEmpty()) {
+          bySet.add(field.toLowerCase(Locale.ROOT));
+        }
+      }
+    }
+    String p = prefix == null || prefix.isEmpty() ? "h_" : prefix;
+    String sql = buildHavingRec(having, dialect, bySet, targetParams, p, modelName);
+    return new Where(sql, targetParams);
+  }
+
+  private static String buildHavingRec(
+      Map<String, ?> having,
+      Dialect dialect,
+      Set<String> bySet,
+      Map<String, Object> params,
+      String prefix,
+      String modelName) {
+    if (having == null || having.isEmpty()) {
+      return "";
+    }
+    List<String> keys = new ArrayList<String>(having.keySet());
+    Collections.sort(keys);
+    List<String> conditions = new ArrayList<String>();
+    boolean hasFields =
+        modelName != null && !modelName.isEmpty() && Metadata.hasFields(modelName);
+
+    for (String key : keys) {
+      Object value = having.get(key);
+      if ("OR".equals(key)) {
+        if (!(value instanceof List)) {
+          throw new IllegalArgumentException("'OR' filter in having must be a list of filter maps");
+        }
+        List<?> items = (List<?>) value;
+        List<String> sub = new ArrayList<String>();
+        for (int i = 0; i < items.size(); i++) {
+          Object branch = items.get(i);
+          if (!(branch instanceof Map)) {
+            throw new IllegalArgumentException("'OR' branch in having must be a filter map");
+          }
+          sub.add(
+              orEmpty(
+                  buildHavingRec(
+                      copyMap(branch),
+                      dialect,
+                      bySet,
+                      params,
+                      prefix + "or" + i + "_",
+                      modelName)));
+        }
+        conditions.add(sub.isEmpty() ? "1=0" : "(" + join(sub, " OR ") + ")");
+      } else if ("AND".equals(key)) {
+        List<Map<String, Object>> items = extractGroupMaps("AND", value);
+        List<String> sub = new ArrayList<String>();
+        for (int i = 0; i < items.size(); i++) {
+          String sql =
+              buildHavingRec(
+                  items.get(i),
+                  dialect,
+                  bySet,
+                  params,
+                  prefix + "and" + i + "_",
+                  modelName);
+          if (sql != null && !sql.isEmpty()) {
+            sub.add(sql);
+          }
+        }
+        if (!sub.isEmpty()) {
+          conditions.add("(" + join(sub, " AND ") + ")");
+        }
+      } else if ("NOT".equals(key)) {
+        List<Map<String, Object>> items = extractGroupMaps("NOT", value);
+        List<String> sub = new ArrayList<String>();
+        for (int i = 0; i < items.size(); i++) {
+          sub.add(
+              orEmpty(
+                  buildHavingRec(
+                      items.get(i),
+                      dialect,
+                      bySet,
+                      params,
+                      prefix + "not" + i + "_",
+                      modelName)));
+        }
+        if (!sub.isEmpty()) {
+          conditions.add("NOT (" + join(sub, " OR ") + ")");
+        }
+      } else if (AGGREGATE_HAVING_OPS.containsKey(key)) {
+        if (!(value instanceof Map)) {
+          throw new IllegalArgumentException(
+              "'" + key + "' having filter must be a map of column conditions");
+        }
+        String sqlFn = AGGREGATE_HAVING_OPS.get(key);
+        Map<String, Object> aggMap = copyMap(value);
+        List<String> aggFields = new ArrayList<String>(aggMap.keySet());
+        Collections.sort(aggFields);
+        for (String field : aggFields) {
+          String expr;
+          if ("_all".equals(field)) {
+            if (!"_count".equals(key)) {
+              throw new IllegalArgumentException(
+                  "'_all' is only valid inside '_count' having filter, not '" + key + "'");
+            }
+            expr = "COUNT(*)";
+          } else {
+            if (hasFields && !Metadata.hasField(modelName, field)) {
+              throw new IllegalArgumentException(
+                  "unknown field '" + field + "' on model '" + modelName + "' in '" + key + "' having filter");
+            }
+            expr = sqlFn + "(" + dialect.quoteIdentifier(field) + ")";
+          }
+          String sql =
+              buildExprCondition(
+                  expr,
+                  key + "_" + field,
+                  aggMap.get(field),
+                  dialect,
+                  params,
+                  prefix,
+                  false);
+          if (!sql.isEmpty()) {
+            conditions.add(sql);
+          }
+        }
+      } else {
+        if (hasFields && !Metadata.hasField(modelName, key)) {
+          throw new IllegalArgumentException(
+              "unknown field '" + key + "' on model '" + modelName + "' in having clause");
+        }
+        if (!bySet.contains(key.toLowerCase(Locale.ROOT))) {
+          throw new IllegalArgumentException(
+              "field '"
+                  + key
+                  + "' in having clause must be included in 'by' fields or wrapped in an aggregate filter (_count, _sum, _avg, _min, _max)");
+        }
+        String sql =
+            buildExprCondition(
+                dialect.quoteIdentifier(key), key, value, dialect, params, prefix, false);
+        if (!sql.isEmpty()) {
+          conditions.add(sql);
+        }
+      }
+    }
+    return join(conditions, " AND ");
+  }
+
+  private static boolean isNonScalarCollection(Object value) {
+    if (value == null || value instanceof String || value instanceof byte[]) {
+      return false;
+    }
+    return value instanceof Collection || value.getClass().isArray();
+  }
+
   private static String scalarCondition(
       String key,
       Object value,
@@ -412,19 +601,51 @@ public final class SqlBuilder {
       String modelName,
       String selfRef,
       String colPrefix) {
+    if (modelName != null
+        && !modelName.isEmpty()
+        && Metadata.hasFields(modelName)
+        && !Metadata.hasField(modelName, key)) {
+      throw new IllegalArgumentException("unknown field '" + key + "' on model '" + modelName + "'");
+    }
     String column = colPrefix + dialect.quoteIdentifier(key);
-    String paramName = sanitizeParamName(prefix + key);
+    return buildExprCondition(column, key, value, dialect, params, prefix, false);
+  }
+
+  private static String buildExprCondition(
+      String expr,
+      String label,
+      Object value,
+      Dialect dialect,
+      Map<String, Object> params,
+      String prefix,
+      boolean inheritedInsensitive) {
+    String paramName = sanitizeParamName(prefix + label);
     String placeholder = dialect.placeholder();
 
     if (value == null) {
-      return column + " IS NULL";
+      return expr + " IS NULL";
     }
     if (!(value instanceof Map)) {
+      if (isNonScalarCollection(value)) {
+        throw new IllegalArgumentException(
+            "filter value for '" + label + "' must be a scalar value, not a collection");
+      }
       putParam(params, paramName, value);
-      return column + " = " + placeholder;
+      return expr + " = " + placeholder;
     }
 
     Map<?, ?> operators = (Map<?, ?>) value;
+    boolean insensitive = inheritedInsensitive;
+    if (operators.containsKey("mode")) {
+      Object rawMode = operators.get("mode");
+      if (!(rawMode instanceof String)
+          || (!"default".equals(rawMode) && !"insensitive".equals(rawMode))) {
+        throw new IllegalArgumentException(
+            "invalid filter mode '" + rawMode + "' for field '" + label + "'");
+      }
+      insensitive = "insensitive".equals(rawMode);
+    }
+
     List<String> opKeys = new ArrayList<String>();
     for (Object rawKey : operators.keySet()) {
       opKeys.add(String.valueOf(rawKey));
@@ -433,82 +654,113 @@ public final class SqlBuilder {
 
     List<String> conditions = new ArrayList<String>();
     for (String op : opKeys) {
+      if ("mode".equals(op)) {
+        continue;
+      }
       Object operand = operators.get(op);
       if ("not".equals(op)) {
         if (operand == null) {
-          conditions.add(column + " IS NOT NULL");
+          conditions.add(expr + " IS NOT NULL");
         } else if (operand instanceof Map) {
           String nestedSql =
-              parseWhereRec(
-                  single(key, operand),
+              buildExprCondition(
+                  expr,
+                  label,
+                  operand,
                   dialect,
                   params,
-                  prefix + key + "_not_",
-                  modelName,
-                  selfRef,
-                  colPrefix);
+                  prefix + sanitizeParamName(label) + "_not_",
+                  insensitive);
           if (nestedSql != null && !nestedSql.isEmpty()) {
             conditions.add("NOT (" + nestedSql + ")");
           }
+        } else if (isNonScalarCollection(operand)) {
+          throw new IllegalArgumentException(
+              "'not' operator on '" + label + "' requires a scalar value or operator map");
+        } else if (insensitive && operand instanceof String) {
+          putParam(params, paramName + "_not", operand);
+          conditions.add("LOWER(" + expr + ") <> LOWER(" + placeholder + ")");
         } else {
           putParam(params, paramName + "_not", operand);
-          conditions.add(column + " <> " + placeholder);
+          conditions.add(expr + " <> " + placeholder);
         }
       } else if ("equals".equals(op)) {
         if (operand == null) {
-          conditions.add(column + " IS NULL");
+          conditions.add(expr + " IS NULL");
+        } else if (operand instanceof Map || isNonScalarCollection(operand)) {
+          throw new IllegalArgumentException(
+              "'equals' operator on '" + label + "' requires a scalar value");
+        } else if (insensitive && operand instanceof String) {
+          putParam(params, paramName + "_eq", operand);
+          conditions.add("LOWER(" + expr + ") = LOWER(" + placeholder + ")");
         } else {
           putParam(params, paramName + "_eq", operand);
-          conditions.add(column + " = " + placeholder);
+          conditions.add(expr + " = " + placeholder);
         }
-      } else if ("contains".equals(op)) {
-        putParam(params, paramName + "_co", "%" + (operand == null ? "" : operand) + "%");
-        conditions.add(column + " LIKE " + placeholder);
-      } else if ("startsWith".equals(op)) {
-        putParam(params, paramName + "_sw", (operand == null ? "" : operand) + "%");
-        conditions.add(column + " LIKE " + placeholder);
-      } else if ("endsWith".equals(op)) {
-        putParam(params, paramName + "_ew", "%" + (operand == null ? "" : operand));
-        conditions.add(column + " LIKE " + placeholder);
-      } else if ("gte".equals(op)) {
-        putParam(params, paramName + "_gte", operand);
-        conditions.add(column + " >= " + placeholder);
-      } else if ("lte".equals(op)) {
-        putParam(params, paramName + "_lte", operand);
-        conditions.add(column + " <= " + placeholder);
-      } else if ("gt".equals(op)) {
-        putParam(params, paramName + "_gt", operand);
-        conditions.add(column + " > " + placeholder);
-      } else if ("lt".equals(op)) {
-        putParam(params, paramName + "_lt", operand);
-        conditions.add(column + " < " + placeholder);
+      } else if ("contains".equals(op) || "startsWith".equals(op) || "endsWith".equals(op)) {
+        if (!(operand instanceof String)) {
+          throw new IllegalArgumentException(
+              "'" + op + "' operator on '" + label + "' requires a string value");
+        }
+        String text = (String) operand;
+        String pattern =
+            "contains".equals(op)
+                ? "%" + text + "%"
+                : "startsWith".equals(op) ? text + "%" : "%" + text;
+        String suffix =
+            "contains".equals(op) ? "_co" : "startsWith".equals(op) ? "_sw" : "_ew";
+        putParam(params, paramName + suffix, pattern);
+        if (insensitive) {
+          if (dialect == Dialect.POSTGRES) {
+            conditions.add(expr + " ILIKE " + placeholder);
+          } else {
+            conditions.add("LOWER(" + expr + ") LIKE LOWER(" + placeholder + ")");
+          }
+        } else {
+          conditions.add(expr + " LIKE " + placeholder);
+        }
+      } else if ("gte".equals(op) || "lte".equals(op) || "gt".equals(op) || "lt".equals(op)) {
+        if (operand == null || operand instanceof Map || isNonScalarCollection(operand)) {
+          throw new IllegalArgumentException(
+              "'" + op + "' operator on '" + label + "' requires a scalar value");
+        }
+        String sqlOp =
+            "gte".equals(op) ? " >= " : "lte".equals(op) ? " <= " : "gt".equals(op) ? " > " : " < ";
+        putParam(params, paramName + "_" + op, operand);
+        conditions.add(expr + sqlOp + placeholder);
       } else if ("in".equals(op) || "notIn".equals(op)) {
-        if (operand != null && !(operand instanceof Collection)) {
-          throw new IllegalArgumentException("'" + op + "' operator for field '" + key + "' requires a list");
+        if (operand == null || !(operand instanceof Collection)) {
+          throw new IllegalArgumentException("'" + op + "' operator for field '" + label + "' requires a list");
         }
-        Collection<?> values =
-            operand == null ? Collections.<Object>emptyList() : (Collection<?>) operand;
+        Collection<?> values = (Collection<?>) operand;
         boolean emptyIsFalse = "in".equals(op);
         if (values.isEmpty()) {
           // `IN ()` is a syntax error in every dialect. An empty set can match nothing, so it
           // becomes 1=0; the negated form is true of every row, so it becomes 1=1.
           conditions.add(emptyIsFalse ? "1=0" : "1=1");
         } else {
+          boolean allStrings = true;
+          for (Object item : values) {
+            if (!(item instanceof String)) {
+              allStrings = false;
+              break;
+            }
+          }
+          boolean useLower = insensitive && allStrings;
           List<String> placeholders = new ArrayList<String>();
           int idx = 0;
           for (Object item : values) {
             putParam(params, paramName + "_" + op + idx, item);
-            placeholders.add(placeholder);
+            placeholders.add(useLower ? "LOWER(" + placeholder + ")" : placeholder);
             idx++;
           }
+          String lhs = useLower ? "LOWER(" + expr + ")" : expr;
           String sqlOp = emptyIsFalse ? " IN (" : " NOT IN (";
-          conditions.add(column + sqlOp + join(placeholders, ", ") + ")");
+          conditions.add(lhs + sqlOp + join(placeholders, ", ") + ")");
         }
-      } else if ("mode".equals(op)) {
-        // Collation/case-sensitivity mode is accepted for parity across generated clients.
       } else {
         throw new IllegalArgumentException(
-            "unsupported filter operator '" + op + "' for field '" + key + "'");
+            "unsupported filter operator '" + op + "' for field '" + label + "'");
       }
     }
 

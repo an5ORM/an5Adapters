@@ -41,6 +41,7 @@ public final class An5AdaptersSmoke {
     relationFiltersAndIncludes();
     strictFilterValidation();
     aggregation();
+    insensitiveAndHavingValidation();
     transactionRollback();
     viewIsReadOnly();
     vectorFallback();
@@ -108,6 +109,18 @@ public final class An5AdaptersSmoke {
         "mssql fetch without order",
         " ORDER BY (SELECT NULL) OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY",
         Dialect.MSSQL.pagination(Integer.valueOf(10), 5, ""));
+    equals(
+        "sqlite offset-only limit",
+        " LIMIT -1 OFFSET 2",
+        Dialect.SQLITE.pagination(null, 2, "ORDER BY id"));
+    equals(
+        "postgres offset-only limit",
+        " LIMIT ALL OFFSET 2",
+        Dialect.POSTGRES.pagination(null, 2, "ORDER BY id"));
+    equals(
+        "mssql offset-only without order",
+        " ORDER BY (SELECT NULL) OFFSET 2 ROWS",
+        Dialect.MSSQL.pagination(null, 2, ""));
   }
 
   private static void checkVectors() {
@@ -524,6 +537,195 @@ public final class An5AdaptersSmoke {
           }));
     } finally {
       adapter.close();
+    }
+  }
+
+  private static void insensitiveAndHavingValidation() throws Exception {
+    System.out.println("\n[insensitive mode, groupBy having & per-field count]");
+    Map<String, Object> fields = new LinkedHashMap<String, Object>();
+    fields.put(
+        "GrpOrder",
+        list(field("id", true), field("status", false), field("total", false), field("note", false)));
+    Map<String, Object> tables = new LinkedHashMap<String, Object>();
+    tables.put("GrpOrder", "grp_orders");
+    Metadata.setAdapterMetadata(map("modelToTable", tables, "modelFields", fields));
+
+    An5Adapter adapter = new An5Adapter(":memory:");
+    try {
+      adapter.executeRaw(
+          "CREATE TABLE grp_orders (id INTEGER PRIMARY KEY, status TEXT, total INTEGER, note TEXT)");
+      An5TableClient grp = adapter.table("GrpOrder");
+      grp.create(map("id", "1", "status", "paid", "total", Integer.valueOf(150), "note", "vip"));
+      grp.create(map("id", "2", "status", "paid", "total", Integer.valueOf(50), "note", null));
+      grp.create(map("id", "3", "status", "open", "total", Integer.valueOf(120), "note", "hold"));
+      grp.create(
+          map("id", "4", "status", "cancelled", "total", Integer.valueOf(40), "note", null));
+
+      equals(
+          "insensitive equals",
+          1,
+          grp.findMany(new An5Query().where(map("status", map("equals", "OPEN", "mode", "insensitive"))))
+              .size());
+      equals(
+          "insensitive not",
+          2,
+          grp.findMany(new An5Query().where(map("status", map("not", "PAID", "mode", "insensitive"))))
+              .size());
+      equals(
+          "insensitive nested not inherits mode",
+          3,
+          grp.findMany(
+                  new An5Query()
+                      .where(
+                          map(
+                              "status",
+                              map(
+                                  "mode",
+                                  "insensitive",
+                                  "not",
+                                  map("contains", "CANCEL")))))
+              .size());
+      equals(
+          "insensitive startsWith",
+          2,
+          grp.findMany(new An5Query().where(map("status", map("startsWith", "PA", "mode", "insensitive"))))
+              .size());
+      equals(
+          "insensitive endsWith",
+          1,
+          grp.findMany(new An5Query().where(map("status", map("endsWith", "EN", "mode", "insensitive"))))
+              .size());
+      equals(
+          "insensitive in",
+          3,
+          grp.findMany(
+                  new An5Query()
+                      .where(map("status", map("in", list("PAID", "OPEN"), "mode", "insensitive"))))
+              .size());
+      equals(
+          "insensitive notIn",
+          2,
+          grp.findMany(
+                  new An5Query()
+                      .where(map("status", map("notIn", list("PAID"), "mode", "insensitive"))))
+              .size());
+
+      SqlBuilder.Where pgInsensitive =
+          SqlBuilder.parseWhere(
+              map("status", map("contains", "paid", "mode", "insensitive")),
+              Dialect.POSTGRES,
+              new LinkedHashMap<String, Object>(),
+              "",
+              "GrpOrder");
+      equals("Postgres insensitive ILIKE SQL", true, pgInsensitive.sql.contains("ILIKE"));
+
+      Map<String, Object> agg =
+          grp.aggregate(
+              new An5Aggregate()
+                  .count("_all", "note")
+                  .sum("total")
+                  .avg("total")
+                  .min("status", "total")
+                  .max("status", "total"));
+      equals("aggregate per-field _count", 4L, ((Number) agg.get("_count")).longValue());
+      equals("aggregate per-field _count_note", 2L, ((Number) agg.get("_count_note")).longValue());
+      equals("aggregate string _min_status", "cancelled", agg.get("_min_status"));
+      equals("aggregate string _max_status", "paid", agg.get("_max_status"));
+
+      Map<String, Object> havingOr =
+          map(
+              "OR",
+              list(
+                  map("_count", map("_all", map("gte", Integer.valueOf(2)))),
+                  map("_sum", map("total", map("gte", Integer.valueOf(120))))),
+              "NOT",
+              map("status", "cancelled"));
+      List<Map<String, Object>> grouped =
+          grp.groupBy(
+              new An5GroupBy()
+                  .by("status")
+                  .count("_all", "note")
+                  .sum("total")
+                  .avg("total")
+                  .min("total")
+                  .max("total")
+                  .having(havingOr)
+                  .orderBy("status", "asc"));
+      equals("groupBy having row count", 2, grouped.size());
+      equals("groupBy having first status", "open", grouped.get(0).get("status"));
+      equals("groupBy having second status", "paid", grouped.get(1).get("status"));
+      equals("paid _count", 2L, ((Number) grouped.get(1).get("_count")).longValue());
+      equals("paid _count_note", 1L, ((Number) grouped.get(1).get("_count_note")).longValue());
+      equals("paid _sum_total", 200.0, ((Number) grouped.get(1).get("_sum_total")).doubleValue());
+      equals("paid _avg_total", 100.0, ((Number) grouped.get(1).get("_avg_total")).doubleValue());
+      equals("paid _min_total", 50L, ((Number) grouped.get(1).get("_min_total")).longValue());
+      equals("paid _max_total", 150L, ((Number) grouped.get(1).get("_max_total")).longValue());
+
+      // Grouped scalar field filter in HAVING with mode: insensitive + WHERE binding order
+      List<Map<String, Object>> scopedGroup =
+          grp.groupBy(
+              new An5GroupBy()
+                  .by("status")
+                  .where(map("total", map("gte", Integer.valueOf(50))))
+                  .having(
+                      map(
+                          "status",
+                          map("in", list("PAID"), "mode", "insensitive"),
+                          "_sum",
+                          map("total", map("gte", Integer.valueOf(200)))))
+                  .orderBy("status", "asc"));
+      equals("where + having parameter order count", 1, scopedGroup.size());
+      equals("where + having status", "paid", scopedGroup.get(0).get("status"));
+
+      // Offset-only pagination on SQLite GroupBy (LIMIT -1 OFFSET 1)
+      List<Map<String, Object>> offsetOnly =
+          grp.groupBy(new An5GroupBy().by("status").orderBy("status", "asc").skip(1));
+      equals("groupBy skip-only returns 2 groups", 2, offsetOnly.size());
+      equals("groupBy skip-only first status", "open", offsetOnly.get(0).get("status"));
+
+      // Strict validation checks
+      expectInvalidQuery("invalid filter mode", grp, map("status", map("equals", "paid", "mode", "fuzzy")));
+      expectInvalidQuery("unknown model field in where", grp, map("bogus", "paid"));
+      expectInvalidQuery("collection on direct scalar", grp, map("status", list("paid")));
+      expectInvalidQuery("collection on equals", grp, map("status", map("equals", list("paid"))));
+      expectInvalidQuery("collection on not", grp, map("status", map("not", list("paid"))));
+      expectInvalidQuery("collection on gt", grp, map("total", map("gt", list(Integer.valueOf(10)))));
+      expectInvalidQuery("non-string contains", grp, map("status", map("contains", Integer.valueOf(42))));
+
+      expectInvalidGroupBy(
+          "ungrouped scalar in having",
+          grp,
+          new An5GroupBy().by("status").having(map("total", map("gte", Integer.valueOf(100)))));
+      expectInvalidGroupBy(
+          "_all inside _sum in having",
+          grp,
+          new An5GroupBy().by("status").having(map("_sum", map("_all", Integer.valueOf(1)))));
+      expectInvalidGroupBy(
+          "unknown field in having",
+          grp,
+          new An5GroupBy().by("status").having(map("_count", map("bogus", Integer.valueOf(1)))));
+      expectInvalidGroupBy(
+          "non-list OR in having",
+          grp,
+          new An5GroupBy().by("status").having(map("OR", map("status", "paid"))));
+      expectInvalidGroupBy(
+          "unknown field in aggregate count",
+          grp,
+          new An5GroupBy().by("status").count("bogus"));
+    } finally {
+      Metadata.setAdapterMetadata(null);
+      adapter.close();
+    }
+  }
+
+  private static void expectInvalidGroupBy(String label, An5TableClient client, An5GroupBy spec) {
+    try {
+      client.groupBy(spec);
+      equals(label + " throws IllegalArgumentException", true, false);
+    } catch (IllegalArgumentException expected) {
+      equals(label + " throws IllegalArgumentException", true, true);
+    } catch (Exception other) {
+      equals(label + " throws IllegalArgumentException (got " + other + ")", true, false);
     }
   }
 

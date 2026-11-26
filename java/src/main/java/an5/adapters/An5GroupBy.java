@@ -3,6 +3,7 @@ package an5.adapters;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 /**
  * A grouped aggregate: the {@code GROUP BY} columns plus the aggregates over each group.
@@ -13,6 +14,7 @@ import java.util.List;
 public class An5GroupBy extends An5Aggregate {
 
   private List<String> by = new ArrayList<String>();
+  private Map<String, Object> having;
   private Object orderBy;
   private int skip;
   private Integer take;
@@ -26,6 +28,12 @@ public class An5GroupBy extends An5Aggregate {
   @Override
   public An5GroupBy count() {
     super.count();
+    return this;
+  }
+
+  @Override
+  public An5GroupBy count(String... columns) {
+    super.count(columns);
     return this;
   }
 
@@ -54,8 +62,13 @@ public class An5GroupBy extends An5Aggregate {
   }
 
   @Override
-  public An5GroupBy where(java.util.Map<String, Object> where) {
+  public An5GroupBy where(Map<String, Object> where) {
     super.where(where);
+    return this;
+  }
+
+  public An5GroupBy having(Map<String, Object> having) {
+    this.having = having;
     return this;
   }
 
@@ -81,6 +94,10 @@ public class An5GroupBy extends An5Aggregate {
 
   public List<String> byFields() {
     return by;
+  }
+
+  public Map<String, Object> havingMap() {
+    return having;
   }
 
   public Object orderByValue() {

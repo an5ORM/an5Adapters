@@ -16,6 +16,7 @@ import java.util.Map;
 public class An5Aggregate {
 
   private boolean count;
+  private List<String> countFields = new ArrayList<String>();
   private List<String> sum = new ArrayList<String>();
   private List<String> avg = new ArrayList<String>();
   private List<String> min = new ArrayList<String>();
@@ -25,6 +26,22 @@ public class An5Aggregate {
   /** Adds {@code COUNT(*)}. */
   public An5Aggregate count() {
     this.count = true;
+    return this;
+  }
+
+  /** Adds {@code COUNT(*)} (for {@code "_all"}) and per-column non-null counts. */
+  public An5Aggregate count(String... columns) {
+    if (columns == null || columns.length == 0) {
+      this.count = true;
+      return this;
+    }
+    for (String col : columns) {
+      if ("_all".equals(col)) {
+        this.count = true;
+      } else if (col != null && !col.isEmpty() && !countFields.contains(col)) {
+        this.countFields.add(col);
+      }
+    }
     return this;
   }
 
@@ -58,6 +75,10 @@ public class An5Aggregate {
     return count;
   }
 
+  public List<String> countFields() {
+    return countFields;
+  }
+
   public List<String> sumFields() {
     return sum;
   }
@@ -88,6 +109,9 @@ public class An5Aggregate {
     List<String> expressions = new ArrayList<String>();
     if (count) {
       expressions.add("COUNT(*) AS _count");
+    }
+    for (String field : countFields) {
+      expressions.add("COUNT(" + dialect.quoteIdentifier(field) + ") AS _count_" + field);
     }
     addFor(expressions, "SUM", sumFields(), dialect);
     addFor(expressions, "AVG", avgFields(), dialect);

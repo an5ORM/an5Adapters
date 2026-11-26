@@ -81,14 +81,21 @@ public enum Dialect {
    * the two are kept apart deliberately.
    */
   public String pagination(Integer take, int skip, String orderSql) {
-    if (take == null) {
+    int safeSkip = Math.max(0, skip);
+    if (take == null && safeSkip <= 0) {
       return "";
     }
     if (this == MSSQL) {
       String prefix = orderSql == null || orderSql.isEmpty() ? " ORDER BY (SELECT NULL)" : "";
-      return prefix + " OFFSET " + Math.max(0, skip) + " ROWS FETCH NEXT " + take + " ROWS ONLY";
+      if (take == null) {
+        return prefix + " OFFSET " + safeSkip + " ROWS";
+      }
+      return prefix + " OFFSET " + safeSkip + " ROWS FETCH NEXT " + take + " ROWS ONLY";
     }
-    return " LIMIT " + take + " OFFSET " + Math.max(0, skip);
+    if (take == null) {
+      return (this == POSTGRES ? " LIMIT ALL OFFSET " : " LIMIT -1 OFFSET ") + safeSkip;
+    }
+    return " LIMIT " + take + " OFFSET " + safeSkip;
   }
 
   private static String stripWrapping(String name, String left, String right) {

@@ -401,8 +401,42 @@ public class An5TableClient {
 
   // ─── Aggregation ────────────────────────────────────────────────────────────────
 
+  private void validateAggregateFields(An5Aggregate spec) {
+    boolean hasFields = Metadata.hasFields(modelName);
+    for (String field : spec.countFields()) {
+      validateModelField(field, "_count", hasFields);
+    }
+    for (String field : spec.sumFields()) {
+      validateModelField(field, "_sum", hasFields);
+    }
+    for (String field : spec.avgFields()) {
+      validateModelField(field, "_avg", hasFields);
+    }
+    for (String field : spec.minFields()) {
+      validateModelField(field, "_min", hasFields);
+    }
+    for (String field : spec.maxFields()) {
+      validateModelField(field, "_max", hasFields);
+    }
+  }
+
+  private void validateModelField(String field, String context, boolean hasFields) {
+    if ("_all".equals(field)) {
+      if (!"_count".equals(context)) {
+        throw new IllegalArgumentException(
+            "'_all' is only valid inside '_count', not '" + context + "'");
+      }
+      return;
+    }
+    if (hasFields && !Metadata.hasField(modelName, field)) {
+      throw new IllegalArgumentException(
+          "unknown field '" + field + "' on model '" + modelName + "' in " + context);
+    }
+  }
+
   /** One row of aggregate values, keyed {@code _count}, {@code _sum_<field>} and so on. */
   public Map<String, Object> aggregate(An5Aggregate aggregate) throws SQLException {
+    validateAggregateFields(aggregate);
     List<String> expressions = aggregate.selectExpressions(dialect);
     if (expressions.isEmpty()) {
       throw new IllegalArgumentException("aggregate requires at least one aggregator column");
@@ -427,8 +461,16 @@ public class An5TableClient {
     if (byFields.isEmpty()) {
       throw new IllegalArgumentException("groupBy requires at least one 'by' column");
     }
+    boolean hasFields = Metadata.hasFields(modelName);
+    for (String byField : byFields) {
+      validateModelField(byField, "by", hasFields);
+    }
+    validateAggregateFields(group);
+
     Map<String, Object> params = new LinkedHashMap<String, Object>();
     SqlBuilder.Where where = SqlBuilder.parseWhere(group.whereMap(), dialect, params, "", modelName);
+    SqlBuilder.Where having =
+        SqlBuilder.buildHaving(group.havingMap(), dialect, byFields, params, "h_", modelName);
 
     String byColumns = quoteAll(byFields);
     // Counted unconditionally: a group is only useful next to its size, and a group whose
@@ -452,6 +494,9 @@ public class An5TableClient {
       sql.append(" WHERE ").append(where.sql);
     }
     sql.append(" GROUP BY ").append(byColumns);
+    if (!having.isEmpty()) {
+      sql.append(" HAVING ").append(having.sql);
+    }
 
     Integer take = group.takeValue();
     int skip = group.skipValue();
@@ -466,9 +511,9 @@ public class An5TableClient {
       sql.append(' ').append(orderSql);
     }
     if (paging) {
-      sql.append(dialect.pagination(take == null ? 1 : take, skip, orderSql));
+      sql.append(dialect.pagination(take, skip, orderSql));
     }
-    return adapter.exec(sql.toString(), where.params);
+    return adapter.exec(sql.toString(), new ArrayList<Object>(params.values()));
   }
 
   // ─── Vector search ──────────────────────────────────────────────────────────────
