@@ -33,7 +33,7 @@ import {
   type VectorHealthResult,
   type VectorStoreProvider,
 } from './vector';
-import { bindParam, buildOrderBy, parseWhere, quote, type WhereContext } from './base/sql';
+import { bindParam, buildHaving, buildOrderBy, parseWhere, quote, sanitizeParamName, type WhereContext } from './base/sql';
 import {
   decodeVector,
   isVectorField,
@@ -63,11 +63,6 @@ export type AnyAdapterConfig = An5AdapterConfig | An5SheetsAdapterConfig | { con
 
 function isSheetsConfig(config: AnyAdapterConfig): config is An5SheetsAdapterConfig {
   return (config as any).spreadsheetId !== undefined;
-}
-
-function sanitizeParamName(name: string): string {
-  const cleaned = String(name).replace(/[^A-Za-z0-9_]/g, '_');
-  return /^[A-Za-z]/.test(cleaned) ? cleaned : `p_${cleaned}`;
 }
 
 /** Match only unique/primary-key violations, never general constraint errors. */
@@ -1314,16 +1309,23 @@ export class AdapterTableClient<T = any> {
 
   async groupBy(args: any): Promise<any[]> {
     const params: Record<string, any> = {};
-    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect, '', this.whereContext());
+    const whereCtx = this.whereContext();
+    const whereSql = parseWhere(this.modelName, args?.where, params, this.dialect, '', whereCtx);
     const byFields = normalizeByFields(args?.by);
     if (byFields.length === 0) throw new Error("groupBy requires 'by' fields");
     const byCols = byFields.map((b: string) => quote(b, this.dialect)).join(', ');
     const aggs: string[] = ['COUNT(*) AS _count'];
-    if (args?._sum) for (const f of selectedAggregateFields(args._sum)) aggs.push(`SUM(${quote(f, this.dialect)}) AS _sum_${f}`);
-    if (args?._avg) for (const f of selectedAggregateFields(args._avg)) aggs.push(`AVG(${quote(f, this.dialect)}) AS _avg_${f}`);
-    if (args?._min) for (const f of selectedAggregateFields(args._min)) aggs.push(`MIN(${quote(f, this.dialect)}) AS _min_${f}`);
-    if (args?._max) for (const f of selectedAggregateFields(args._max)) aggs.push(`MAX(${quote(f, this.dialect)}) AS _max_${f}`);
-    let query = `SELECT ${byCols}, ${aggs.join(', ')} FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''} GROUP BY ${byCols}`;
+    if (args?._count && typeof args._count === 'object') {
+      for (const f of selectedAggregateFields(args._count)) {
+        if (f !== '_all') aggs.push(`COUNT(${quote(f, this.dialect)}) AS _count_${sanitizeParamName(f)}`);
+      }
+    }
+    if (args?._sum) for (const f of selectedAggregateFields(args._sum)) aggs.push(`SUM(${quote(f, this.dialect)}) AS _sum_${sanitizeParamName(f)}`);
+    if (args?._avg) for (const f of selectedAggregateFields(args._avg)) aggs.push(`AVG(${quote(f, this.dialect)}) AS _avg_${sanitizeParamName(f)}`);
+    if (args?._min) for (const f of selectedAggregateFields(args._min)) aggs.push(`MIN(${quote(f, this.dialect)}) AS _min_${sanitizeParamName(f)}`);
+    if (args?._max) for (const f of selectedAggregateFields(args._max)) aggs.push(`MAX(${quote(f, this.dialect)}) AS _max_${sanitizeParamName(f)}`);
+    const havingSql = buildHaving(args?.having, params, this.dialect, byFields, this.modelName, 'having_', whereCtx);
+    let query = `SELECT ${byCols}, ${aggs.join(', ')} FROM ${this.tableName}${whereSql ? ` WHERE ${whereSql}` : ''} GROUP BY ${byCols}${havingSql ? ` HAVING ${havingSql}` : ''}`;
     const orderSql = buildOrderBy(args?.orderBy, this.dialect);
     const hasSkip = args?.skip !== undefined && args?.skip !== null;
     const hasTake = args?.take !== undefined && args?.take !== null;
@@ -1352,34 +1354,35 @@ export class AdapterTableClient<T = any> {
         if (typeof args._count === 'object') {
           for (const f of selectedAggregateFields(args._count)) {
             if (f === '_all') continue;
-            res._count[f] = row[`_count_${f}`] !== undefined ? Number(row[`_count_${f}`]) : allCount;
+            const k = `_count_${sanitizeParamName(f)}`;
+            res._count[f] = row[k] !== undefined ? Number(row[k]) : allCount;
           }
         }
       }
       if (args._sum) {
         res._sum = {};
         for (const f of selectedAggregateFields(args._sum)) {
-          const val = row[`_sum_${f}`];
+          const val = row[`_sum_${sanitizeParamName(f)}`];
           res._sum[f] = val !== null && val !== undefined ? Number(val) : null;
         }
       }
       if (args._avg) {
         res._avg = {};
         for (const f of selectedAggregateFields(args._avg)) {
-          const val = row[`_avg_${f}`];
+          const val = row[`_avg_${sanitizeParamName(f)}`];
           res._avg[f] = val !== null && val !== undefined ? Number(val) : null;
         }
       }
       if (args._min) {
         res._min = {};
         for (const f of selectedAggregateFields(args._min)) {
-          res._min[f] = row[`_min_${f}`] ?? null;
+          res._min[f] = row[`_min_${sanitizeParamName(f)}`] ?? null;
         }
       }
       if (args._max) {
         res._max = {};
         for (const f of selectedAggregateFields(args._max)) {
-          res._max[f] = row[`_max_${f}`] ?? null;
+          res._max[f] = row[`_max_${sanitizeParamName(f)}`] ?? null;
         }
       }
       return res;

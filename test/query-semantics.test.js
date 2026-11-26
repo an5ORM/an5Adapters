@@ -5,8 +5,9 @@ try { ({ DatabaseSync } = require('node:sqlite')); } catch (error) {
   if (error.code !== 'ERR_UNKNOWN_BUILTIN_MODULE') throw error;
 }
 const test = (name, fn) => nodeTest(name, { skip: !DatabaseSync && 'SQLite regression tests require Node.js 22.13+' }, fn);
-const { parseWhere } = require('../dist/base/sql.js');
-const { matchWhere } = require('../dist/googlesheets/helpers.js');
+const { parseWhere, buildHaving } = require('../dist/base/sql.js');
+const { matchWhere, matchHaving } = require('../dist/googlesheets/helpers.js');
+const { SheetsTableClient } = require('../dist/googlesheets/tableClient.js');
 
 const rows = [{ id: 1, score: 0 }, { id: 2, score: 10 }, { id: 3, score: 20 }];
 function query(where, ctx) {
@@ -464,4 +465,151 @@ nodeTest('Google Sheets matchWhere rejects malformed filters and supports mode i
   assert.deepEqual(sample.filter(r => matchWhere(r, { title: { equals: null, mode: 'insensitive' } })).map(r => r.id), [3]);
   assert.deepEqual(sample.filter(r => matchWhere(r, { title: { equals: 'ALICE', mode: 'insensitive' } })).map(r => r.id), [1]);
   assert.deepEqual(sample.filter(r => matchWhere(r, { title: { in: ['alice'], mode: 'insensitive' } })).map(r => r.id), [1]);
+});
+
+test('groupBy supports having aggregate and grouped scalar filters on SQLite plus per-field _count', async () => {
+  const { setAdapterMetadata } = require('../dist/base/metadata.js');
+  const db = new DatabaseSync(':memory:');
+  setAdapterMetadata({
+    modelToTable: { Order: 'orders' },
+    modelFields: {
+      Order: {
+        id: { ts: 'number', isId: true },
+        status: { ts: 'string' },
+        total: { ts: 'number' },
+        note: { ts: 'string?' },
+      },
+    },
+  });
+  try {
+    db.exec(`CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT, total INTEGER, note TEXT NULL);
+      INSERT INTO orders VALUES
+        (1, 'Paid', 100, 'vip'),
+        (2, 'Paid', 200, NULL),
+        (3, 'Open', 50, 'hold'),
+        (4, 'Open', 60, 'hold'),
+        (5, 'Void', 10, NULL);`);
+    const table = new AdapterTableClient({ dialect: 'sqlite', exec: async (sql, params) => db.prepare(sql).all(params) }, 'Order');
+
+    const byTotal = await table.groupBy({
+      by: 'status',
+      _count: { _all: true, note: true },
+      _sum: { total: true },
+      _avg: { total: true },
+      _min: { total: true },
+      _max: { total: true },
+      having: { _sum: { total: { gte: 110 } }, _count: { note: { gte: 1 } } },
+      orderBy: { status: 'asc' },
+    });
+    assert.deepEqual(byTotal.map(r => ({
+      status: r.status,
+      all: r._count._all,
+      note: r._count.note,
+      sum: r._sum.total,
+      avg: r._avg.total,
+      min: r._min.total,
+      max: r._max.total,
+    })), [
+      { status: 'Open', all: 2, note: 2, sum: 110, avg: 55, min: 50, max: 60 },
+      { status: 'Paid', all: 2, note: 1, sum: 300, avg: 150, min: 100, max: 200 },
+    ]);
+
+    const combinedHaving = await table.groupBy({
+      by: ['status'],
+      where: { total: { gte: 10 } },
+      _count: true,
+      having: {
+        OR: [
+          { status: { equals: 'void', mode: 'insensitive' } },
+          { AND: [{ _avg: { total: { gt: 100 } } }, { NOT: { _min: { total: { lt: 50 } } } }] },
+        ],
+      },
+      orderBy: { status: 'asc' },
+    });
+    assert.deepEqual(combinedHaving.map(r => [r.status, r._count]), [['Paid', 2], ['Void', 1]]);
+
+    await assert.rejects(() => table.groupBy({ by: ['status'], having: { total: { gt: 10 } } }), /must be included in groupBy/);
+    await assert.rejects(() => table.groupBy({ by: ['status'], having: { _sum: { _all: 1 } } }), /does not support '_all'/);
+    await assert.rejects(() => table.groupBy({ by: ['status'], having: { _unknown: { total: 1 } } }), /Unknown having aggregate key/);
+    await assert.rejects(() => table.groupBy({ by: ['status'], having: { _sum: { missingCol: 1 } } }), /Unknown field 'missingCol'/);
+    await assert.rejects(() => table.groupBy({ by: ['status'], having: { _sum: { total: { bogus: 1 } } } }), /Unknown filter operator 'bogus'/);
+    await assert.rejects(() => table.groupBy({ by: ['status'], having: { _sum: { total: { some: {} } } } }), /Relation filter operator 'some'/);
+  } finally {
+    setAdapterMetadata({});
+    db.close();
+  }
+});
+
+nodeTest('buildHaving quotes aggregate expressions per SQL dialect and rejects malformed clauses', () => {
+  for (const [dialect, expected] of [
+    ['postgres', 'SUM("total") >= @having__sum_total_gte'],
+    ['mysql', 'SUM(`total`) >= @having__sum_total_gte'],
+    ['mssql', 'SUM([total]) >= @having__sum_total_gte'],
+    ['sqlite', 'SUM([total]) >= @having__sum_total_gte'],
+  ]) {
+    const params = {};
+    const sql = buildHaving({ _sum: { total: { gte: 100 } }, _count: { _all: { not: { lt: 2 } } } }, params, dialect, ['status']);
+    assert.ok(sql.includes(expected), sql);
+    assert.ok(sql.includes('NOT (COUNT(*) < @having__count__all_not_lt)'), sql);
+  }
+  assert.throws(() => buildHaving('bad', {}, 'sqlite', ['status']), /plain object/);
+  assert.throws(() => buildHaving({ OR: { _count: { _all: 1 } } }, {}, 'sqlite', ['status']), /OR filter must be an array/);
+  assert.throws(() => buildHaving({ _sum: 'bad' }, {}, 'sqlite', ['status']), /plain object/);
+  assert.equal(matchHaving([{ status: 'paid', total: 100 }], ['status'], { _sum: { total: { gte: 100 } } }), true);
+});
+
+nodeTest('SheetsTableClient.groupBy supports aggregates, having filters, ordering, and pagination', async () => {
+  const sheetRows = [
+    ['id', 'status', 'total', 'note'],
+    ['1', 'a|b', '100', 'vip'],
+    ['2', 'a|b', '200', ''],
+    ['3', 'open', '40', 'hold'],
+    ['4', 'void', '5', ''],
+  ];
+  const fakeAdapter = {
+    config: { spreadsheetId: 'sheet-1' },
+    getSheets: async () => ({
+      spreadsheets: { values: { get: async () => ({ data: { values: sheetRows } }) } },
+    }),
+  };
+  const client = new SheetsTableClient(fakeAdapter, 'Order');
+  const rows = await client.groupBy({
+    by: 'status',
+    _count: { _all: true, note: true },
+    _sum: { total: true },
+    _avg: { total: true },
+    _min: { total: true },
+    _max: { total: true },
+    having: { _sum: { total: { gte: 40 } } },
+    orderBy: { status: 'asc' },
+    skip: 0,
+    take: 5,
+  });
+  assert.deepEqual(rows, [
+    {
+      status: 'a|b',
+      _count: { _all: 2, note: 1 },
+      _sum: { total: 300 },
+      _avg: { total: 150 },
+      _min: { total: 100 },
+      _max: { total: 200 },
+    },
+    {
+      status: 'open',
+      _count: { _all: 1, note: 1 },
+      _sum: { total: 40 },
+      _avg: { total: 40 },
+      _min: { total: 40 },
+      _max: { total: 40 },
+    },
+  ]);
+
+  const emptyGroupHaving = await client.groupBy({
+    by: 'status',
+    having: { OR: [] },
+  });
+  assert.deepEqual(emptyGroupHaving, []);
+
+  await assert.rejects(() => client.groupBy({ by: 'status', having: { total: { gt: 10 } } }), /must be included in groupBy/);
+  await assert.rejects(() => client.groupBy({ by: [] }), /groupBy requires 'by' fields/);
 });

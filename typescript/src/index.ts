@@ -6,7 +6,7 @@ export {
   executorFromAdapter,
   setAdapterMetadata,
 } from './an5Adapter';
-export { parseWhere, buildOrderBy, quote } from './base/sql';
+export { parseWhere, buildHaving, buildOrderBy, quote } from './base/sql';
 export { resolveRelationKeys } from './base/metadata';
 export {
   NBaseVectorClient,

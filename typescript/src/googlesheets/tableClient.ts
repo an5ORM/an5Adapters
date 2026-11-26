@@ -1,7 +1,7 @@
 import { generateUUID } from '../base/uuid';
 import { getFieldsForModel, resolveIdField } from '../base/metadata';
 import type { An5SheetsAdapter } from './adapter';
-import { buildOrderBy, coerceCell, esc, matchWhere, resolveSheetName, sortRows } from './helpers';
+import { buildOrderBy, coerceCell, computeGroupAggregates, esc, matchHaving, matchWhere, resolveSheetName, sortRows } from './helpers';
 import { withRetry } from './retry';
 
 // ─── Utility ──────────────────────────────────────────────────────────────────
@@ -387,23 +387,75 @@ export class SheetsTableClient<T = any> {
   }
 
   async groupBy(args: any): Promise<any[]> {
-    const rows = await this.findMany({ where: args?.where });
-    const byCols: string[] = args.by || [];
+    const byCols: string[] = Array.isArray(args?.by)
+      ? args.by.filter((b: unknown): b is string => typeof b === 'string' && b.length > 0)
+      : typeof args?.by === 'string' && args.by.length > 0
+        ? [args.by]
+        : [];
+    if (byCols.length === 0) throw new Error("groupBy requires 'by' fields");
 
-    const groups: Record<string, any[]> = {};
+    const rows = await this.findMany({ where: args?.where });
+    const groups = new Map<string, { keys: Record<string, any>; rows: Record<string, any>[] }>();
+
     for (const row of rows) {
-      const key = byCols.map(c => (row as any)[c]).join('|');
-      if (!groups[key]) groups[key] = [];
-      groups[key].push(row);
+      const keyTuple = byCols.map(c => (row as any)[c] ?? null);
+      const bucketKey = JSON.stringify(keyTuple);
+      let entry = groups.get(bucketKey);
+      if (!entry) {
+        const keys: Record<string, any> = {};
+        byCols.forEach((c, i) => { keys[c] = keyTuple[i]; });
+        entry = { keys, rows: [] };
+        groups.set(bucketKey, entry);
+      }
+      entry.rows.push(row as Record<string, any>);
     }
 
-    return Object.entries(groups).map(([key, group]) => {
-      const entry: any = {};
-      const parts = key.split('|');
-      byCols.forEach((c, i) => { entry[c] = parts[i]; });
-      entry._count = group.length;
-      return entry;
-    });
+    const selected = (map: any): string[] =>
+      map && typeof map === 'object' ? Object.keys(map).filter(k => Boolean(map[k])) : [];
+
+    let results: any[] = [];
+    for (const group of groups.values()) {
+      if (!matchHaving(group.rows, byCols, args?.having)) continue;
+      const entry: any = { ...group.keys };
+      const hasAggs = args?._count || args?._sum || args?._avg || args?._min || args?._max;
+      if (!hasAggs) {
+        entry._count = group.rows.length;
+      } else {
+        if (args?._count) {
+          if (typeof args._count === 'object') {
+            entry._count = { _all: group.rows.length };
+            for (const f of selected(args._count)) {
+              if (f === '_all') continue;
+              entry._count[f] = computeGroupAggregates(group.rows, '_count', f);
+            }
+          } else {
+            entry._count = group.rows.length;
+          }
+        }
+        for (const aggKey of ['_sum', '_avg', '_min', '_max'] as const) {
+          if (args?.[aggKey]) {
+            entry[aggKey] = {};
+            for (const f of selected(args[aggKey])) {
+              entry[aggKey][f] = computeGroupAggregates(group.rows, aggKey, f);
+            }
+          }
+        }
+      }
+      results.push(entry);
+    }
+
+    const orderSql = buildOrderBy(args?.orderBy);
+    if (orderSql) results = sortRows(results, orderSql);
+
+    const skip = typeof args?.skip === 'number' && args.skip >= 0 ? Math.floor(args.skip) : 0;
+    if (args?.take !== undefined && args?.take !== null) {
+      const take = Math.max(0, Math.floor(Number(args.take)));
+      results = results.slice(skip, skip + take);
+    } else if (skip > 0) {
+      results = results.slice(skip);
+    }
+
+    return results;
   }
 
   async vectorSearch(args: {
