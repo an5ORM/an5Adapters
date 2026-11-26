@@ -10,7 +10,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 from an5_adapter import create_an5_adapter  # noqa: E402
 from base.metadata import set_adapter_metadata  # noqa: E402
-from base.sql import _parse_where  # noqa: E402
+from base.sql import _parse_where, _build_having  # noqa: E402
 
 FIXTURES = json.loads((Path(__file__).resolve().parents[1] / "fixtures/query-semantics.json").read_text())
 
@@ -28,6 +28,7 @@ class StringFilter:
     gte: Optional[str] = None
     lt: Optional[str] = None
     lte: Optional[str] = None
+    mode: Optional[str] = None
 
 
 @dataclass
@@ -311,6 +312,102 @@ class QuerySemantics(unittest.TestCase):
         set_adapter_metadata({"model_to_table": TEST_METADATA["model_to_table"], "model_fields": TEST_METADATA["model_fields"], "relation_map": {}})
         with self.assertRaises(ValueError):
             _parse_where("user", {"orders": {"some": {"totalAmount": {"gte": 10}}}}, {}, "sqlite")
+
+    def test_mode_insensitive_and_dialect_sql(self):
+        set_adapter_metadata(TEST_METADATA)
+        pg_params = {}
+        pg_sql = _parse_where("user", {"email": {"contains": "Alice", "mode": "insensitive"}}, pg_params, "postgres")
+        self.assertEqual(pg_sql, '"email" ILIKE %s')
+        self.assertEqual(list(pg_params.values()), ["%Alice%"])
+
+        sqlite_params = {}
+        sqlite_sql = _parse_where("user", {"email": StringFilter(in_=["ALICE@EXAMPLE.COM", "BOB@EXAMPLE.COM"], mode="insensitive")}, sqlite_params, "sqlite")
+        self.assertIn('LOWER("email") IN (LOWER(?), LOWER(?))', sqlite_sql)
+        self.assertEqual(list(sqlite_params.values()), ["ALICE@EXAMPLE.COM", "BOB@EXAMPLE.COM"])
+
+        mssql_params = {}
+        mssql_sql = _parse_where("user", {"email": {"contains": "Alice", "mode": "insensitive"}}, mssql_params, "mssql")
+        self.assertEqual(mssql_sql, "LOWER([email]) LIKE LOWER(?)")
+        self.assertEqual(list(mssql_params.values()), ["%Alice%"])
+
+        db = create_an5_adapter("sqlite::memory:")
+        try:
+            db.execute_raw("CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT NOT NULL, isActive INTEGER, score INTEGER, createdAt TEXT)")
+            db.user.create({"id": "u1", "email": "Alice@Example.com", "isActive": True, "score": 10, "createdAt": "2026-01-01"})
+            db.user.create({"id": "u2", "email": "bob@example.com", "isActive": True, "score": 20, "createdAt": "2026-01-02"})
+
+            rows = db.user.find_many(where=UserWhereInput(email=StringFilter(contains="alice", mode="insensitive")))
+            self.assertEqual([r["id"] for r in rows], ["u1"])
+
+            rows_not = db.user.find_many(where={"email": {"not": "ALICE@EXAMPLE.COM", "mode": "insensitive"}})
+            self.assertEqual([r["id"] for r in rows_not], ["u2"])
+        finally:
+            db.close()
+
+    def test_group_by_having_per_field_count_and_offset_pagination(self):
+        set_adapter_metadata(TEST_METADATA)
+        db = create_an5_adapter("sqlite::memory:")
+        try:
+            db.execute_raw("CREATE TABLE orders (id TEXT PRIMARY KEY, userId TEXT NOT NULL, totalAmount INTEGER, createdAt TEXT)")
+            db.order.create({"id": "o1", "user_id": "u1", "total_amount": 40, "created_at": "2026-01-01"})
+            db.order.create({"id": "o2", "user_id": "u1", "total_amount": 60, "created_at": None})
+            db.order.create({"id": "o3", "user_id": "u2", "total_amount": 25, "created_at": "2026-01-03"})
+            db.order.create({"id": "o4", "user_id": "u3", "total_amount": 200, "created_at": "2026-01-04"})
+
+            agg = db.order.aggregate(where={"user_id": "u1"}, _count={"_all": True, "created_at": True}, _sum={"total_amount": True})
+            self.assertEqual(agg["_count"], {"_all": 2, "createdAt": 1})
+
+            grouped = db.order.group_by(
+                by="user_id",
+                where={"total_amount": {"gte": 20}},
+                having={
+                    "OR": [
+                        {"_count": {"_all": {"gte": 2}}, "_sum": {"total_amount": {"gte": 100}}},
+                        {"user_id": {"in": ["u3"]}},
+                    ]
+                },
+                order_by={"user_id": "asc"},
+                _count={"_all": True, "created_at": True},
+                _sum={"total_amount": True},
+            )
+            self.assertEqual([g["userId"] for g in grouped], ["u1", "u3"])
+            self.assertEqual(grouped[0]["_count"], {"_all": 2, "createdAt": 1})
+            self.assertEqual(grouped[0]["_sum"]["totalAmount"], 100.0)
+
+            paged = db.order.group_by(
+                by="user_id",
+                having={"_sum": {"total_amount": {"gte": 25}}},
+                order_by={"user_id": "asc"},
+                skip=1,
+            )
+            self.assertEqual([g["userId"] for g in paged], ["u2", "u3"])
+        finally:
+            db.close()
+
+    def test_having_and_operand_validation(self):
+        set_adapter_metadata(TEST_METADATA)
+        with self.assertRaises(ValueError):
+            _parse_where("user", {"email": {"contains": "a", "mode": "fuzzy"}}, {}, "sqlite")
+        with self.assertRaises(ValueError):
+            _parse_where("user", {"email": ["a", "b"]}, {}, "sqlite")
+        with self.assertRaises(ValueError):
+            _parse_where("user", {"email": {"contains": 123}}, {}, "sqlite")
+        with self.assertRaises(ValueError):
+            _parse_where("user", {"score": {"gt": None}}, {}, "sqlite")
+        with self.assertRaises(ValueError):
+            _parse_where("user", {"email": {"not": ["a"]}}, {}, "sqlite")
+        with self.assertRaises(ValueError):
+            _parse_where("user", {"email": {"in": "abc"}}, {}, "sqlite")
+        with self.assertRaises(ValueError):
+            _parse_where("user", {"OR": "not-a-list"}, {}, "sqlite")
+        with self.assertRaises(ValueError):
+            _build_having({"total_amount": {"gt": 10}}, {}, "sqlite", by_fields=["userId"], model_name="order")
+        with self.assertRaises(ValueError):
+            _build_having({"_sum": {"_all": {"gt": 10}}}, {}, "sqlite", by_fields=["userId"], model_name="order")
+        with self.assertRaises(ValueError):
+            _build_having({"_unknown": {"total_amount": {"gt": 1}}}, {}, "sqlite", by_fields=["userId"], model_name="order")
+        with self.assertRaises(ValueError):
+            _build_having({"_sum": {"missing_field": {"gt": 1}}}, {}, "sqlite", by_fields=["userId"], model_name="order")
 
 
 if __name__ == "__main__":

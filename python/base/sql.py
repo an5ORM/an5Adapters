@@ -31,6 +31,25 @@ def _sanitize_param_name(name: str) -> str:
     return cleaned if cleaned[:1].isalpha() else f"p_{cleaned}"
 
 
+def _bind_param(params: Dict[str, Any], name: str, value: Any) -> str:
+    """Allocate a unique parameter key in insertion order without overwriting siblings."""
+    candidate = name
+    suffix = 1
+    while candidate in params:
+        candidate = f"{name}_{suffix}"
+        suffix += 1
+    params[candidate] = value
+    return candidate
+
+
+def _format_pattern_condition(expr: str, placeholder: str, dialect: str, insensitive: bool) -> str:
+    if not insensitive:
+        return f"{expr} LIKE {placeholder}"
+    if dialect == DIALECT_POSTGRES:
+        return f"{expr} ILIKE {placeholder}"
+    return f"LOWER({expr}) LIKE LOWER({placeholder})"
+
+
 def _normalize_sort_direction(direction: Any) -> str:
     return "DESC" if isinstance(direction, str) and direction.upper() == "DESC" else "ASC"
 
@@ -39,7 +58,14 @@ def _normalize_sort_direction(direction: Any) -> str:
 
 # ─── Where clause builder ──────────────────────────────────────────────────────────
 
-_OPERATOR_KEYS = {"equals", "in", "notIn", "contains", "startsWith", "endsWith", "not", "gte", "lte", "gt", "lt"}
+_OPERATOR_KEYS = {"equals", "in", "notIn", "contains", "startsWith", "endsWith", "not", "gte", "lte", "gt", "lt", "mode"}
+_HAVING_AGGREGATES = {
+    "_count": "COUNT",
+    "_sum": "SUM",
+    "_avg": "AVG",
+    "_min": "MIN",
+    "_max": "MAX",
+}
 _OPERATOR_ALIASES = {
     "not_": "not",
     "in_": "in",
@@ -50,6 +76,10 @@ _OPERATOR_ALIASES = {
 _RELATION_MANY_KEYS = {"some", "none", "every"}
 _RELATION_ONE_KEYS = {"is", "isNot"}
 _RELATION_OPERATOR_ALIASES = {"is_not": "isNot", "is_": "is"}
+
+
+def _is_dataclass_instance(value: Any) -> bool:
+    return is_dataclass(value) and not isinstance(value, type)
 
 
 def _normalize_dataclass_dict(value: Any) -> Any:
@@ -179,11 +209,174 @@ def _parse_relation_filter(model_name: str, relation: Dict[str, str], value: Any
     return " AND ".join(parts) if parts else None
 
 
+def _build_expr_conditions(
+    expr: str,
+    field_label: str,
+    value: Any,
+    params: Dict[str, Any],
+    dialect: str,
+    param_base: str,
+    nested_prefix: str = "",
+) -> List[str]:
+    if _is_dataclass_instance(value):
+        value = _normalize_dataclass_dict(value)
+    if isinstance(value, (list, tuple, set)):
+        raise ValueError(f"Invalid collection filter value for field '{field_label}'; use {{'in': [...]}} instead")
+
+    conditions: List[str] = []
+    placeholder = "%s" if dialect == DIALECT_POSTGRES else "?"
+
+    if value is None:
+        conditions.append(f"{expr} IS NULL")
+        return conditions
+
+    if isinstance(value, dict):
+        value = _normalize_operator_dict(value, field_label)
+        if "mode" in value and value["mode"] is not None and value["mode"] not in ("default", "insensitive"):
+            raise ValueError(
+                f"Invalid filter mode '{value['mode']}' on field '{field_label}'; expected 'default' or 'insensitive'"
+            )
+        insensitive = value.get("mode") == "insensitive"
+
+        if "not" in value:
+            not_val = value["not"]
+            if not_val is None:
+                conditions.append(f"{expr} IS NOT NULL")
+            elif isinstance(not_val, (list, tuple, set)):
+                raise ValueError(f"Filter operator 'not' on field '{field_label}' cannot be a collection; use 'notIn' instead")
+            elif isinstance(not_val, dict) or _is_dataclass_instance(not_val):
+                next_prefix = nested_prefix or _sanitize_param_name(f"{param_base}_not")
+                nested = _build_expr_conditions(
+                    expr,
+                    field_label,
+                    not_val,
+                    params,
+                    dialect,
+                    next_prefix,
+                    _sanitize_param_name(f"{next_prefix}_not"),
+                )
+                if nested:
+                    conditions.append(f"NOT ({' AND '.join(nested)})")
+            else:
+                _bind_param(params, f"{param_base}_not", not_val)
+                if insensitive and isinstance(not_val, str):
+                    conditions.append(f"LOWER({expr}) <> LOWER({placeholder})")
+                else:
+                    conditions.append(f"{expr} <> {placeholder}")
+
+        if "equals" in value:
+            if value["equals"] is None:
+                conditions.append(f"{expr} IS NULL")
+            elif isinstance(value["equals"], (list, tuple, set, dict)) or _is_dataclass_instance(value["equals"]):
+                raise ValueError(f"Filter operator 'equals' on field '{field_label}' must be a scalar value or None")
+            else:
+                eq_val = value["equals"]
+                _bind_param(params, f"{param_base}_eq", eq_val)
+                if insensitive and isinstance(eq_val, str):
+                    conditions.append(f"LOWER({expr}) = LOWER({placeholder})")
+                else:
+                    conditions.append(f"{expr} = {placeholder}")
+
+        if "contains" in value:
+            if not isinstance(value["contains"], str):
+                raise ValueError(f"Filter operator 'contains' on field '{field_label}' must be a string")
+            _bind_param(params, f"{param_base}_co", f"%{value['contains']}%")
+            conditions.append(_format_pattern_condition(expr, placeholder, dialect, insensitive))
+
+        if "startsWith" in value:
+            if not isinstance(value["startsWith"], str):
+                raise ValueError(f"Filter operator 'startsWith' on field '{field_label}' must be a string")
+            _bind_param(params, f"{param_base}_sw", f"{value['startsWith']}%")
+            conditions.append(_format_pattern_condition(expr, placeholder, dialect, insensitive))
+
+        if "endsWith" in value:
+            if not isinstance(value["endsWith"], str):
+                raise ValueError(f"Filter operator 'endsWith' on field '{field_label}' must be a string")
+            _bind_param(params, f"{param_base}_ew", f"%{value['endsWith']}")
+            conditions.append(_format_pattern_condition(expr, placeholder, dialect, insensitive))
+
+        for op, sql_op, suffix in (("gte", ">=", "gte"), ("lte", "<=", "lte"), ("gt", ">", "gt"), ("lt", "<", "lt")):
+            if op in value:
+                operand = value[op]
+                if operand is None or isinstance(operand, (list, tuple, set, dict)) or _is_dataclass_instance(operand):
+                    raise ValueError(f"Filter operator '{op}' on field '{field_label}' must be a scalar comparison value")
+                _bind_param(params, f"{param_base}_{suffix}", operand)
+                conditions.append(f"{expr} {sql_op} {placeholder}")
+
+        if "in" in value:
+            vals = value["in"]
+            if not isinstance(vals, (list, tuple)):
+                raise ValueError(f"Filter operator 'in' on field '{field_label}' must be a list or tuple")
+            if vals:
+                lower = insensitive and any(isinstance(x, str) for x in vals)
+                in_placeholders: List[str] = []
+                for i, v in enumerate(vals):
+                    _bind_param(params, f"{param_base}_in{i}", v)
+                    in_placeholders.append(f"LOWER({placeholder})" if lower and isinstance(v, str) else placeholder)
+                lhs = f"LOWER({expr})" if lower else expr
+                conditions.append(f"{lhs} IN ({', '.join(in_placeholders)})")
+            else:
+                conditions.append("1=0")
+
+        if "notIn" in value:
+            vals = value["notIn"]
+            if not isinstance(vals, (list, tuple)):
+                raise ValueError(f"Filter operator 'notIn' on field '{field_label}' must be a list or tuple")
+            if vals:
+                lower = insensitive and any(isinstance(x, str) for x in vals)
+                notin_placeholders: List[str] = []
+                for i, v in enumerate(vals):
+                    _bind_param(params, f"{param_base}_notin{i}", v)
+                    notin_placeholders.append(f"LOWER({placeholder})" if lower and isinstance(v, str) else placeholder)
+                lhs = f"LOWER({expr})" if lower else expr
+                conditions.append(f"{lhs} NOT IN ({', '.join(notin_placeholders)})")
+            else:
+                conditions.append("1=1")
+
+        return conditions
+
+    _bind_param(params, param_base, value)
+    conditions.append(f"{expr} = {placeholder}")
+    return conditions
+
+
+def _parse_logical_group(key: str, value: Any, recurse_fn: Any, prefix: str) -> Optional[str]:
+    if key == "OR":
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("OR filter must be a list of filter mappings or dataclasses")
+        sub = []
+        for i, v in enumerate(value):
+            if not (isinstance(v, dict) or _is_dataclass_instance(v)):
+                raise ValueError("OR filter entries must be mappings or filter dataclasses")
+            sub.append(recurse_fn(v, f"{prefix}or{i}_") or "1=1")
+        return f"({' OR '.join(sub)})" if sub else "1=0"
+
+    if not (isinstance(value, (list, tuple, dict)) or _is_dataclass_instance(value)):
+        raise ValueError(f"{key} filter must be a mapping, filter dataclass, or list thereof")
+    items = value if isinstance(value, (list, tuple)) else [value]
+    sub = []
+    for i, v in enumerate(items):
+        if not (isinstance(v, dict) or _is_dataclass_instance(v)):
+            raise ValueError(f"{key} filter entries must be mappings or filter dataclasses")
+        part = recurse_fn(v, f"{prefix}{key.lower()}{i}_")
+        if key == "NOT":
+            sub.append(part or "1=1")
+        elif part:
+            sub.append(part)
+    if not sub:
+        return None
+    if key == "NOT":
+        return f"NOT ({' OR '.join(sub)})"
+    return f"({' AND '.join(sub)})"
+
+
 def _parse_where(model_name: str, where: Optional[Any], params: Dict, dialect: str, prefix: str = "", self_ref: str = "", col_prefix: str = "") -> str:
     if where is None:
         return ""
-    if is_dataclass(where) and not isinstance(where, type):
+    if _is_dataclass_instance(where):
         where = _normalize_dataclass_dict(where)
+    if not isinstance(where, dict):
+        raise ValueError("Where clause must be a mapping or filter dataclass")
     if not where:
         return ""
     conditions: List[str] = []
@@ -193,7 +386,7 @@ def _parse_where(model_name: str, where: Optional[Any], params: Dict, dialect: s
 
     clean_where: Dict[str, Any] = {}
     for key, raw_value in where.items():
-        val = _normalize_dataclass_dict(raw_value) if is_dataclass(raw_value) and not isinstance(raw_value, type) else raw_value
+        val = _normalize_dataclass_dict(raw_value) if _is_dataclass_instance(raw_value) else raw_value
         if (
             "_" in key
             and key not in field_map
@@ -209,20 +402,15 @@ def _parse_where(model_name: str, where: Optional[Any], params: Dict, dialect: s
             clean_where[key] = val
 
     for key, value in clean_where.items():
-        if key == "OR" and isinstance(value, list):
-            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}or{i}_", self_ref=self_ref, col_prefix=col_prefix) or "1=1" for i, v in enumerate(value)]
-            conditions.append(f"({' OR '.join(sub)})" if sub else "1=0")
-        elif key == "AND":
-            items = value if isinstance(value, list) else [value]
-            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}and{i}_", self_ref=self_ref, col_prefix=col_prefix) for i, v in enumerate(items)]
-            sub = [s for s in sub if s]
-            if sub:
-                conditions.append(f"({' AND '.join(sub)})")
-        elif key == "NOT":
-            items = value if isinstance(value, list) else [value]
-            sub = [_parse_where(model_name, v, params, dialect, f"{prefix}not{i}_", self_ref=self_ref, col_prefix=col_prefix) or "1=1" for i, v in enumerate(items)]
-            if sub:
-                conditions.append(f"NOT ({' OR '.join(sub)})")
+        if key == "OR" or key == "AND" or key == "NOT":
+            logical_sql = _parse_logical_group(
+                key,
+                value,
+                lambda sub_val, sub_prefix: _parse_where(model_name, sub_val, params, dialect, sub_prefix, self_ref=self_ref, col_prefix=col_prefix),
+                prefix,
+            )
+            if logical_sql is not None:
+                conditions.append(logical_sql)
         else:
             rel_key = resolve_relation_key(model_name, key)
             if rel_key is not None:
@@ -236,79 +424,77 @@ def _parse_where(model_name: str, where: Optional[Any], params: Dict, dialect: s
             resolved_key = resolve_field_name(model_name, key, strict=True)
             col = f"{col_prefix}{_quote(resolved_key, dialect)}"
             pname = _sanitize_param_name(f"{prefix}{resolved_key}")
-            placeholder = "%s" if dialect == DIALECT_POSTGRES else "?"
-            if value is None:
-                conditions.append(f"{col} IS NULL")
-            elif isinstance(value, dict):
-                value = _normalize_operator_dict(value, resolved_key)
-                if "not" in value:
-                    if value["not"] is None:
-                        conditions.append(f"{col} IS NOT NULL")
-                    elif isinstance(value["not"], dict):
-                        nested_params: Dict[str, Any] = {}
-                        nested_sql = _parse_where(
-                            model_name,
-                            {resolved_key: value["not"]},
-                            nested_params,
-                            dialect,
-                            f"{prefix}{resolved_key}_not_",
-                            self_ref=self_ref,
-                            col_prefix=col_prefix,
-                        )
-                        params.update(nested_params)
-                        if nested_sql:
-                            conditions.append(f"NOT ({nested_sql})")
-                    else:
-                        params[f"{pname}_not"] = value["not"]
-                        conditions.append(f"{col} <> {placeholder}")
-                if "equals" in value:
-                    if value["equals"] is None:
-                        conditions.append(f"{col} IS NULL")
-                    else:
-                        params[f"{pname}_eq"] = value["equals"]
-                        conditions.append(f"{col} = {placeholder}")
-                if "contains" in value:
-                    params[f"{pname}_co"] = f"%{value['contains']}%"
-                    conditions.append(f"{col} LIKE {placeholder}")
-                if "startsWith" in value:
-                    params[f"{pname}_sw"] = f"{value['startsWith']}%"
-                    conditions.append(f"{col} LIKE {placeholder}")
-                if "endsWith" in value:
-                    params[f"{pname}_ew"] = f"%{value['endsWith']}"
-                    conditions.append(f"{col} LIKE {placeholder}")
-                if "gte" in value:
-                    params[f"{pname}_gte"] = value["gte"]
-                    conditions.append(f"{col} >= {placeholder}")
-                if "lte" in value:
-                    params[f"{pname}_lte"] = value["lte"]
-                    conditions.append(f"{col} <= {placeholder}")
-                if "gt" in value:
-                    params[f"{pname}_gt"] = value["gt"]
-                    conditions.append(f"{col} > {placeholder}")
-                if "lt" in value:
-                    params[f"{pname}_lt"] = value["lt"]
-                    conditions.append(f"{col} < {placeholder}")
-                if "in" in value:
-                    vals = value["in"]
-                    if vals:
-                        placeholders = ", ".join([placeholder] * len(vals))
-                        for i, v in enumerate(vals):
-                            params[f"{pname}_in{i}"] = v
-                        conditions.append(f"{col} IN ({placeholders})")
-                    else:
-                        conditions.append("1=0")
-                if "notIn" in value:
-                    vals = value["notIn"]
-                    if vals:
-                        placeholders = ", ".join([placeholder] * len(vals))
-                        for i, v in enumerate(vals):
-                            params[f"{pname}_notin{i}"] = v
-                        conditions.append(f"{col} NOT IN ({placeholders})")
-                    else:
-                        conditions.append("1=1")
-            else:
-                params[pname] = value
-                conditions.append(f"{col} = {placeholder}")
+            conditions.extend(_build_expr_conditions(col, resolved_key, value, params, dialect, pname))
+
+    return " AND ".join(conditions)
+
+
+def _build_having(
+    having: Any,
+    params: Dict[str, Any],
+    dialect: str,
+    by_fields: Optional[List[str]] = None,
+    model_name: str = "",
+    prefix: str = "having_",
+) -> str:
+    """Build a SQL HAVING clause from group_by(having=...) filters."""
+    if having is None:
+        return ""
+    if _is_dataclass_instance(having):
+        having = _normalize_dataclass_dict(having)
+    if not isinstance(having, dict):
+        raise ValueError("Having clause must be a mapping or filter dataclass")
+    if not having:
+        return ""
+
+    conditions: List[str] = []
+    by_field_set = {
+        (resolve_field_name(model_name, f, strict=False) if model_name else str(f)).lower()
+        for f in (by_fields or [])
+    }
+
+    for key, raw_value in having.items():
+        value = _normalize_dataclass_dict(raw_value) if _is_dataclass_instance(raw_value) else raw_value
+        if key == "OR" or key == "AND" or key == "NOT":
+            logical_sql = _parse_logical_group(
+                key,
+                value,
+                lambda sub_val, sub_prefix: _build_having(
+                    sub_val, params, dialect, by_fields=by_fields, model_name=model_name, prefix=sub_prefix
+                ),
+                prefix,
+            )
+            if logical_sql is not None:
+                conditions.append(logical_sql)
+        elif key in _HAVING_AGGREGATES:
+            sql_fn = _HAVING_AGGREGATES[key]
+            if not isinstance(value, dict):
+                raise ValueError(f"Having '{key}' filter must be a mapping or filter dataclass")
+            for field, agg_filter in value.items():
+                if field == "_all":
+                    if key != "_count":
+                        raise ValueError(f"Having '{key}' does not support '_all'; specify a field name")
+                    expr = "COUNT(*)"
+                    resolved_field = "_all"
+                else:
+                    resolved_field = resolve_field_name(model_name, field, strict=True) if model_name else field
+                    expr = f"{sql_fn}({_quote(resolved_field, dialect)})"
+                param_base = _sanitize_param_name(f"{prefix}{key}_{resolved_field}")
+                conditions.extend(
+                    _build_expr_conditions(expr, f"{key}.{resolved_field}", agg_filter, params, dialect, param_base)
+                )
+        elif str(key).startswith("_"):
+            raise ValueError(f"Unknown having aggregate key '{key}'")
+        else:
+            resolved_key = resolve_field_name(model_name, key, strict=True) if model_name else key
+            if by_field_set and resolved_key.lower() not in by_field_set:
+                raise ValueError(
+                    f"Field '{resolved_key}' in having must be included in group_by 'by' fields or wrapped in an aggregate (_count, _sum, _avg, _min, _max)"
+                )
+            param_base = _sanitize_param_name(f"{prefix}{resolved_key}")
+            conditions.extend(
+                _build_expr_conditions(_quote(resolved_key, dialect), resolved_key, value, params, dialect, param_base)
+            )
 
     return " AND ".join(conditions)
 

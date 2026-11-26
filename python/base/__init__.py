@@ -12,7 +12,7 @@ from .metadata import (
     resolve_field_name,
     resolve_relation_key,
 )
-from .sql import _quote, _parse_where, _build_order_by, _resolve_table, _quote_table
+from .sql import _quote, _parse_where, _build_having, _build_order_by, _resolve_table, _quote_table
 from .vectors import (
     AN5_VECTOR_FUNCTIONS,
     SQLITE_VEC_FUNCTIONS,

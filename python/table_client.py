@@ -5,12 +5,12 @@ import json
 import uuid
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 try:
-    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model, resolve_field_name, resolve_relation_key
+    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_having, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model, resolve_field_name, resolve_relation_key
     from .base.sql import _normalize_dataclass_dict
     from .base.vectors import decode_vector, encode_vector, is_vector_field, needs_vector_encoding, run_sqlite_vector_search, vector_distance
     from .base.vector_providers import VectorProviderError
 except ImportError:
-    from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model, resolve_field_name, resolve_relation_key
+    from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_having, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model, resolve_field_name, resolve_relation_key
     from base.sql import _normalize_dataclass_dict
     from base.vectors import decode_vector, encode_vector, is_vector_field, needs_vector_encoding, run_sqlite_vector_search, vector_distance
     from base.vector_providers import VectorProviderError
@@ -65,6 +65,15 @@ def _is_find_args_dataclass(obj: Any) -> bool:
         return False
     names = {f.name for f in dc_fields(obj)}
     return "where" in names and names.issubset({"where", "order_by", "take", "skip", "select", "include"})
+
+
+def _is_group_by_args_dataclass(obj: Any) -> bool:
+    if not is_dataclass(obj) or isinstance(obj, type):
+        return False
+    names = {f.name for f in dc_fields(obj)}
+    return "by" in names and names.issubset(
+        {"by", "where", "having", "order_by", "skip", "take", "_count", "_sum", "_avg", "_min", "_max"}
+    )
 
 
 def _resolve_select(model_name: str, select: Any) -> Any:
@@ -654,6 +663,10 @@ class AdapterTableClient(Generic[T]):
         aggs: List[str] = []
         if _count:
             aggs.append("COUNT(*) AS _count")
+            if isinstance(_count, (list, dict)):
+                for f in _selected_aggregate_fields(_count):
+                    if f != "_all":
+                        aggs.append(f"COUNT({_quote(f, self._dialect)}) AS _count_{f}")
         if _sum:
             for f in _selected_aggregate_fields(_sum):
                 aggs.append(f"SUM({_quote(f, self._dialect)}) AS _sum_{f}")
@@ -678,7 +691,7 @@ class AdapterTableClient(Generic[T]):
         if _count:
             all_count = int(row.get("_count") or 0)
             result["_count"] = {"_all": all_count}
-            if isinstance(_count, dict):
+            if isinstance(_count, (list, dict)):
                 for f in _selected_aggregate_fields(_count):
                     if f != "_all":
                         result["_count"][f] = int(row.get(f"_count_{f}", all_count))
@@ -703,7 +716,31 @@ class AdapterTableClient(Generic[T]):
         return result
 
     def group_by(self, by, where=None, order_by=None, skip: int = 0, take: Optional[int] = None,
-                 _count=None, _sum=None, _avg=None, _min=None, _max=None) -> List[Dict]:
+                 _count=None, _sum=None, _avg=None, _min=None, _max=None, having=None) -> List[Dict]:
+        if _is_group_by_args_dataclass(by):
+            args = by
+            by = args.by
+            if where is None:
+                where = getattr(args, "where", None)
+            if having is None:
+                having = getattr(args, "having", None)
+            if order_by is None:
+                order_by = getattr(args, "order_by", None)
+            if skip == 0 and getattr(args, "skip", 0):
+                skip = args.skip
+            if take is None:
+                take = getattr(args, "take", None)
+            if _count is None:
+                _count = getattr(args, "_count", None)
+            if _sum is None:
+                _sum = getattr(args, "_sum", None)
+            if _avg is None:
+                _avg = getattr(args, "_avg", None)
+            if _min is None:
+                _min = getattr(args, "_min", None)
+            if _max is None:
+                _max = getattr(args, "_max", None)
+
         _count = self._resolve_agg_fields(_count, allow_all=True) if isinstance(_count, (str, list, dict)) else _count
         _sum = self._resolve_agg_fields(_sum)
         _avg = self._resolve_agg_fields(_avg)
@@ -717,6 +754,10 @@ class AdapterTableClient(Generic[T]):
 
         by_cols = ", ".join(_quote(f, self._dialect) for f in by_fields)
         aggs = ["COUNT(*) AS _count"]
+        if isinstance(_count, (list, dict)):
+            for f in _selected_aggregate_fields(_count):
+                if f != "_all":
+                    aggs.append(f"COUNT({_quote(f, self._dialect)}) AS _count_{f}")
         for f in _selected_aggregate_fields(_sum):
             aggs.append(f"SUM({_quote(f, self._dialect)}) AS _sum_{f}")
         for f in _selected_aggregate_fields(_avg):
@@ -726,10 +767,13 @@ class AdapterTableClient(Generic[T]):
         for f in _selected_aggregate_fields(_max):
             aggs.append(f"MAX({_quote(f, self._dialect)}) AS _max_{f}")
 
+        having_sql = _build_having(having, params, self._dialect, by_fields=by_fields, model_name=self._model)
         query = f"SELECT {by_cols}, {', '.join(aggs)} FROM {self._table_sql}"
         if where_sql:
             query += f" WHERE {where_sql}"
         query += f" GROUP BY {by_cols}"
+        if having_sql:
+            query += f" HAVING {having_sql}"
         order_sql = _build_order_by(order_by, self._dialect, model_name=self._model)
         has_take = take is not None
         has_skip = skip is not None and skip > 0
@@ -742,6 +786,8 @@ class AdapterTableClient(Generic[T]):
             if self._dialect in (DIALECT_POSTGRES, DIALECT_SQLITE):
                 if has_take:
                     query += f" LIMIT {_to_non_negative_int(take, 1)}"
+                elif self._dialect == DIALECT_SQLITE:
+                    query += " LIMIT -1"
                 query += f" OFFSET {final_skip}"
             else:
                 query += f" OFFSET {final_skip} ROWS"
@@ -756,8 +802,8 @@ class AdapterTableClient(Generic[T]):
             item = dict(r)
             if _count:
                 all_count = int(r.get("_count") or 0)
-                item["_count"] = all_count if not isinstance(_count, dict) else {"_all": all_count}
-                if isinstance(_count, dict):
+                item["_count"] = all_count if not isinstance(_count, (list, dict)) else {"_all": all_count}
+                if isinstance(_count, (list, dict)):
                     for f in _selected_aggregate_fields(_count):
                         if f != "_all":
                             item["_count"][f] = int(r.get(f"_count_{f}", all_count))
