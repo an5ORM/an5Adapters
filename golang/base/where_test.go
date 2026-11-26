@@ -186,6 +186,10 @@ func TestTryBuildWhereWithModelStrictErrors(t *testing.T) {
 		{"non-slice notIn operator", "User", map[string]interface{}{"email": map[string]interface{}{"notIn": 123}}},
 		{"non-string contains", "User", map[string]interface{}{"email": map[string]interface{}{"contains": 99}}},
 		{"invalid mode", "User", map[string]interface{}{"email": map[string]interface{}{"mode": "weird", "equals": "a"}}},
+		{"direct slice filter", "User", map[string]interface{}{"email": []string{"a", "b"}}},
+		{"slice equals", "User", map[string]interface{}{"email": map[string]interface{}{"equals": []string{"a"}}}},
+		{"slice not", "User", map[string]interface{}{"email": map[string]interface{}{"not": []string{"a"}}}},
+		{"nil gt comparison", "Order", map[string]interface{}{"total": map[string]interface{}{"gt": nil}}},
 		{"unknown model field", "User", map[string]interface{}{"missing_col": "x"}},
 		{"non-map AND entry", "User", map[string]interface{}{"AND": []interface{}{"bad"}}},
 	}
@@ -194,6 +198,72 @@ func TestTryBuildWhereWithModelStrictErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if clause, _, err := TryBuildWhereWithModel(tc.where, tc.model, DialectSqlite, ph); err == nil {
 				t.Fatalf("expected error for %s, got clause %q", tc.name, clause)
+			}
+		})
+	}
+}
+
+func TestTryBuildHavingWithModelAndModeInsensitiveIn(t *testing.T) {
+	defer setupRelationTestMetadata()()
+	sqlitePh := func(int) string { return "?" }
+	pgPh := func(n int) string { return fmt.Sprintf("$%d", n) }
+
+	// mode: insensitive on in / notIn
+	inClause, inArgs, err := TryBuildWhereWithModel(map[string]interface{}{
+		"email": map[string]interface{}{"in": []string{"ALICE@EXAMPLE.COM", "BOB@EXAMPLE.COM"}, "mode": "insensitive"},
+	}, "User", DialectPostgres, pgPh)
+	if err != nil {
+		t.Fatalf("TryBuildWhereWithModel insensitive in: %v", err)
+	}
+	if inClause != `LOWER("email") IN (LOWER($1), LOWER($2))` || len(inArgs) != 2 {
+		t.Fatalf("unexpected insensitive IN clause=%q args=%#v", inClause, inArgs)
+	}
+
+	// Build HAVING clause with aggregates, grouped scalar, and OR combinator across dialects.
+	having := map[string]interface{}{
+		"OR": []interface{}{
+			map[string]interface{}{
+				"_count": map[string]interface{}{"_all": map[string]interface{}{"gte": 2}},
+				"_sum":   map[string]interface{}{"total": map[string]interface{}{"gt": 100}},
+			},
+			map[string]interface{}{
+				"status": "vip",
+			},
+		},
+	}
+	pgHaving, pgArgs, err := TryBuildHavingWithModel(having, []string{"status"}, "Order", DialectPostgres, func(n int) string {
+		return fmt.Sprintf("$%d", n+1)
+	})
+	if err != nil {
+		t.Fatalf("TryBuildHavingWithModel postgres: %v", err)
+	}
+	wantPg := `(COUNT(*) >= $2 AND SUM("total") > $3 OR "status" = $4)`
+	if pgHaving != wantPg || len(pgArgs) != 3 {
+		t.Fatalf("pgHaving=%q (want %q), args=%#v", pgHaving, wantPg, pgArgs)
+	}
+
+	mssqlHaving, _, err := TryBuildHavingWithModel(map[string]interface{}{
+		"_avg": map[string]interface{}{"total": map[string]interface{}{"lte": 500}},
+	}, []string{"status"}, "Order", DialectMssql, sqlitePh)
+	if err != nil || mssqlHaving != "AVG([total]) <= ?" {
+		t.Fatalf("mssqlHaving=%q err=%v", mssqlHaving, err)
+	}
+
+	// Strict validation errors in HAVING
+	invalidHavings := []struct {
+		name   string
+		having map[string]interface{}
+	}{
+		{"ungrouped scalar field", map[string]interface{}{"total": map[string]interface{}{"gt": 10}}},
+		{"_all on _sum", map[string]interface{}{"_sum": map[string]interface{}{"_all": 10}}},
+		{"unknown aggregate key", map[string]interface{}{"_median": map[string]interface{}{"total": 10}}},
+		{"unknown field in _sum", map[string]interface{}{"_sum": map[string]interface{}{"bogus": 10}}},
+		{"non-map aggregate filter", map[string]interface{}{"_count": 2}},
+	}
+	for _, tc := range invalidHavings {
+		t.Run(tc.name, func(t *testing.T) {
+			if clause, _, err := TryBuildHavingWithModel(tc.having, []string{"status"}, "Order", DialectSqlite, sqlitePh); err == nil {
+				t.Fatalf("expected having error for %s, got %q", tc.name, clause)
 			}
 		})
 	}

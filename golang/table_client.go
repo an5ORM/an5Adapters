@@ -141,9 +141,11 @@ type AggregateArgs struct {
 type GroupByArgs struct {
 	By      interface{} // string or []string
 	Where   interface{}
+	Having  interface{}
 	OrderBy interface{}
 	Skip    int
 	Take    int
+	Count   interface{} // bool, []string, or map[string]bool / map[string]interface{}
 	Sum     interface{}
 	Avg     interface{}
 	Min     interface{}
@@ -197,6 +199,22 @@ func (t *TableClient) buildWhereWithOffsetE(where interface{}, offset int) (stri
 
 func (t *TableClient) buildWhereE(where interface{}) (string, []interface{}, error) {
 	return t.buildWhereWithOffsetE(where, 0)
+}
+
+func (t *TableClient) buildHavingWithOffsetE(having interface{}, byFields []string, offset int) (string, []interface{}, error) {
+	if having == nil {
+		return "", nil, nil
+	}
+	m, ok := having.(map[string]interface{})
+	if !ok {
+		return "", nil, fmt.Errorf("having clause for '%s' must be a map[string]interface{}", t.TableName)
+	}
+	if m == nil {
+		return "", nil, nil
+	}
+	return base.TryBuildHavingWithModel(m, byFields, t.TableName, t.Adapter.Dialect, func(n int) string {
+		return placeholder(t.Adapter.Dialect, n+offset)
+	})
 }
 
 // buildWhere converts an ORM-style where object into SQL clause + bound args.
@@ -417,6 +435,8 @@ func (t *TableClient) FindMany(ctx context.Context, args *FindManyArgs) ([]map[s
 			}
 			if take > 0 {
 				query += fmt.Sprintf(" LIMIT %d", take)
+			} else if t.Adapter.Dialect == base.DialectSqlite {
+				query += " LIMIT -1"
 			} else {
 				query += " LIMIT ALL"
 			}
@@ -907,6 +927,127 @@ func (t *TableClient) Upsert(ctx context.Context, args *UpsertArgs) (map[string]
 // Deprecated: use AggregateArgs with _count/_sum/_avg/_min/_max keys.
 type AggregateOptions map[string]string
 
+func buildAggregateSelectParts(countVal, sumVal, avgVal, minVal, maxVal interface{}, alwaysIncludeAllCount bool, allCountAlias string, dialect base.Dialect) []string {
+	var aggs []string
+	if countVal != nil || alwaysIncludeAllCount {
+		aggs = append(aggs, "COUNT(*) AS "+allCountAlias)
+		for _, f := range selectedAggregateFields(countVal) {
+			if f != "_all" {
+				aggs = append(aggs, fmt.Sprintf("COUNT(%s) AS cnt_%s", base.QuoteIdentifier(f, dialect), sanitizeParamName(f)))
+			}
+		}
+	}
+	for _, aggTuple := range []struct {
+		kind  string
+		value interface{}
+	}{
+		{"SUM", sumVal},
+		{"AVG", avgVal},
+		{"MIN", minVal},
+		{"MAX", maxVal},
+	} {
+		for _, f := range selectedAggregateFields(aggTuple.value) {
+			aggs = append(aggs, fmt.Sprintf("%s(%s) AS %s_%s", aggTuple.kind, base.QuoteIdentifier(f, dialect), strings.ToLower(aggTuple.kind), sanitizeParamName(f)))
+		}
+	}
+	return aggs
+}
+
+func scalarAggregateValue(v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+	switch x := v.(type) {
+	case int64:
+		return float64(x)
+	case int:
+		return float64(x)
+	case float64:
+		return x
+	case []byte:
+		var f float64
+		if _, err := fmt.Sscanf(string(x), "%f", &f); err == nil {
+			return f
+		}
+		return string(x)
+	case string:
+		var f float64
+		if _, err := fmt.Sscanf(x, "%f", &f); err == nil {
+			return f
+		}
+		return x
+	default:
+		return v
+	}
+}
+
+func shapeAggregateSections(dst, row map[string]interface{}, countVal, sumVal, avgVal, minVal, maxVal interface{}, stripAliases bool) {
+	if stripAliases {
+		for k, v := range row {
+			dst[k] = v
+		}
+	}
+	if countVal != nil {
+		countFields := selectedAggregateFields(countVal)
+		allCount := numberOrZero(row["cnt_all"], row["_count"])
+		if len(countFields) > 0 {
+			cmap := map[string]interface{}{"_all": allCount}
+			for _, f := range countFields {
+				if f == "_all" {
+					continue
+				}
+				key := "cnt_" + sanitizeParamName(f)
+				if stripAliases {
+					delete(dst, key)
+				}
+				if v, ok := row[key]; ok && v != nil {
+					cmap[f] = numberOrZero(v)
+				} else {
+					cmap[f] = allCount
+				}
+			}
+			dst["_count"] = cmap
+		} else {
+			if !stripAliases {
+				dst["_count"] = map[string]interface{}{"_all": allCount}
+			} else {
+				dst["_count"] = allCount
+			}
+		}
+		if stripAliases {
+			delete(dst, "cnt_all")
+		}
+	}
+	for _, aggTuple := range []struct {
+		kind  string
+		value interface{}
+	}{
+		{"sum", sumVal},
+		{"avg", avgVal},
+		{"min", minVal},
+		{"max", maxVal},
+	} {
+		fields := selectedAggregateFields(aggTuple.value)
+		if len(fields) == 0 {
+			continue
+		}
+		sub := map[string]interface{}{}
+		for _, f := range fields {
+			key := aggTuple.kind + "_" + sanitizeParamName(f)
+			if stripAliases {
+				delete(dst, key)
+			}
+			v := row[key]
+			if aggTuple.kind == "sum" || aggTuple.kind == "avg" {
+				sub[f] = numberOrNil(v)
+			} else {
+				sub[f] = scalarAggregateValue(v)
+			}
+		}
+		dst["_"+aggTuple.kind] = sub
+	}
+}
+
 // Aggregate executes aggregation queries (SUM, AVG, MIN, MAX, COUNT) and returns a single row result.
 func (t *TableClient) Aggregate(ctx context.Context, args *AggregateArgs) (map[string]interface{}, error) {
 	if args == nil {
@@ -916,34 +1057,7 @@ func (t *TableClient) Aggregate(ctx context.Context, args *AggregateArgs) (map[s
 	if err != nil {
 		return nil, err
 	}
-	var aggs []string
-
-	if args.Count != nil {
-		countFields := selectedAggregateFields(args.Count)
-		if len(countFields) == 0 {
-			aggs = append(aggs, "COUNT(*) AS cnt_all")
-		} else {
-			for _, f := range countFields {
-				if f != "_all" {
-					aggs = append(aggs, fmt.Sprintf("COUNT(%s) AS cnt_%s", base.QuoteIdentifier(f, t.Adapter.Dialect), sanitizeParamName(f)))
-				}
-			}
-		}
-	}
-	for _, aggTuple := range []struct {
-		kind  string
-		value interface{}
-	}{
-		{"SUM", args.Sum},
-		{"AVG", args.Avg},
-		{"MIN", args.Min},
-		{"MAX", args.Max},
-	} {
-		for _, f := range selectedAggregateFields(aggTuple.value) {
-			aggs = append(aggs, fmt.Sprintf("%s(%s) AS %s_%s", aggTuple.kind, base.QuoteIdentifier(f, t.Adapter.Dialect), strings.ToLower(aggTuple.kind), sanitizeParamName(f)))
-		}
-	}
-
+	aggs := buildAggregateSelectParts(args.Count, args.Sum, args.Avg, args.Min, args.Max, false, "cnt_all", t.Adapter.Dialect)
 	if len(aggs) == 0 {
 		return nil, fmt.Errorf("aggregate requires at least one aggregator field")
 	}
@@ -959,49 +1073,8 @@ func (t *TableClient) Aggregate(ctx context.Context, args *AggregateArgs) (map[s
 	if len(rows) == 0 {
 		return map[string]interface{}{}, nil
 	}
-	row := rows[0]
-
 	result := map[string]interface{}{}
-	if args.Count != nil {
-		countFields := selectedAggregateFields(args.Count)
-		allCount := numberOrZero(row["cnt_all"], row["_count"])
-		result["_count"] = map[string]interface{}{"_all": allCount}
-		for _, f := range countFields {
-			if f == "_all" {
-				continue
-			}
-			key := "cnt_" + sanitizeParamName(f)
-			if v, ok := row[key]; ok && v != nil {
-				result["_count"].(map[string]interface{})[f] = numberOrZero(v)
-			} else {
-				result["_count"].(map[string]interface{})[f] = allCount
-			}
-		}
-	}
-	for _, aggTuple := range []struct {
-		kind  string
-		value interface{}
-	}{
-		{"sum", args.Sum},
-		{"avg", args.Avg},
-		{"min", args.Min},
-		{"max", args.Max},
-	} {
-		fields := selectedAggregateFields(aggTuple.value)
-		if len(fields) == 0 {
-			continue
-		}
-		sub := map[string]interface{}{}
-		for _, f := range fields {
-			key := aggTuple.kind + "_" + sanitizeParamName(f)
-			if v, ok := row[key]; ok && v != nil {
-				sub[f] = numberOrNil(v)
-			} else {
-				sub[f] = nil
-			}
-		}
-		result["_"+aggTuple.kind] = sub
-	}
+	shapeAggregateSections(result, rows[0], args.Count, args.Sum, args.Avg, args.Min, args.Max, false)
 	return result, nil
 }
 
@@ -1018,26 +1091,18 @@ func (t *TableClient) GroupBy(ctx context.Context, args *GroupByArgs) ([]map[str
 	if err != nil {
 		return nil, err
 	}
+	havingCond, havingArgs, err := t.buildHavingWithOffsetE(args.Having, byFields, len(queryArgs))
+	if err != nil {
+		return nil, err
+	}
+	queryArgs = append(queryArgs, havingArgs...)
 
 	quotedGroups := make([]string, len(byFields))
 	for i, f := range byFields {
 		quotedGroups[i] = base.QuoteIdentifier(f, t.Adapter.Dialect)
 	}
 
-	aggs := []string{"COUNT(*) AS _count"}
-	for _, aggTuple := range []struct {
-		kind  string
-		value interface{}
-	}{
-		{"SUM", args.Sum},
-		{"AVG", args.Avg},
-		{"MIN", args.Min},
-		{"MAX", args.Max},
-	} {
-		for _, f := range selectedAggregateFields(aggTuple.value) {
-			aggs = append(aggs, fmt.Sprintf("%s(%s) AS %s_%s", aggTuple.kind, base.QuoteIdentifier(f, t.Adapter.Dialect), strings.ToLower(aggTuple.kind), sanitizeParamName(f)))
-		}
-	}
+	aggs := buildAggregateSelectParts(args.Count, args.Sum, args.Avg, args.Min, args.Max, true, "_count", t.Adapter.Dialect)
 
 	query := fmt.Sprintf("SELECT %s, %s FROM %s",
 		strings.Join(quotedGroups, ", "), strings.Join(aggs, ", "), t.quotedTable())
@@ -1045,9 +1110,12 @@ func (t *TableClient) GroupBy(ctx context.Context, args *GroupByArgs) ([]map[str
 		query += " WHERE " + whereCond
 	}
 	query += " GROUP BY " + strings.Join(quotedGroups, ", ")
+	if havingCond != "" {
+		query += " HAVING " + havingCond
+	}
 
 	order := t.orderSql(args.OrderBy)
-	hasSkip := args.Skip != 0
+	hasSkip := args.Skip > 0
 	hasTake := args.Take > 0
 	if order != "" {
 		query += " " + order
@@ -1056,13 +1124,17 @@ func (t *TableClient) GroupBy(ctx context.Context, args *GroupByArgs) ([]map[str
 	}
 	if hasSkip || hasTake {
 		skip := args.Skip
-		take := args.Take
-		if take <= 0 {
-			take = 1
+		if skip < 0 {
+			skip = 0
 		}
+		take := args.Take
 		if t.Adapter.Dialect == base.DialectPostgres || t.Adapter.Dialect == base.DialectSqlite {
 			if hasTake {
 				query += fmt.Sprintf(" LIMIT %d", take)
+			} else if t.Adapter.Dialect == base.DialectSqlite {
+				query += " LIMIT -1"
+			} else {
+				query += " LIMIT ALL"
 			}
 			query += fmt.Sprintf(" OFFSET %d", skip)
 		} else {
@@ -1073,7 +1145,20 @@ func (t *TableClient) GroupBy(ctx context.Context, args *GroupByArgs) ([]map[str
 		}
 	}
 
-	return t.Adapter.QueryRaw(ctx, query, queryArgs...)
+	rows, err := t.Adapter.QueryRaw(ctx, query, queryArgs...)
+	if err != nil {
+		return nil, err
+	}
+	if args.Count == nil && args.Sum == nil && args.Avg == nil && args.Min == nil && args.Max == nil {
+		return rows, nil
+	}
+	reshaped := make([]map[string]interface{}, len(rows))
+	for i, r := range rows {
+		item := map[string]interface{}{}
+		shapeAggregateSections(item, r, args.Count, args.Sum, args.Avg, args.Min, args.Max, true)
+		reshaped[i] = item
+	}
+	return reshaped, nil
 }
 
 // VectorSearch ranks table rows by vector distance using native SQL or fallback.

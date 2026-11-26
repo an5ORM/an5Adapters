@@ -281,3 +281,71 @@ func TestTableClientInverseOneToOneIncludeAndPostgresUpdateOffsets(t *testing.T)
 		t.Fatalf("ToSnakeCase(UserID) = %q, want user_id", base.ToSnakeCase("UserID"))
 	}
 }
+
+func TestTableClientGroupByHavingPerFieldCountAndPagination(t *testing.T) {
+	defer registerSampleRelationMetadata()()
+	ctx := context.Background()
+
+	// 1. Postgres GroupBy with Where + Having sequential placeholders, per-field count, and reshaping.
+	pgAdapter, pgState := openMockAdapter(t, "pg-groupby", "postgres://localhost/test", func(query string, _ []driver.NamedValue) ([]string, [][]driver.Value) {
+		return []string{"status", "_count", "cnt_user_id", "sum_total"}, [][]driver.Value{
+			{"paid", int64(3), int64(2), int64(500)},
+		}
+	})
+	grouped, err := pgAdapter.Table("Order").GroupBy(ctx, &an5adapters.GroupByArgs{
+		By:     []string{"status"},
+		Where:  map[string]interface{}{"total": map[string]interface{}{"gte": 10}},
+		Having: map[string]interface{}{"_sum": map[string]interface{}{"total": map[string]interface{}{"gt": 100}}, "status": "paid"},
+		Count:  map[string]bool{"_all": true, "user_id": true},
+		Sum:    []string{"total"},
+		Skip:   1,
+	})
+	if err != nil {
+		t.Fatalf("Postgres GroupBy failed: %v", err)
+	}
+	if len(pgState.queries) != 1 {
+		t.Fatalf("expected 1 Postgres query, got %d", len(pgState.queries))
+	}
+	pgQuery := pgState.queries[0]
+	wantSQL := `SELECT "status", COUNT(*) AS _count, COUNT("user_id") AS cnt_user_id, SUM("total") AS sum_total FROM "dbo"."orders" WHERE "total" >= $1 GROUP BY "status" HAVING SUM("total") > $2 AND "status" = $3 ORDER BY "status" LIMIT ALL OFFSET 1`
+	if pgQuery.sql != wantSQL {
+		t.Fatalf("Postgres GroupBy SQL:\n got: %s\nwant: %s", pgQuery.sql, wantSQL)
+	}
+	if len(pgQuery.args) != 3 || pgQuery.args[0] != int64(10) || pgQuery.args[1] != int64(100) || pgQuery.args[2] != "paid" {
+		t.Fatalf("unexpected Postgres GroupBy args: %#v", pgQuery.args)
+	}
+	if len(grouped) != 1 {
+		t.Fatalf("expected 1 grouped row, got %d", len(grouped))
+	}
+	cntMap, ok := grouped[0]["_count"].(map[string]interface{})
+	if !ok || cntMap["_all"] != float64(3) || cntMap["user_id"] != float64(2) {
+		t.Fatalf("unexpected reshaped _count: %#v", grouped[0]["_count"])
+	}
+	sumMap, ok := grouped[0]["_sum"].(map[string]interface{})
+	if !ok || sumMap["total"] != float64(500) {
+		t.Fatalf("unexpected reshaped _sum: %#v", grouped[0]["_sum"])
+	}
+
+	// 2. SQLite offset-only pagination emits LIMIT -1 OFFSET 1 in both FindMany and GroupBy.
+	sqliteAdapter, sqliteState := openMockAdapter(t, "sqlite-offset", "sqlite://test.db", nil)
+	if _, err := sqliteAdapter.Table("Order").FindMany(ctx, &an5adapters.FindManyArgs{Skip: 2}); err != nil {
+		t.Fatalf("SQLite FindMany offset-only failed: %v", err)
+	}
+	if _, err := sqliteAdapter.Table("Order").GroupBy(ctx, &an5adapters.GroupByArgs{By: []string{"status"}, Skip: 1}); err != nil {
+		t.Fatalf("SQLite GroupBy offset-only failed: %v", err)
+	}
+	if !strings.Contains(sqliteState.queries[0].sql, "LIMIT -1 OFFSET 2") {
+		t.Fatalf("SQLite FindMany must emit LIMIT -1 OFFSET 2, got: %s", sqliteState.queries[0].sql)
+	}
+	if !strings.Contains(sqliteState.queries[1].sql, "LIMIT -1 OFFSET 1") {
+		t.Fatalf("SQLite GroupBy must emit LIMIT -1 OFFSET 1, got: %s", sqliteState.queries[1].sql)
+	}
+
+	// 3. Invalid HAVING clause must fail before querying DB.
+	if _, err := sqliteAdapter.Table("Order").GroupBy(ctx, &an5adapters.GroupByArgs{
+		By:     []string{"status"},
+		Having: map[string]interface{}{"total": map[string]interface{}{"gt": 10}},
+	}); err == nil {
+		t.Fatal("expected GroupBy error for ungrouped scalar field in Having")
+	}
+}

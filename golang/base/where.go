@@ -256,6 +256,49 @@ func TryBuildWhereWithModel(where map[string]interface{}, modelName string, dial
 	return clause, args, nil
 }
 
+func buildLogicalGroup(key string, value interface{}, recurse func(map[string]interface{}, string) (string, error), prefix string) (string, error) {
+	items := value
+	if m, ok := isPlainMap(value); ok {
+		items = []interface{}{m}
+	} else if _, isNilOrInvalid := value.(map[string]interface{}); isNilOrInvalid {
+		return "", fmt.Errorf("'%s' filter payload must not be nil", key)
+	}
+	list, ok := toSlice(items)
+	if !ok {
+		return "", fmt.Errorf("'%s' filter must be an object or slice of objects", key)
+	}
+	var subs []string
+	for i, item := range list {
+		m, ok := isPlainMap(item)
+		if !ok {
+			return "", fmt.Errorf("'%s' filter entry must be an object", key)
+		}
+		s, err := recurse(m, fmt.Sprintf("%s%s%d_", prefix, key, i))
+		if err != nil {
+			return "", err
+		}
+		if s == "" {
+			s = "1=1"
+		}
+		subs = append(subs, s)
+	}
+	if len(subs) == 0 {
+		if key == "OR" {
+			return "1=0", nil
+		}
+		return "", nil
+	}
+	joiner := " OR "
+	if key == "AND" {
+		joiner = " AND "
+	}
+	clause := "(" + strings.Join(subs, joiner) + ")"
+	if key == "NOT" {
+		clause = "NOT " + clause
+	}
+	return clause, nil
+}
+
 func buildWhereRecWithModel(where map[string]interface{}, modelName string, dialect Dialect, args *[]interface{}, ph func(n int) string, prefix string, selfRef string, colPrefix string) (string, error) {
 	if where == nil || len(where) == 0 {
 		return "", nil
@@ -267,44 +310,13 @@ func buildWhereRecWithModel(where map[string]interface{}, modelName string, dial
 
 		switch key {
 		case "OR", "AND", "NOT":
-			items := value
-			if m, ok := isPlainMap(value); ok {
-				items = []interface{}{m}
-			} else if _, isNilOrInvalid := value.(map[string]interface{}); isNilOrInvalid {
-				return "", fmt.Errorf("'%s' filter payload must not be nil", key)
+			clause, err := buildLogicalGroup(key, value, func(sub map[string]interface{}, nextPrefix string) (string, error) {
+				return buildWhereRecWithModel(cleanWhere(sub, modelName), modelName, dialect, args, ph, nextPrefix, selfRef, colPrefix)
+			}, prefix)
+			if err != nil {
+				return "", err
 			}
-			list, ok := toSlice(items)
-			if !ok {
-				return "", fmt.Errorf("'%s' filter must be an object or slice of objects", key)
-			}
-			var subs []string
-			for i, item := range list {
-				m, ok := isPlainMap(item)
-				if !ok {
-					return "", fmt.Errorf("'%s' filter entry must be an object", key)
-				}
-				s, err := buildWhereRecWithModel(cleanWhere(m, modelName), modelName, dialect, args, ph, fmt.Sprintf("%s%s%d_", prefix, key, i), selfRef, colPrefix)
-				if err != nil {
-					return "", err
-				}
-				if s == "" {
-					s = "1=1"
-				}
-				subs = append(subs, s)
-			}
-			if len(subs) == 0 {
-				if key == "OR" {
-					conditions = append(conditions, "1=0")
-				}
-			} else {
-				joiner := " OR "
-				if key == "AND" {
-					joiner = " AND "
-				}
-				clause := "(" + strings.Join(subs, joiner) + ")"
-				if key == "NOT" {
-					clause = "NOT " + clause
-				}
+			if clause != "" {
 				conditions = append(conditions, clause)
 			}
 			continue
@@ -327,7 +339,7 @@ func buildWhereRecWithModel(where map[string]interface{}, modelName string, dial
 		}
 
 		col := colPrefix + QuoteIdentifier(key, dialect)
-		fieldConds, err := buildFieldConditionWithCol(col, key, value, modelName, dialect, args, ph, prefix, selfRef, colPrefix)
+		fieldConds, err := buildExprConditions(col, key, value, args, ph)
 		if err != nil {
 			return "", err
 		}
@@ -337,19 +349,135 @@ func buildWhereRecWithModel(where map[string]interface{}, modelName string, dial
 	return strings.Join(conditions, " AND "), nil
 }
 
-func buildFieldConditionWithCol(col string, key string, value interface{}, modelName string, dialect Dialect, args *[]interface{}, ph func(n int) string, prefix string, selfRef string, colPrefix string) ([]string, error) {
+var havingAggregates = map[string]string{
+	"_count": "COUNT",
+	"_sum":   "SUM",
+	"_avg":   "AVG",
+	"_min":   "MIN",
+	"_max":   "MAX",
+}
+
+// TryBuildHaving converts an ORM-style groupBy HAVING filter object into SQL + bound args.
+func TryBuildHaving(having map[string]interface{}, byFields []string, dialect Dialect, ph func(n int) string) (string, []interface{}, error) {
+	return TryBuildHavingWithModel(having, byFields, "", dialect, ph)
+}
+
+// TryBuildHavingWithModel converts an ORM-style groupBy HAVING filter object into SQL + bound args
+// with model field validation and grouped-column checks.
+func TryBuildHavingWithModel(having map[string]interface{}, byFields []string, modelName string, dialect Dialect, ph func(n int) string) (string, []interface{}, error) {
+	args := make([]interface{}, 0, 4)
+	if having == nil || len(having) == 0 {
+		return "", args, nil
+	}
+	bySet := make(map[string]bool, len(byFields)*2)
+	for _, f := range byFields {
+		bySet[strings.ToLower(f)] = true
+		bySet[ToSnakeCase(f)] = true
+	}
+	clause, err := tryBuildHavingRec(having, bySet, modelName, dialect, &args, ph, "having_")
+	if err != nil {
+		return "", nil, err
+	}
+	return clause, args, nil
+}
+
+func tryBuildHavingRec(having map[string]interface{}, bySet map[string]bool, modelName string, dialect Dialect, args *[]interface{}, ph func(n int) string, prefix string) (string, error) {
+	if having == nil || len(having) == 0 {
+		return "", nil
+	}
+	var conditions []string
+
+	for _, key := range sortedKeys(having) {
+		value := having[key]
+		switch key {
+		case "OR", "AND", "NOT":
+			clause, err := buildLogicalGroup(key, value, func(sub map[string]interface{}, nextPrefix string) (string, error) {
+				return tryBuildHavingRec(sub, bySet, modelName, dialect, args, ph, nextPrefix)
+			}, prefix)
+			if err != nil {
+				return "", err
+			}
+			if clause != "" {
+				conditions = append(conditions, clause)
+			}
+			continue
+		}
+
+		if sqlFn, isAgg := havingAggregates[key]; isAgg {
+			aggMap, ok := isPlainMap(value)
+			if !ok {
+				return "", fmt.Errorf("having '%s' filter must be an object", key)
+			}
+			for _, field := range sortedKeys(aggMap) {
+				filterVal := aggMap[field]
+				var expr string
+				if field == "_all" {
+					if key != "_count" {
+						return "", fmt.Errorf("having '%s' does not support '_all'; specify a field name", key)
+					}
+					expr = "COUNT(*)"
+				} else {
+					if modelName != "" && ModelHasFields(modelName) && !ModelHasField(modelName, field) {
+						return "", fmt.Errorf("unknown field '%s' in having.%s on model '%s'", field, key, modelName)
+					}
+					expr = fmt.Sprintf("%s(%s)", sqlFn, QuoteIdentifier(field, dialect))
+				}
+				conds, err := buildExprConditions(expr, key+"."+field, filterVal, args, ph)
+				if err != nil {
+					return "", err
+				}
+				conditions = append(conditions, conds...)
+			}
+			continue
+		}
+
+		if strings.HasPrefix(key, "_") {
+			return "", fmt.Errorf("unknown having aggregate key '%s'", key)
+		}
+
+		if modelName != "" && ModelHasFields(modelName) && !ModelHasField(modelName, key) {
+			return "", fmt.Errorf("unknown field '%s' on model '%s'", key, modelName)
+		}
+		if len(bySet) > 0 && !bySet[strings.ToLower(key)] && !bySet[ToSnakeCase(key)] {
+			return "", fmt.Errorf("field '%s' in having must be included in groupBy 'by' fields or wrapped in an aggregate (_count, _sum, _avg, _min, _max)", key)
+		}
+		conds, err := buildExprConditions(QuoteIdentifier(key, dialect), key, value, args, ph)
+		if err != nil {
+			return "", err
+		}
+		conditions = append(conditions, conds...)
+	}
+
+	return strings.Join(conditions, " AND "), nil
+}
+
+func isNonByteCollection(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	if _, ok := v.([]byte); ok {
+		return false
+	}
+	rt := reflect.TypeOf(v)
+	return rt != nil && (rt.Kind() == reflect.Slice || rt.Kind() == reflect.Array)
+}
+
+func buildExprConditions(expr string, label string, value interface{}, args *[]interface{}, ph func(n int) string) ([]string, error) {
 	if value == nil {
-		return []string{col + " IS NULL"}, nil
+		return []string{expr + " IS NULL"}, nil
+	}
+	if isNonByteCollection(value) {
+		return nil, fmt.Errorf("invalid collection filter value for '%s'; use 'in' instead", label)
 	}
 
 	m, isMap := isPlainMap(value)
 	if !isMap {
 		if _, isTypedNilMap := value.(map[string]interface{}); isTypedNilMap {
-			return []string{col + " IS NULL"}, nil
+			return []string{expr + " IS NULL"}, nil
 		}
 		n := len(*args) + 1
 		*args = append(*args, value)
-		return []string{fmt.Sprintf("%s = %s", col, ph(n))}, nil
+		return []string{fmt.Sprintf("%s = %s", expr, ph(n))}, nil
 	}
 
 	var parts []string
@@ -363,7 +491,7 @@ func buildFieldConditionWithCol(col string, key string, value interface{}, model
 	if modeVal, hasMode := m["mode"]; hasMode {
 		ms, ok := modeVal.(string)
 		if !ok || (ms != "default" && ms != "insensitive") {
-			return nil, fmt.Errorf("invalid filter mode '%v' for field '%s'", modeVal, key)
+			return nil, fmt.Errorf("invalid filter mode '%v' for field '%s'", modeVal, label)
 		}
 		insensitive = ms == "insensitive"
 	}
@@ -376,9 +504,11 @@ func buildFieldConditionWithCol(col string, key string, value interface{}, model
 			continue
 		case "not":
 			if val == nil {
-				parts = append(parts, col+" IS NOT NULL")
+				parts = append(parts, expr+" IS NOT NULL")
+			} else if isNonByteCollection(val) {
+				return nil, fmt.Errorf("'not' operator on field '%s' cannot be a slice; use 'notIn' instead", label)
 			} else if nested, ok := isPlainMap(val); ok {
-				nestedConds, err := buildFieldConditionWithCol(col, key, nested, modelName, dialect, args, ph, prefix+key+"_not_", selfRef, colPrefix)
+				nestedConds, err := buildExprConditions(expr, label, nested, args, ph)
 				if err != nil {
 					return nil, err
 				}
@@ -386,86 +516,97 @@ func buildFieldConditionWithCol(col string, key string, value interface{}, model
 					parts = append(parts, "NOT ("+strings.Join(nestedConds, " AND ")+")")
 				}
 			} else if s, ok := val.(string); ok && insensitive {
-				parts = append(parts, fmt.Sprintf("LOWER(%s) <> LOWER(%s)", col, addArg(s)))
+				parts = append(parts, fmt.Sprintf("LOWER(%s) <> LOWER(%s)", expr, addArg(s)))
 			} else {
-				parts = append(parts, fmt.Sprintf("%s <> %s", col, addArg(val)))
+				parts = append(parts, fmt.Sprintf("%s <> %s", expr, addArg(val)))
 			}
 		case "equals":
 			if val == nil {
-				parts = append(parts, col+" IS NULL")
+				parts = append(parts, expr+" IS NULL")
+			} else if _, isM := isPlainMap(val); isM || isNonByteCollection(val) {
+				return nil, fmt.Errorf("'equals' operator on field '%s' must be a scalar value or nil", label)
 			} else if s, ok := val.(string); ok && insensitive {
-				parts = append(parts, fmt.Sprintf("LOWER(%s) = LOWER(%s)", col, addArg(s)))
+				parts = append(parts, fmt.Sprintf("LOWER(%s) = LOWER(%s)", expr, addArg(s)))
 			} else {
-				parts = append(parts, fmt.Sprintf("%s = %s", col, addArg(val)))
+				parts = append(parts, fmt.Sprintf("%s = %s", expr, addArg(val)))
 			}
 		case "contains":
 			s, ok := val.(string)
 			if !ok {
-				return nil, fmt.Errorf("'contains' operator on field '%s' requires a string value", key)
+				return nil, fmt.Errorf("'contains' operator on field '%s' requires a string value", label)
 			}
 			if insensitive {
-				parts = append(parts, fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", col, addArg("%"+s+"%")))
+				parts = append(parts, fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, addArg("%"+s+"%")))
 			} else {
-				parts = append(parts, fmt.Sprintf("%s LIKE %s", col, addArg("%"+s+"%")))
+				parts = append(parts, fmt.Sprintf("%s LIKE %s", expr, addArg("%"+s+"%")))
 			}
 		case "startsWith":
 			s, ok := val.(string)
 			if !ok {
-				return nil, fmt.Errorf("'startsWith' operator on field '%s' requires a string value", key)
+				return nil, fmt.Errorf("'startsWith' operator on field '%s' requires a string value", label)
 			}
 			if insensitive {
-				parts = append(parts, fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", col, addArg(s+"%")))
+				parts = append(parts, fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, addArg(s+"%")))
 			} else {
-				parts = append(parts, fmt.Sprintf("%s LIKE %s", col, addArg(s+"%")))
+				parts = append(parts, fmt.Sprintf("%s LIKE %s", expr, addArg(s+"%")))
 			}
 		case "endsWith":
 			s, ok := val.(string)
 			if !ok {
-				return nil, fmt.Errorf("'endsWith' operator on field '%s' requires a string value", key)
+				return nil, fmt.Errorf("'endsWith' operator on field '%s' requires a string value", label)
 			}
 			if insensitive {
-				parts = append(parts, fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", col, addArg("%"+s)))
+				parts = append(parts, fmt.Sprintf("LOWER(%s) LIKE LOWER(%s)", expr, addArg("%"+s)))
 			} else {
-				parts = append(parts, fmt.Sprintf("%s LIKE %s", col, addArg("%"+s)))
+				parts = append(parts, fmt.Sprintf("%s LIKE %s", expr, addArg("%"+s)))
 			}
-		case "gte":
-			parts = append(parts, fmt.Sprintf("%s >= %s", col, addArg(val)))
-		case "lte":
-			parts = append(parts, fmt.Sprintf("%s <= %s", col, addArg(val)))
-		case "gt":
-			parts = append(parts, fmt.Sprintf("%s > %s", col, addArg(val)))
-		case "lt":
-			parts = append(parts, fmt.Sprintf("%s < %s", col, addArg(val)))
-		case "in":
+		case "gte", "lte", "gt", "lt":
+			if _, isM := isPlainMap(val); val == nil || isM || isNonByteCollection(val) {
+				return nil, fmt.Errorf("'%s' operator on field '%s' must be a scalar comparison value", op, label)
+			}
+			sqlOp := map[string]string{"gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}[op]
+			parts = append(parts, fmt.Sprintf("%s %s %s", expr, sqlOp, addArg(val)))
+		case "in", "notIn":
 			list, ok := toSlice(val)
 			if !ok {
-				return nil, fmt.Errorf("'in' operator on field '%s' requires a slice or array", key)
+				return nil, fmt.Errorf("'%s' operator on field '%s' requires a slice or array", op, label)
 			}
-			if len(list) > 0 {
-				phs := make([]string, 0, len(list))
+			if len(list) == 0 {
+				if op == "in" {
+					parts = append(parts, "1=0")
+				} else {
+					parts = append(parts, "1=1")
+				}
+				continue
+			}
+			lower := false
+			if insensitive {
 				for _, item := range list {
+					if _, isStr := item.(string); isStr {
+						lower = true
+						break
+					}
+				}
+			}
+			phs := make([]string, 0, len(list))
+			for _, item := range list {
+				if _, isStr := item.(string); lower && isStr {
+					phs = append(phs, "LOWER("+addArg(item)+")")
+				} else {
 					phs = append(phs, addArg(item))
 				}
-				parts = append(parts, fmt.Sprintf("%s IN (%s)", col, strings.Join(phs, ", ")))
-			} else {
-				parts = append(parts, "1=0")
 			}
-		case "notIn":
-			list, ok := toSlice(val)
-			if !ok {
-				return nil, fmt.Errorf("'notIn' operator on field '%s' requires a slice or array", key)
+			lhs := expr
+			if lower {
+				lhs = "LOWER(" + expr + ")"
 			}
-			if len(list) > 0 {
-				phs := make([]string, 0, len(list))
-				for _, item := range list {
-					phs = append(phs, addArg(item))
-				}
-				parts = append(parts, fmt.Sprintf("%s NOT IN (%s)", col, strings.Join(phs, ", ")))
-			} else {
-				parts = append(parts, "1=1")
+			sqlIn := "IN"
+			if op == "notIn" {
+				sqlIn = "NOT IN"
 			}
+			parts = append(parts, fmt.Sprintf("%s %s (%s)", lhs, sqlIn, strings.Join(phs, ", ")))
 		default:
-			return nil, fmt.Errorf("unsupported filter operator '%s' for field '%s'", op, key)
+			return nil, fmt.Errorf("unsupported filter operator '%s' for field '%s'", op, label)
 		}
 	}
 	return parts, nil
