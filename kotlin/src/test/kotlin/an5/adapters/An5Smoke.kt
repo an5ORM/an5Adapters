@@ -17,6 +17,7 @@ object An5Smoke {
         crud()
         filters()
         aggregates()
+        insensitiveGroupByHavingAndValidation()
         relations()
         relationFiltersAndValidation()
         transactions()
@@ -133,6 +134,139 @@ object An5Smoke {
             val groups = users.groupBy("name") { sum("score") }
             check("groupBy rows") { groups.size == 3 }
             check("groupBy counts") { groups.all { (it["_count"] as Number).toLong() == 1L } }
+        }
+    }
+
+    private fun insensitiveGroupByHavingAndValidation() {
+        val db = open()
+        db.use {
+            val users = it.table("User")
+            users.createMany(
+                listOf(
+                    mapOf("name" to "Alice", "score" to 10, "nickname" to "ally"),
+                    mapOf("name" to "alice", "score" to 30, "nickname" to null),
+                    mapOf("name" to "Bob", "score" to 25, "nickname" to "bobby"),
+                    mapOf("name" to "charlie", "score" to 5, "nickname" to null),
+                )
+            )
+
+            // Case-insensitive string matching and list filters.
+            check("eqInsensitive") { users.findMany { where("name" eqInsensitive "ALICE") }.size == 2 }
+            check("neqInsensitive") { users.findMany { where("name" neqInsensitive "ALICE") }.size == 2 }
+            check("containsInsensitive") { users.findMany { where("name" containsInsensitive "LIC") }.size == 2 }
+            check("startsWithInsensitive") { users.findMany { where("name" startsWithInsensitive "al") }.size == 2 }
+            check("endsWithInsensitive") { users.findMany { where("name" endsWithInsensitive "CE") }.size == 2 }
+            check("inListInsensitive") {
+                users.findMany { where("name" inListInsensitive listOf("ALICE", "BOB")) }.size == 3
+            }
+            check("notInListInsensitive") {
+                users.findMany { where("name" notInListInsensitive listOf("ALICE", "BOB")) }
+                    .single().string("name") == "charlie"
+            }
+            check("nested not inherits mode insensitive") {
+                users.findMany {
+                    where(mapOf("name" to mapOf("not" to mapOf("equals" to "ALICE"), "mode" to "insensitive")))
+                }.size == 2
+            }
+            check("invalid mode rejected") {
+                runCatching {
+                    users.findMany(where = mapOf("name" to mapOf("equals" to "Alice", "mode" to "bogus")))
+                }.exceptionOrNull() is IllegalArgumentException
+            }
+
+            // Combined WHERE + HAVING aggregate filters, per-field _count, and offset-only pagination.
+            val grouped = users.groupBy("name") {
+                where("score" gte 10)
+                count("_all", "nickname")
+                sum("score")
+                avg("score")
+                min("score")
+                max("score")
+                having(
+                    andOf(
+                        mapOf("_count" to mapOf("_all" to mapOf("gte" to 1))),
+                        mapOf("_sum" to mapOf("score" to mapOf("gte" to 25))),
+                        orOf(
+                            mapOf("_avg" to mapOf("score" to mapOf("gte" to 25))),
+                            mapOf("name" to mapOf("equals" to "alice")),
+                        ),
+                        notOf(mapOf("_min" to mapOf("score" to mapOf("gt" to 100)))),
+                        mapOf("_max" to mapOf("score" to mapOf("lte" to 30))),
+                    )
+                )
+                orderBy(listOf("name" to Sort.ASC))
+            }
+            check("groupBy having matched 2 groups") { grouped.size == 2 }
+            check("groupBy having ordered") {
+                grouped.map { row -> row.string("name") } == listOf("Bob", "alice")
+            }
+            check("per-field _count counts non-null nickname") {
+                grouped.first { it.string("name") == "Bob" }.long("_count_nickname") == 1L &&
+                    grouped.first { it.string("name") == "alice" }.long("_count_nickname") == 0L
+            }
+
+            val builderSpec = AggregateBuilder()
+                .groupedBy("name")
+                .count("_all", "nickname")
+                .sum("score")
+            builderSpec.orderBy("name", Sort.ASC)
+            builderSpec.skip(2)
+            val paged = users.groupBy(builderSpec)
+            check("SQLite offset-only groupBy skip(2)") {
+                paged.map { row -> row.string("name") } == listOf("alice", "charlie")
+            }
+
+            // ViewClient groupBy with HAVING.
+            it.executeRaw("CREATE VIEW user_view AS SELECT id, name, score, nickname FROM users")
+            val viewMeta = metadata()
+            @Suppress("UNCHECKED_CAST")
+            (viewMeta["modelToTable"] as MutableMap<String, Any?>)["UserView"] = "user_view"
+            @Suppress("UNCHECKED_CAST")
+            (viewMeta["modelFields"] as MutableMap<String, Any?>)["UserView"] = listOf(
+                field("id", true),
+                field("name", false),
+                field("score", false),
+                field("nickname", false),
+            )
+            an5.adapters.base.Metadata.setAdapterMetadata(viewMeta)
+            val viewGroups = it.view("UserView").groupBy("name") {
+                having(mapOf("_sum" to mapOf("score" to mapOf("gte" to 30))))
+            }
+            check("ViewClient groupBy having") {
+                viewGroups.single().string("name") == "alice"
+            }
+
+            // Strict validation rejections.
+            check("unknown field in groupBy rejected") {
+                runCatching { users.groupBy("unknownCol") { count() } }
+                    .exceptionOrNull() is IllegalArgumentException
+            }
+            check("_all outside _count rejected") {
+                runCatching { users.aggregate { sum("_all") } }
+                    .exceptionOrNull() is IllegalArgumentException
+            }
+            check("ungrouped scalar in having rejected") {
+                runCatching {
+                    users.groupBy("name") {
+                        having(mapOf("score" to mapOf("gte" to 10)))
+                    }
+                }.exceptionOrNull() is IllegalArgumentException
+            }
+            check("non-list OR in having rejected") {
+                runCatching {
+                    users.groupBy("name") {
+                        having(mapOf("OR" to mapOf("name" to "Alice")))
+                    }
+                }.exceptionOrNull() is IllegalArgumentException
+            }
+            check("collection passed to scalar equals rejected") {
+                runCatching { users.findMany(where = mapOf("name" to mapOf("equals" to listOf("Alice")))) }
+                    .exceptionOrNull() is IllegalArgumentException
+            }
+            check("non-string contains operand rejected") {
+                runCatching { users.findMany(where = mapOf("name" to mapOf("contains" to 123))) }
+                    .exceptionOrNull() is IllegalArgumentException
+            }
         }
     }
 
@@ -399,7 +533,7 @@ object An5Smoke {
                 "Document" to "documents",
             ),
             "modelFields" to mutableMapOf(
-                "User" to listOf(field("id", true), field("name", false), field("score", false)),
+                "User" to listOf(field("id", true), field("name", false), field("score", false), field("nickname", false)),
                 "Post" to listOf(field("id", true), field("title", false), field("userId", false)),
                 "Document" to listOf(field("id", true), field("title", false), field("embedding", false)),
             ),

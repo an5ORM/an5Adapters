@@ -120,6 +120,48 @@ infix fun <T> String.inList(values: List<T>): Where = mapOf(this to mapOf("in" t
 /** `"id" notInList listOf(1, 2)` — an empty list matches everything. */
 infix fun <T> String.notInList(values: List<T>): Where = mapOf(this to mapOf("notIn" to values))
 
+/** `"name".eq("ada", mode = "insensitive")` — equality with an explicit match mode. */
+fun String.eq(value: String?, mode: String): Where = mapOf(this to mapOf("equals" to value, "mode" to mode))
+
+/** `"name".neq("ada", mode = "insensitive")` — inequality with an explicit match mode. */
+fun String.neq(value: String?, mode: String): Where = mapOf(this to mapOf("not" to value, "mode" to mode))
+
+/** `"name".contains("da", mode = "insensitive")` — substring match with an explicit match mode. */
+fun String.contains(value: String, mode: String): Where = mapOf(this to mapOf("contains" to value, "mode" to mode))
+
+/** `"name".startsWith("ad", mode = "insensitive")` — prefix match with an explicit match mode. */
+fun String.startsWith(value: String, mode: String): Where = mapOf(this to mapOf("startsWith" to value, "mode" to mode))
+
+/** `"name".endsWith("da", mode = "insensitive")` — suffix match with an explicit match mode. */
+fun String.endsWith(value: String, mode: String): Where = mapOf(this to mapOf("endsWith" to value, "mode" to mode))
+
+/** `"name".inList(listOf("ada", "alan"), mode = "insensitive")` — list membership with an explicit match mode. */
+fun String.inList(values: List<String>, mode: String): Where = mapOf(this to mapOf("in" to values, "mode" to mode))
+
+/** `"name".notInList(listOf("ada", "alan"), mode = "insensitive")` — excluded list membership with an explicit match mode. */
+fun String.notInList(values: List<String>, mode: String): Where = mapOf(this to mapOf("notIn" to values, "mode" to mode))
+
+/** `"name" eqInsensitive "ada"` — case-insensitive equality. */
+infix fun String.eqInsensitive(value: String?): Where = eq(value, "insensitive")
+
+/** `"name" neqInsensitive "ada"` — case-insensitive inequality. */
+infix fun String.neqInsensitive(value: String?): Where = neq(value, "insensitive")
+
+/** `"name" containsInsensitive "da"` — case-insensitive substring match. */
+infix fun String.containsInsensitive(value: String): Where = contains(value, "insensitive")
+
+/** `"name" startsWithInsensitive "ad"` — case-insensitive prefix match. */
+infix fun String.startsWithInsensitive(value: String): Where = startsWith(value, "insensitive")
+
+/** `"name" endsWithInsensitive "da"` — case-insensitive suffix match. */
+infix fun String.endsWithInsensitive(value: String): Where = endsWith(value, "insensitive")
+
+/** `"name" inListInsensitive listOf("ada", "alan")` — case-insensitive `in` list match. */
+infix fun String.inListInsensitive(values: List<String>): Where = inList(values, "insensitive")
+
+/** `"name" notInListInsensitive listOf("ada", "alan")` — case-insensitive `notIn` list match. */
+infix fun String.notInListInsensitive(values: List<String>): Where = notInList(values, "insensitive")
+
 /** Any of [clauses]; an empty list matches nothing. */
 fun orOf(vararg clauses: Where): Where = mapOf("OR" to clauses.toList())
 

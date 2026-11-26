@@ -72,25 +72,41 @@ try {
   skip('no JDK installed');
 }
 
-// The Java sibling is resolved from ~/.m2 by `mavenLocal()`; install it when that version is
-// not there yet, and let an unreachable repository degrade the gate instead of failing it.
-// The path follows the published coordinates `io.github.an5orm:an5-adapters-java`; the
-// pre-release `org.an5orm` directory never existed locally, so the check below was always
-// false and every run paid for a fresh `mvn install`.
+function newestMtime(entry) {
+  if (!fs.existsSync(entry)) return 0;
+  const stat = fs.statSync(entry);
+  if (!stat.isDirectory()) return stat.mtimeMs;
+  let max = stat.mtimeMs;
+  for (const child of fs.readdirSync(entry, { withFileTypes: true })) {
+    const childMtime = newestMtime(path.join(entry, child.name));
+    if (childMtime > max) max = childMtime;
+  }
+  return max;
+}
+
+// The Java sibling is resolved from ~/.m2 by `mavenLocal()`; install it when missing or older
+// than the current Java sources, and let an unreachable repository degrade instead of failing.
 const version = require(path.join(root, 'package.json')).version;
-const installed = fs.existsSync(
-  path.join(
-    os.homedir(),
-    '.m2',
-    'repository',
-    'io',
-    'github',
-    'an5orm',
-    'an5-adapters-java',
-    version,
-    `an5-adapters-java-${version}.pom`,
-  ),
+const mavenArtifactDir = path.join(
+  os.homedir(),
+  '.m2',
+  'repository',
+  'io',
+  'github',
+  'an5orm',
+  'an5-adapters-java',
+  version,
 );
+const installedPom = path.join(mavenArtifactDir, `an5-adapters-java-${version}.pom`);
+const installedJar = path.join(mavenArtifactDir, `an5-adapters-java-${version}.jar`);
+const javaSourceMtime = Math.max(
+  newestMtime(path.join(javaDir, 'pom.xml')),
+  newestMtime(path.join(javaDir, 'src', 'main', 'java')),
+);
+const installed =
+  fs.existsSync(installedPom) &&
+  fs.existsSync(installedJar) &&
+  fs.statSync(installedJar).mtimeMs >= javaSourceMtime;
 if (!installed) {
   try {
     command('mvn', ['-q', '-B', '-f', path.join(javaDir, 'pom.xml'), 'install', '-DskipTests'], {

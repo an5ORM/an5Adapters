@@ -22,11 +22,13 @@ package an5.adapters
  */
 class AggregateBuilder {
     private var counts = false
+    private val countColumns = mutableListOf<String>()
     private val sums = mutableListOf<String>()
     private val averages = mutableListOf<String>()
     private val minimums = mutableListOf<String>()
     private val maximums = mutableListOf<String>()
     private val clauses = mutableListOf<Where>()
+    private val havingClauses = mutableListOf<Where>()
     private val groups = mutableListOf<String>()
     private val order = mutableListOf<Map<String, String>>()
     private var offset = 0
@@ -35,6 +37,21 @@ class AggregateBuilder {
     /** Adds `COUNT(*)`. */
     fun count() {
         counts = true
+    }
+
+    /** Adds `COUNT(*)` (for `"_all"`) and per-column non-null counts. */
+    fun count(vararg columns: String): AggregateBuilder = apply {
+        if (columns.isEmpty()) {
+            counts = true
+        } else {
+            for (column in columns) {
+                if (column == "_all") {
+                    counts = true
+                } else if (column.isNotEmpty() && !countColumns.contains(column)) {
+                    countColumns += column
+                }
+            }
+        }
     }
 
     fun sum(vararg columns: String) = apply { sums += columns }
@@ -50,9 +67,25 @@ class AggregateBuilder {
         clauses += clause
     }
 
+    /** Filters grouped rows after aggregation (`HAVING`). Repeated calls combine with `AND`. */
+    fun having(clause: Where) {
+        havingClauses += clause
+    }
+
     /** Orders the grouped rows; a flat aggregate returns one row, so it is ignored there. */
     fun orderBy(column: String, direction: Sort = Sort.ASC) {
         order += mapOf(column to direction.sql)
+    }
+
+    /** Orders grouped rows by several columns at once, each with its own direction. */
+    fun orderBy(columns: List<Pair<String, Sort>>) {
+        order.addAll(columns.map { (column, direction) -> mapOf(column to direction.sql) })
+    }
+
+    /** Appends raw `{ column: direction }` sort entries, used by generated `OrderBy` builders. */
+    @JvmName("orderByEntries")
+    fun orderBy(entries: List<Map<String, String>>) {
+        order.addAll(entries)
     }
 
     fun skip(count: Int) {
@@ -69,6 +102,7 @@ class AggregateBuilder {
     internal fun build(): an5.adapters.An5GroupBy {
         val aggregate = an5.adapters.An5GroupBy()
         if (counts) aggregate.count()
+        if (countColumns.isNotEmpty()) aggregate.count(*countColumns.toTypedArray())
         aggregate.sum(*sums.toTypedArray())
         aggregate.avg(*averages.toTypedArray())
         aggregate.min(*minimums.toTypedArray())
@@ -77,6 +111,11 @@ class AggregateBuilder {
             val filter =
                 if (clauses.size == 1) clauses[0] else andOf(*clauses.toTypedArray())
             aggregate.where(filter.toJavaWhere())
+        }
+        if (havingClauses.isNotEmpty()) {
+            val filter =
+                if (havingClauses.size == 1) havingClauses[0] else andOf(*havingClauses.toTypedArray())
+            aggregate.having(filter.toJavaWhere())
         }
         aggregate.by(*groups.toTypedArray())
         if (order.isNotEmpty()) {

@@ -95,6 +95,12 @@ class TableClient internal constructor(
     fun groupBy(vararg by: String, block: AggregateBuilder.() -> Unit = {}): List<Row> =
         delegate.groupBy(AggregateBuilder().apply(block).groupedBy(*by).build())
 
+    /** Executes a pre-built [AggregateBuilder] specification (used by generated typed `GroupBy` builders). */
+    fun groupBy(spec: AggregateBuilder): List<Row> = delegate.groupBy(spec.build())
+
+    /** Executes a raw [an5.adapters.An5GroupBy] specification. */
+    fun groupBy(spec: an5.adapters.An5GroupBy): List<Row> = delegate.groupBy(spec)
+
     // ─── Vector search ────────────────────────────────────────────────────────────
 
     /**
@@ -138,6 +144,12 @@ class ViewClient internal constructor(
 
     fun groupBy(vararg by: String, block: AggregateBuilder.() -> Unit = {}): List<Row> =
         delegate.groupBy(AggregateBuilder().apply(block).groupedBy(*by).build())
+
+    /** Executes a pre-built [AggregateBuilder] specification on the view. */
+    fun groupBy(spec: AggregateBuilder): List<Row> = delegate.groupBy(spec.build())
+
+    /** Executes a raw [an5.adapters.An5GroupBy] specification on the view. */
+    fun groupBy(spec: an5.adapters.An5GroupBy): List<Row> = delegate.groupBy(spec)
 
     @JvmOverloads
     fun vectorSearch(
