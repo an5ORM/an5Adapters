@@ -119,6 +119,7 @@ function buildExpressionConditions(
   dialect: Dialect,
   paramBase: string,
   nestedParamPrefix?: string,
+  inheritedInsensitive = false,
 ): string[] {
   if (Array.isArray(value)) {
     throw new Error(`Invalid array filter value for field '${fieldLabel}'; use { in: [...] } instead`);
@@ -145,7 +146,7 @@ function buildExpressionConditions(
     if (v.mode !== undefined && v.mode !== 'default' && v.mode !== 'insensitive') {
       throw new Error(`Invalid filter mode '${String(v.mode)}' on field '${fieldLabel}'; expected 'default' or 'insensitive'`);
     }
-    const insensitive = v.mode === 'insensitive';
+    const insensitive = v.mode !== undefined ? v.mode === 'insensitive' : inheritedInsensitive;
 
     if (v.not !== undefined) {
       if (v.not === null) {
@@ -162,6 +163,7 @@ function buildExpressionConditions(
           dialect,
           nextPrefix,
           sanitizeParamName(`${nextPrefix}_not`),
+          insensitive,
         );
         if (nested.length > 0) conditions.push(`NOT (${nested.join(' AND ')})`);
       } else {

@@ -219,6 +219,39 @@ func TestTryBuildHavingWithModelAndModeInsensitiveIn(t *testing.T) {
 		t.Fatalf("unexpected insensitive IN clause=%q args=%#v", inClause, inArgs)
 	}
 
+	// Nested not inherits outer mode: insensitive and respects inner mode: default override
+	nestedClause, nestedArgs, err := TryBuildWhereWithModel(map[string]interface{}{
+		"email": map[string]interface{}{
+			"not":  map[string]interface{}{"startsWith": "alice"},
+			"mode": "insensitive",
+		},
+	}, "User", DialectPostgres, pgPh)
+	if err != nil || nestedClause != `NOT (LOWER("email") LIKE LOWER($1))` || len(nestedArgs) != 1 || nestedArgs[0] != "alice%" {
+		t.Fatalf("unexpected nested insensitive not clause=%q args=%#v err=%v", nestedClause, nestedArgs, err)
+	}
+
+	overrideClause, overrideArgs, err := TryBuildWhereWithModel(map[string]interface{}{
+		"email": map[string]interface{}{
+			"not":  map[string]interface{}{"equals": "Alice", "mode": "default"},
+			"mode": "insensitive",
+		},
+	}, "User", DialectSqlite, sqlitePh)
+	if err != nil || overrideClause != `NOT ("email" = ?)` || len(overrideArgs) != 1 || overrideArgs[0] != "Alice" {
+		t.Fatalf("unexpected nested default override clause=%q args=%#v err=%v", overrideClause, overrideArgs, err)
+	}
+
+	havingNotClause, _, err := TryBuildHavingWithModel(map[string]interface{}{
+		"status": map[string]interface{}{
+			"not":  map[string]interface{}{"startsWith": "pa"},
+			"mode": "insensitive",
+		},
+	}, []string{"status"}, "Order", DialectPostgres, func(n int) string {
+		return fmt.Sprintf("$%d", n+1)
+	})
+	if err != nil || havingNotClause != `NOT (LOWER("status") LIKE LOWER($2))` {
+		t.Fatalf("unexpected having nested insensitive not clause=%q err=%v", havingNotClause, err)
+	}
+
 	// Build HAVING clause with aggregates, grouped scalar, and OR combinator across dialects.
 	having := map[string]interface{}{
 		"OR": []interface{}{

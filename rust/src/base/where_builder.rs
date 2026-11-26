@@ -471,6 +471,18 @@ fn build_expr_conditions(
     args: &mut Vec<SqlArg>,
     ph: &dyn Fn(usize) -> String,
 ) -> std::result::Result<Vec<String>, String> {
+    build_expr_conditions_with_mode(expr, label, value, dialect, args, ph, false)
+}
+
+fn build_expr_conditions_with_mode(
+    expr: &str,
+    label: &str,
+    value: &Value,
+    dialect: Dialect,
+    args: &mut Vec<SqlArg>,
+    ph: &dyn Fn(usize) -> String,
+    inherited_insensitive: bool,
+) -> std::result::Result<Vec<String>, String> {
     if value.is_null() {
         return Ok(vec![format!("{} IS NULL", expr)]);
     }
@@ -490,7 +502,7 @@ fn build_expr_conditions(
     };
 
     let insensitive = match map.get("mode") {
-        None | Some(Value::Null) => false,
+        None | Some(Value::Null) => inherited_insensitive,
         Some(Value::String(s)) if s == "default" => false,
         Some(Value::String(s)) if s == "insensitive" => true,
         Some(other) => {
@@ -518,8 +530,15 @@ fn build_expr_conditions(
                         label
                     ));
                 } else if val.is_object() {
-                    let nested_parts =
-                        build_expr_conditions(expr, label, val, dialect, args, ph)?;
+                    let nested_parts = build_expr_conditions_with_mode(
+                        expr,
+                        label,
+                        val,
+                        dialect,
+                        args,
+                        ph,
+                        insensitive,
+                    )?;
                     if !nested_parts.is_empty() {
                         parts.push(format!("NOT ({})", nested_parts.join(" AND ")));
                     }
@@ -1022,6 +1041,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mssql_sw.clause, "LOWER([email]) LIKE LOWER(?1)");
+
+        // Nested not inherits outer mode: insensitive and respects inner mode: default override
+        let pg_nested_not = try_build_where_with_model(
+            &json!({ "email": { "not": { "startsWith": "alice" }, "mode": "insensitive" } }),
+            "User",
+            Dialect::Postgres,
+            &|n| format!("${}", n),
+        )
+        .unwrap();
+        assert_eq!(pg_nested_not.clause, "NOT (\"email\" ILIKE $1)");
+        assert_eq!(pg_nested_not.args, vec![json!("alice%")]);
+
+        let sqlite_override = try_build_where_with_model(
+            &json!({ "email": { "not": { "equals": "Alice", "mode": "default" }, "mode": "insensitive" } }),
+            "User",
+            Dialect::Sqlite,
+            &q,
+        )
+        .unwrap();
+        assert_eq!(sqlite_override.clause, "NOT (\"email\" = ?1)");
+
+        let pg_having_not = try_build_having_with_model(
+            &json!({ "userId": { "not": { "startsWith": "u" }, "mode": "insensitive" } }),
+            &["userId".to_string()],
+            "Order",
+            Dialect::Postgres,
+            &|n| format!("${}", n + 1),
+        )
+        .unwrap();
+        assert_eq!(pg_having_not.clause, "NOT (\"userId\" ILIKE $2)");
 
         // HAVING builder across dialects
         let pg_having = try_build_having_with_model(

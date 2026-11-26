@@ -217,6 +217,7 @@ def _build_expr_conditions(
     dialect: str,
     param_base: str,
     nested_prefix: str = "",
+    inherited_insensitive: bool = False,
 ) -> List[str]:
     if _is_dataclass_instance(value):
         value = _normalize_dataclass_dict(value)
@@ -232,11 +233,14 @@ def _build_expr_conditions(
 
     if isinstance(value, dict):
         value = _normalize_operator_dict(value, field_label)
-        if "mode" in value and value["mode"] is not None and value["mode"] not in ("default", "insensitive"):
-            raise ValueError(
-                f"Invalid filter mode '{value['mode']}' on field '{field_label}'; expected 'default' or 'insensitive'"
-            )
-        insensitive = value.get("mode") == "insensitive"
+        if "mode" in value and value["mode"] is not None:
+            if value["mode"] not in ("default", "insensitive"):
+                raise ValueError(
+                    f"Invalid filter mode '{value['mode']}' on field '{field_label}'; expected 'default' or 'insensitive'"
+                )
+            insensitive = value["mode"] == "insensitive"
+        else:
+            insensitive = inherited_insensitive
 
         if "not" in value:
             not_val = value["not"]
@@ -254,6 +258,7 @@ def _build_expr_conditions(
                     dialect,
                     next_prefix,
                     _sanitize_param_name(f"{next_prefix}_not"),
+                    inherited_insensitive=insensitive,
                 )
                 if nested:
                     conditions.append(f"NOT ({' AND '.join(nested)})")

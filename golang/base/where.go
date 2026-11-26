@@ -463,6 +463,10 @@ func isNonByteCollection(v interface{}) bool {
 }
 
 func buildExprConditions(expr string, label string, value interface{}, args *[]interface{}, ph func(n int) string) ([]string, error) {
+	return buildExprConditionsWithMode(expr, label, value, args, ph, false)
+}
+
+func buildExprConditionsWithMode(expr string, label string, value interface{}, args *[]interface{}, ph func(n int) string, inheritedInsensitive bool) ([]string, error) {
 	if value == nil {
 		return []string{expr + " IS NULL"}, nil
 	}
@@ -487,7 +491,7 @@ func buildExprConditions(expr string, label string, value interface{}, args *[]i
 		return ph(n)
 	}
 
-	insensitive := false
+	insensitive := inheritedInsensitive
 	if modeVal, hasMode := m["mode"]; hasMode {
 		ms, ok := modeVal.(string)
 		if !ok || (ms != "default" && ms != "insensitive") {
@@ -508,7 +512,7 @@ func buildExprConditions(expr string, label string, value interface{}, args *[]i
 			} else if isNonByteCollection(val) {
 				return nil, fmt.Errorf("'not' operator on field '%s' cannot be a slice; use 'notIn' instead", label)
 			} else if nested, ok := isPlainMap(val); ok {
-				nestedConds, err := buildExprConditions(expr, label, nested, args, ph)
+				nestedConds, err := buildExprConditionsWithMode(expr, label, nested, args, ph, insensitive)
 				if err != nil {
 					return nil, err
 				}

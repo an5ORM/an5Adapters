@@ -330,6 +330,16 @@ class QuerySemantics(unittest.TestCase):
         self.assertEqual(mssql_sql, "LOWER([email]) LIKE LOWER(?)")
         self.assertEqual(list(mssql_params.values()), ["%Alice%"])
 
+        nested_pg_params = {}
+        nested_pg_sql = _parse_where("user", {"email": {"not": {"startsWith": "alice"}, "mode": "insensitive"}}, nested_pg_params, "postgres")
+        self.assertEqual(nested_pg_sql, 'NOT ("email" ILIKE %s)')
+        self.assertEqual(list(nested_pg_params.values()), ["alice%"])
+
+        override_params = {}
+        override_sql = _parse_where("user", {"email": {"not": {"equals": "Alice@Example.com", "mode": "default"}, "mode": "insensitive"}}, override_params, "sqlite")
+        self.assertEqual(override_sql, 'NOT ("email" = ?)')
+        self.assertEqual(list(override_params.values()), ["Alice@Example.com"])
+
         db = create_an5_adapter("sqlite::memory:")
         try:
             db.execute_raw("CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT NOT NULL, isActive INTEGER, score INTEGER, createdAt TEXT)")
@@ -341,6 +351,21 @@ class QuerySemantics(unittest.TestCase):
 
             rows_not = db.user.find_many(where={"email": {"not": "ALICE@EXAMPLE.COM", "mode": "insensitive"}})
             self.assertEqual([r["id"] for r in rows_not], ["u2"])
+
+            rows_nested_not = db.user.find_many(where={"email": {"not": {"startsWith": "ALICE"}, "mode": "insensitive"}})
+            self.assertEqual([r["id"] for r in rows_nested_not], ["u2"])
+
+            rows_double_not = db.user.find_many(where={"email": {"not": {"not": {"in": ["alice@example.com"]}}, "mode": "insensitive"}})
+            self.assertEqual([r["id"] for r in rows_double_not], ["u1"])
+
+            rows_default_override = db.user.find_many(where={"email": {"not": {"equals": "ALICE@EXAMPLE.COM", "mode": "default"}, "mode": "insensitive"}})
+            self.assertEqual([r["id"] for r in rows_default_override], ["u1", "u2"])
+
+            having_not_groups = db.user.group_by(
+                by="email",
+                having={"email": {"not": {"startsWith": "ALICE"}, "mode": "insensitive"}},
+            )
+            self.assertEqual([g["email"] for g in having_not_groups], ["bob@example.com"])
         finally:
             db.close()
 

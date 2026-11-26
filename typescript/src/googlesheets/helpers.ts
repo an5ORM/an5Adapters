@@ -25,7 +25,12 @@ function isPlainObject(value: unknown): value is Record<string, any> {
   return proto === Object.prototype || proto === null;
 }
 
-function matchScalarFilter(cellVal: any, fieldLabel: string, value: any): boolean {
+function matchScalarFilter(
+  cellVal: any,
+  fieldLabel: string,
+  value: any,
+  inheritedInsensitive = false,
+): boolean {
   if (Array.isArray(value)) {
     throw new Error(`Invalid array filter value for field '${fieldLabel}'; use { in: [...] } instead`);
   }
@@ -49,7 +54,7 @@ function matchScalarFilter(cellVal: any, fieldLabel: string, value: any): boolea
       throw new Error(`Invalid filter mode '${String(v.mode)}' on field '${fieldLabel}'; expected 'default' or 'insensitive'`);
     }
 
-    const caseInsensitive = v.mode === 'insensitive';
+    const caseInsensitive = v.mode !== undefined ? v.mode === 'insensitive' : inheritedInsensitive;
     const normalize = (s: any) => (caseInsensitive && typeof s === 'string' ? s.toLowerCase() : s);
 
     if (v.not !== undefined) {
@@ -57,7 +62,7 @@ function matchScalarFilter(cellVal: any, fieldLabel: string, value: any): boolea
       else if (Array.isArray(v.not)) {
         throw new Error(`Filter operator 'not' on field '${fieldLabel}' cannot be an array; use 'notIn' instead`);
       } else if (isPlainObject(v.not)) {
-        if (matchScalarFilter(cellVal, fieldLabel, v.not)) return false;
+        if (matchScalarFilter(cellVal, fieldLabel, v.not, caseInsensitive)) return false;
       } else if (normalize(cellVal) == normalize(v.not)) {
         return false;
       }

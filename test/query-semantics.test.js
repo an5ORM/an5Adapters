@@ -613,3 +613,75 @@ nodeTest('SheetsTableClient.groupBy supports aggregates, having filters, orderin
   await assert.rejects(() => client.groupBy({ by: 'status', having: { total: { gt: 10 } } }), /must be included in groupBy/);
   await assert.rejects(() => client.groupBy({ by: [] }), /groupBy requires 'by' fields/);
 });
+
+test('nested not inherits outer mode insensitive and respects inner mode default override', async () => {
+  const { setAdapterMetadata } = require('../dist/base/metadata.js');
+  const { AdapterTableClient } = require('../dist/an5Adapter.js');
+
+  const pgParams = {};
+  const pgSql = parseWhere('Order', { status: { not: { startsWith: 'pa' }, mode: 'insensitive' } }, pgParams, 'postgres');
+  assert.equal(pgSql, 'NOT ("status" ILIKE @status_not_status_sw)');
+  assert.deepEqual(pgParams, { status_not_status_sw: 'pa%' });
+
+  const sqliteOverrideParams = {};
+  const sqliteOverrideSql = parseWhere(
+    'Order',
+    { status: { not: { equals: 'PAID', mode: 'default' }, mode: 'insensitive' } },
+    sqliteOverrideParams,
+    'sqlite',
+  );
+  assert.equal(sqliteOverrideSql, 'NOT ([status] = @status_not_status_eq)');
+  assert.deepEqual(sqliteOverrideParams, { status_not_status_eq: 'PAID' });
+
+  const doubleNotParams = {};
+  const doubleNotSql = parseWhere(
+    'Order',
+    { status: { not: { not: { equals: 'PAID' } }, mode: 'insensitive' } },
+    doubleNotParams,
+    'sqlite',
+  );
+  assert.equal(doubleNotSql, 'NOT (NOT (LOWER([status]) = LOWER(@status_not_status_not_eq)))');
+
+  const havingPgParams = {};
+  const havingPgSql = buildHaving(
+    { _min: { status: { not: { startsWith: 'pa' }, mode: 'insensitive' } } },
+    havingPgParams,
+    'postgres',
+    ['status'],
+  );
+  assert.equal(havingPgSql, 'NOT (MIN("status") ILIKE @having__min_status_not_sw)');
+
+  // Google Sheets in-memory filter and having parity
+  assert.equal(matchWhere({ status: 'Paid' }, { status: { not: { startsWith: 'pa' }, mode: 'insensitive' } }), false);
+  assert.equal(matchWhere({ status: 'Open' }, { status: { not: { startsWith: 'pa' }, mode: 'insensitive' } }), true);
+  assert.equal(matchWhere({ status: 'paid' }, { status: { not: { equals: 'PAID', mode: 'default' }, mode: 'insensitive' } }), true);
+  assert.equal(matchWhere({ status: 'PAID' }, { status: { not: { equals: 'PAID', mode: 'default' }, mode: 'insensitive' } }), false);
+  assert.equal(matchHaving([{ status: 'Paid' }], ['status'], { status: { not: { startsWith: 'pa' }, mode: 'insensitive' } }), false);
+
+  // Live SQLite execution via AdapterTableClient
+  const db = new DatabaseSync(':memory:');
+  setAdapterMetadata({
+    modelToTable: { Order: 'orders' },
+    modelFields: { Order: { id: { ts: 'number', isId: true }, status: { ts: 'string' }, total: { ts: 'number' } } },
+  });
+  try {
+    db.exec(`CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT, total INTEGER);
+      INSERT INTO orders VALUES (1, 'Paid', 100), (2, 'paid', 200), (3, 'Open', 50);`);
+    const ordersTable = new AdapterTableClient({ dialect: 'sqlite', exec: async (sql, params) => db.prepare(sql).all(params) }, 'Order');
+
+    const excludedPaid = await ordersTable.findMany({
+      where: { status: { not: { in: ['paid', 'void'] }, mode: 'insensitive' } },
+      orderBy: { id: 'asc' },
+    });
+    assert.deepEqual(excludedPaid.map(r => r.id), [3]);
+
+    const keepLowercasePaid = await ordersTable.findMany({
+      where: { status: { not: { equals: 'Paid', mode: 'default' }, mode: 'insensitive' } },
+      orderBy: { id: 'asc' },
+    });
+    assert.deepEqual(keepLowercasePaid.map(r => r.id), [2, 3]);
+  } finally {
+    setAdapterMetadata({});
+    db.close();
+  }
+});
