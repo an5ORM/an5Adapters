@@ -282,11 +282,38 @@ object An5Smoke {
             }
             check("many relation eager-loaded") { rows.single().related("posts").size == 2 }
             check("relation count eager-loaded") { rows.single().relationCount("posts") == 2 }
+            check("relation counts map eager-loaded") { rows.single().relationCounts() == mapOf("posts" to 2) }
             check("related rows are readable") {
                 rows.single().related("posts").first().string("title") == "first"
             }
             check("missing relation reads as empty") { rows.single().related("comments").isEmpty() }
             check("missing relation count reads as zero") { rows.single().relationCount("comments") == 0 }
+
+            val adaId = ada.string("id")!!
+            val uniqueWithCount = it.table("User").findUnique {
+                where("id" eq adaId)
+                include(mapOf("posts" to true, "_count" to true))
+            }
+            check("findUnique query block eager-loads posts and _count") {
+                uniqueWithCount?.related("posts")?.size == 2 &&
+                    uniqueWithCount.relationCounts() == mapOf("posts" to 2)
+            }
+            val uniqueWhereWithBlock = it.table("User").findUnique(mapOf("id" to adaId)) {
+                include(mapOf("_count" to true))
+            }
+            check("findUnique(where, block) hydrates _count") {
+                uniqueWhereWithBlock?.relationCounts() == mapOf("posts" to 2)
+            }
+            check("relationCounts is null when _count was not requested") {
+                it.table("User").findFirst(mapOf("id" to adaId))?.relationCounts() == null
+            }
+            val updatedWithCount = it.table("User").update(mapOf("id" to adaId), mapOf("score" to 9)) {
+                include(mapOf("_count" to true))
+            }
+            check("update with query block returns _count") {
+                updatedWithCount?.int("score") == 9 &&
+                    updatedWithCount.relationCounts() == mapOf("posts" to 2)
+            }
         }
     }
 

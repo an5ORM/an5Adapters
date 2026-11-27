@@ -122,8 +122,27 @@ extension Row {
         (self[relation] ?? nil) as? Row
     }
 
+    /// The `_count` totals map for a query that asked for relation counts, or `nil` when absent.
+    public var relationCounts: [String: Int]? {
+        guard let raw = self["_count"] ?? nil else { return nil }
+        if let typed = raw as? [String: Int] { return typed }
+        guard let map = raw as? [String: Any?] else { return nil }
+        var counts: [String: Int] = [:]
+        for (key, value) in map {
+            guard let unwrapped = value else { continue }
+            if let number = unwrapped as? Int {
+                counts[key] = number
+            } else if let number = unwrapped as? Int64 {
+                counts[key] = Int(number)
+            } else if !(unwrapped is Bool), let number = unwrapped as? NSNumber {
+                counts[key] = number.intValue
+            }
+        }
+        return counts
+    }
+
     /// The `_count` total for a relation, or `0`.
     public func relationCount(_ relation: String) -> Int {
-        ((self["_count"] ?? nil) as? [String: Int])?[relation] ?? 0
+        relationCounts?[relation] ?? 0
     }
 }

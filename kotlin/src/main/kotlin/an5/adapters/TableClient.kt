@@ -34,8 +34,19 @@ class TableClient internal constructor(
 
     fun findFirst(where: Where): Row? = delegate.findFirst(where.toJavaFilter())
 
+    /** The first matching row matching [where], with optional refinements [block] adds. */
+    fun findFirst(where: Where, block: QueryBuilder.() -> Unit): Row? =
+        delegate.findFirst(QueryBuilder().apply { this.where(where); block() }.build())
+
+    /** The row the query identifies, or `null`. */
+    fun findUnique(block: QueryBuilder.() -> Unit): Row? = delegate.findUnique(query(block))
+
     /** The row [where] identifies, or `null`. */
     fun findUnique(where: Where): Row? = delegate.findUnique(where.toJavaFilter())
+
+    /** The row [where] identifies with optional [block] options, or `null`. */
+    fun findUnique(where: Where, block: QueryBuilder.() -> Unit): Row? =
+        delegate.findUnique(QueryBuilder().apply { this.where(where); block() }.build())
 
     /** How many rows match. */
     fun count(where: Where? = null): Long = delegate.count(where?.toJavaWhere())
@@ -64,6 +75,10 @@ class TableClient internal constructor(
 
     /** Updates the rows matching [where] and returns the first of them re-read. */
     fun update(where: Where, data: Data): Row? = delegate.update(where.toJavaFilter(), data.toJavaData())
+
+    /** Updates the rows matching [where] and returns the first of them re-read with [block] options. */
+    fun update(where: Where, data: Data, block: QueryBuilder.() -> Unit): Row? =
+        delegate.update(an5.adapters.An5Query().where(where.toJavaFilter()), data.toJavaData(), query(block))
 
     /** Updates every matching row and gives back how many changed. */
     fun updateMany(where: Where?, data: Data): Int =
@@ -133,9 +148,22 @@ class ViewClient internal constructor(
 
     fun findMany(block: QueryBuilder.() -> Unit): List<Row> = delegate.findMany(query(block))
 
+    fun findMany(where: Where, block: QueryBuilder.() -> Unit = {}): List<Row> =
+        delegate.findMany(QueryBuilder().apply { this.where(where); block() }.build())
+
+    fun findFirst(block: QueryBuilder.() -> Unit): Row? = delegate.findFirst(query(block))
+
     fun findFirst(where: Where): Row? = delegate.findFirst(where.toJavaFilter())
 
+    fun findFirst(where: Where, block: QueryBuilder.() -> Unit): Row? =
+        delegate.findFirst(QueryBuilder().apply { this.where(where); block() }.build())
+
+    fun findUnique(block: QueryBuilder.() -> Unit): Row? = delegate.findUnique(query(block))
+
     fun findUnique(where: Where): Row? = delegate.findUnique(where.toJavaFilter())
+
+    fun findUnique(where: Where, block: QueryBuilder.() -> Unit): Row? =
+        delegate.findUnique(QueryBuilder().apply { this.where(where); block() }.build())
 
     fun count(where: Where? = null): Long = delegate.count(where?.toJavaWhere())
 

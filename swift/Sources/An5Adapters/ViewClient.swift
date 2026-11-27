@@ -21,8 +21,13 @@ public struct ViewClient {
     public func findMany() throws -> [Row] { try client.findMany() }
     public func findMany(_ query: Query) throws -> [Row] { try client.findMany(query) }
     public func findMany(filter: Where) throws -> [Row] { try client.findMany(filter: filter) }
+    public func findMany(filter: Where, _ query: Query) throws -> [Row] { try client.findMany(filter: filter, query) }
+    public func findFirst(_ query: Query = Query()) throws -> Row? { try client.findFirst(query) }
     public func findFirst(filter: Where) throws -> Row? { try client.findFirst(filter: filter) }
+    public func findFirst(filter: Where, _ query: Query) throws -> Row? { try client.findFirst(filter: filter, query) }
+    public func findUnique(_ query: Query) throws -> Row? { try client.findUnique(query) }
     public func findUnique(filter: Where) throws -> Row? { try client.findUnique(filter: filter) }
+    public func findUnique(filter: Where, _ query: Query) throws -> Row? { try client.findUnique(filter: filter, query) }
     public func count(_ filter: Where? = nil) throws -> Int { try client.count(filter) }
     public func aggregate(_ aggregate: Aggregate) throws -> Row { try client.aggregate(aggregate) }
     public func groupBy(_ aggregate: Aggregate) throws -> [Row] { try client.groupBy(aggregate) }
@@ -38,7 +43,9 @@ public struct ViewClient {
     }
 
     public func create(_ data: Values) throws -> Row { throw readOnly("create") }
+    public func create(_ data: Values, _ query: Query) throws -> Row { throw readOnly("create") }
     public func update(filter: Where, data: Values) throws -> Row? { throw readOnly("update") }
+    public func update(filter: Where, data: Values, query: Query) throws -> Row? { throw readOnly("update") }
     public func updateMany(filter: Where?, data: Values) throws -> Int { throw readOnly("updateMany") }
     public func delete(filter: Where) throws -> Row? { throw readOnly("delete") }
     public func deleteMany(filter: Where? = nil) throws -> Int { throw readOnly("deleteMany") }

@@ -63,6 +63,18 @@ fun Row.relatedOne(relation: String): Row? = this[relation] as? Row
 fun Row.relationCount(relation: String): Int =
     ((this["_count"] as? Map<*, *>)?.get(relation) as? Number)?.toInt() ?: 0
 
+/** The `_count` totals map for a query that asked for relation counts, or `null` when absent. */
+fun Row.relationCounts(): Map<String, Int>? {
+    val raw = this["_count"] as? Map<*, *> ?: return null
+    val counts = LinkedHashMap<String, Int>(raw.size)
+    for ((key, value) in raw) {
+        val name = key as? String ?: continue
+        val count = (value as? Number)?.toInt() ?: continue
+        counts[name] = count
+    }
+    return counts
+}
+
 /**
  * Copies the row into a data class.
  *

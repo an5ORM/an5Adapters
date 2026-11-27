@@ -80,9 +80,28 @@ public struct TableClient {
         try findFirst(Query(filter: filter))
     }
 
+    /// The first matching row matching `filter`, with optional refinements `query` adds.
+    public func findFirst(filter: Where, _ query: Query) throws -> Row? {
+        var copy = query
+        copy.filter = filter
+        return try findFirst(copy)
+    }
+
+    /// The row `query` identifies, or `nil`.
+    public func findUnique(_ query: Query) throws -> Row? {
+        try findFirst(query)
+    }
+
     /// The row `filter` identifies, or `nil`.
     public func findUnique(filter: Where) throws -> Row? {
         try findFirst(Query(filter: filter))
+    }
+
+    /// The row `filter` identifies, with optional refinements `query` adds, or `nil`.
+    public func findUnique(filter: Where, _ query: Query) throws -> Row? {
+        var copy = query
+        copy.filter = filter
+        return try findUnique(copy)
     }
 
     /// How many rows match.

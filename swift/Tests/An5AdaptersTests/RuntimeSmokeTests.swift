@@ -199,6 +199,21 @@ final class RuntimeSmokeTests: XCTestCase {
         XCTAssertEqual(posts.count, 2)
         XCTAssertEqual(posts.first?["title"] as? String, "first")
         XCTAssertEqual((first["_count"] as? [String: Int])?["posts"], 2)
+        XCTAssertEqual(first.relationCounts, ["posts": 2])
+
+        var uniqueQuery = Query(filter: ["id": adaId])
+        uniqueQuery.include = ["posts": true, "_count": true]
+        let uniqueUser = try adapter.table("User").findUnique(uniqueQuery)
+        XCTAssertEqual(uniqueUser?.related("posts").count, 2)
+        XCTAssertEqual(uniqueUser?.relationCounts, ["posts": 2])
+
+        var countOnlyQuery = Query()
+        countOnlyQuery.include = ["_count": true]
+        let uniqueFiltered = try adapter.table("User").findUnique(filter: ["id": adaId], countOnlyQuery)
+        XCTAssertEqual(uniqueFiltered?.relationCounts, ["posts": 2])
+
+        let plainUnique = try adapter.table("User").findUnique(filter: ["id": adaId])
+        XCTAssertNil(plainUnique?.relationCounts)
 
         try adapter.table("User").create([
             "name": "Barbara",
