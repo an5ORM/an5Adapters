@@ -207,6 +207,93 @@ final class RuntimeSmokeTests: XCTestCase {
         XCTAssertEqual(try adapter.table("Post").count(), 3)
     }
 
+    func testIncludePaginationAndFilteredCount() throws {
+        let meta = Metadata(
+            modelToTable: ["User": "users", "Post": "posts"],
+            modelFields: [
+                "User": [
+                    FieldMeta(name: "id", type: "string", sqlType: "TEXT", isId: true),
+                    FieldMeta(name: "name", type: "string", sqlType: "TEXT"),
+                ],
+                "Post": [
+                    FieldMeta(name: "id", type: "string", sqlType: "TEXT", isId: true),
+                    FieldMeta(name: "title", type: "string", sqlType: "TEXT"),
+                    FieldMeta(name: "published", type: "number", sqlType: "INT"),
+                    FieldMeta(name: "userId", type: "string", sqlType: "TEXT"),
+                ],
+            ],
+            relationMap: [
+                "User": ["posts": RelationDef(modelName: "Post", relationType: "many", foreignKey: "userId", localKey: "id")],
+                "Post": ["author": RelationDef(modelName: "User", relationType: "one", foreignKey: "userId", localKey: "id")],
+            ]
+        )
+        let adapter = try An5Adapter(path: ":memory:", metadata: meta)
+        try adapter.execute("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT)")
+        try adapter.execute("CREATE TABLE posts (id TEXT PRIMARY KEY, title TEXT, published INT, userId TEXT)")
+        try adapter.table("User").create(["id": "u1", "name": "Alice"])
+        try adapter.table("User").create(["id": "u2", "name": "Bob"])
+        try adapter.table("User").create(["id": "u3", "name": "Charlie"])
+        try adapter.table("Post").create(["id": "p1", "title": "A1", "published": 1, "userId": "u1"])
+        try adapter.table("Post").create(["id": "p2", "title": "A2", "published": 0, "userId": "u1"])
+        try adapter.table("Post").create(["id": "p3", "title": "A3", "published": 1, "userId": "u1"])
+        try adapter.table("Post").create(["id": "p4", "title": "B1", "published": 0, "userId": "u2"])
+        try adapter.table("Post").create(["id": "p5", "title": "B2", "published": 1, "userId": "u2"])
+        try adapter.table("Post").create(["id": "p6", "title": "B3", "published": 1, "userId": "u2"])
+
+        var query = Query()
+        query.orderBy = [["id": "asc"]]
+        query.select = ["name"]
+        query.include = [
+            "posts": [
+                "where": ["userId": ["in": ["u1", "u2"]]],
+                "orderBy": [["id": "asc"]],
+                "skip": 1,
+                "take": 1,
+                "select": ["id", "title"],
+                "include": ["author": ["select": ["name"]]],
+            ],
+            "_count": [
+                "select": [
+                    "posts": ["where": ["published": 1]]
+                ]
+            ],
+        ]
+        let users = try adapter.table("User").findMany(query)
+        XCTAssertEqual(users.count, 3)
+        XCTAssertNil(users[0]["id"] as Any?)
+        XCTAssertEqual(users[0]["name"] as? String, "Alice")
+        XCTAssertEqual((users[0]["_count"] as? [String: Int])?["posts"], 2)
+        XCTAssertEqual((users[1]["_count"] as? [String: Int])?["posts"], 2)
+        XCTAssertEqual((users[2]["_count"] as? [String: Int])?["posts"], 0)
+
+        let alicePosts = try XCTUnwrap(users[0]["posts"] as? [Row])
+        XCTAssertEqual(alicePosts.count, 1)
+        XCTAssertEqual(alicePosts[0]["id"] as? String, "p2")
+        XCTAssertNil(alicePosts[0]["userId"] as Any?)
+        XCTAssertEqual((alicePosts[0]["author"] as? Row)?["name"] as? String, "Alice")
+
+        let bobPosts = try XCTUnwrap(users[1]["posts"] as? [Row])
+        XCTAssertEqual(bobPosts.count, 1)
+        XCTAssertEqual(bobPosts[0]["id"] as? String, "p5")
+
+        let charliePosts = try XCTUnwrap(users[2]["posts"] as? [Row])
+        XCTAssertTrue(charliePosts.isEmpty)
+
+        var zeroTakeQuery = Query()
+        zeroTakeQuery.orderBy = [["id": "asc"]]
+        zeroTakeQuery.include = ["posts": ["take": 0]]
+        let zeroRows = try adapter.table("User").findMany(zeroTakeQuery)
+        XCTAssertEqual((zeroRows[0]["posts"] as? [Row])?.count, 0)
+
+        var negTakeQuery = Query()
+        negTakeQuery.include = ["posts": ["take": -1]]
+        XCTAssertThrowsError(try adapter.table("User").findMany(negTakeQuery))
+
+        var badCountQuery = Query()
+        badCountQuery.include = ["_count": ["select": ["bogus": true]]]
+        XCTAssertThrowsError(try adapter.table("User").findMany(badCountQuery))
+    }
+
     // MARK: - Transactions
 
     func testTransactionRollback() throws {

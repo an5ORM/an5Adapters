@@ -415,12 +415,36 @@ namespace An5Orm
             return outList;
         }
 
-        public static Dictionary<string, object> ProjectDict(Dictionary<string, object> row, object select)
+        public static HashSet<string> CollectIncludeKeys(object include)
         {
+            var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (include is System.Collections.IDictionary dict)
+            {
+                foreach (System.Collections.DictionaryEntry de in dict)
+                {
+                    if (de.Value == null) continue;
+                    if (de.Value is bool b && !b) continue;
+                    var ks = de.Key?.ToString();
+                    if (!string.IsNullOrEmpty(ks)) keys.Add(ks);
+                }
+            }
+            return keys;
+        }
+
+        public static Dictionary<string, object> ProjectDict(Dictionary<string, object> row, object select, IEnumerable<string> extraKeys = null)
+        {
+            if (row == null) return null;
             var projected = new Dictionary<string, object>();
             foreach (var key in SelectedFields(select))
                 if (row.TryGetValue(key, out var v)) projected[key] = v;
-            if (row.TryGetValue("_count", out var count)) projected["_count"] = count;
+            if (extraKeys != null)
+            {
+                foreach (var extra in extraKeys)
+                    if (!string.IsNullOrEmpty(extra) && row.TryGetValue(extra, out var ev) && !projected.ContainsKey(extra))
+                        projected[extra] = ev;
+            }
+            if (row.TryGetValue("_count", out var count) && !projected.ContainsKey("_count"))
+                projected["_count"] = count;
             return projected;
         }
     }
@@ -507,8 +531,10 @@ namespace An5Orm
             var cols = "*";
             var keys = ArgsHelper.SelectedFields(args?.Select);
             var usesLimitOffset = UsesLimitOffset;
+            var includeDict = args?.Include as Dictionary<string, object>;
+            var hasInclude = includeDict != null && ArgsHelper.CollectIncludeKeys(includeDict).Count > 0;
 
-            if (keys.Count > 0 && !ArgsHelper.HasRelationSelect(args?.Select, An5Metadata.GetRelationsForModel(_modelName)))
+            if (keys.Count > 0 && !ArgsHelper.HasRelationSelect(args?.Select, An5Metadata.GetRelationsForModel(_modelName)) && !hasInclude)
             {
                 var quoted = keys.ConvertAll(k => SqlQuote.QuoteName(k, _dialect));
                 cols = string.Join(", ", quoted);
@@ -569,9 +595,9 @@ namespace An5Orm
             var select = args?.Select;
             if (select != null)
             {
-                if (ArgsHelper.HasRelationSelect(select, An5Metadata.GetRelationsForModel(_modelName)))
-                    ResolveIncludes(rows, select as Dictionary<string, object>);
-                return ApplyProjection(rows, select);
+                if (select is Dictionary<string, object> relSelectDict && ArgsHelper.HasRelationSelect(select, An5Metadata.GetRelationsForModel(_modelName)))
+                    ResolveIncludes(rows, relSelectDict);
+                return ApplyProjection(rows, select, ArgsHelper.CollectIncludeKeys(include));
             }
 
             return rows;
@@ -612,77 +638,173 @@ namespace An5Orm
 
         // ── Projection / Include helpers ──────────────────────────────────────
 
-        private List<T> ApplyProjection(List<T> rows, object select)
+        private List<T> ApplyProjection(List<T> rows, object select, IEnumerable<string> extraKeys = null)
         {
             var result = new List<T>();
-            var relations = An5Metadata.GetRelationsForModel(_modelName);
-            var isDictSelect = select is Dictionary<string, object> || select is Dictionary<string, bool>;
-            if (!isDictSelect)
+            var allowed = new HashSet<string>(ArgsHelper.SelectedFields(select), StringComparer.OrdinalIgnoreCase);
+            if (extraKeys != null)
             {
-                var props = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
-                var selectedKeys = new HashSet<string>(ArgsHelper.SelectedFields(select), StringComparer.OrdinalIgnoreCase);
-                foreach (var row in rows)
+                foreach (var ek in extraKeys)
                 {
-                    var item = new T();
-                    foreach (var prop in props)
-                        if (selectedKeys.Contains(prop.Name))
-                            prop.SetValue(item, prop.GetValue(row));
-                    result.Add(item);
+                    if (!string.IsNullOrEmpty(ek)) allowed.Add(ek);
                 }
-                return result;
+            }
+            if (select is Dictionary<string, object> dictSel)
+            {
+                foreach (var kv in dictSel)
+                {
+                    if (kv.Value != null && !(kv.Value is bool b && !b)) allowed.Add(kv.Key);
+                }
             }
 
-            // Relation select keys may reference a nested dict; keep it simple and
-            // copy only selected top-level properties.
-            var dictSelect = select as Dictionary<string, object>;
-            var boolSet = select as Dictionary<string, bool>;
+            var props = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
             foreach (var row in rows)
             {
+                if (row is Dictionary<string, object> dictRow)
+                {
+                    result.Add((T)(object)ArgsHelper.ProjectDict(dictRow, select, extraKeys));
+                    continue;
+                }
                 var item = new T();
-                var props = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
                 foreach (var prop in props)
                 {
-                    if (dictSelect != null && dictSelect.TryGetValue(prop.Name, out var sv) && sv is bool b && b)
-                        prop.SetValue(item, prop.GetValue(row));
-                    else if (boolSet != null && boolSet.TryGetValue(prop.Name, out var b2) && b2)
+                    if (!prop.CanWrite) continue;
+                    if (allowed.Contains(prop.Name) || (prop.Name == "_count" && prop.GetValue(row) != null))
                         prop.SetValue(item, prop.GetValue(row));
                 }
                 result.Add(item);
             }
-            _ = relations;
             return result;
         }
 
-        private void ResolveIncludes(List<T> rows, Dictionary<string, object> include)
+        private static (bool Has, int Value) ParseIncludePageBound(Dictionary<string, object> subArgs, string key, string relKey)
         {
-            if (rows.Count == 0 || include == null || include.Count == 0) return;
-            var modelRelations = An5Metadata.GetRelationsForModel(_modelName);
+            if (subArgs == null || !subArgs.TryGetValue(key, out var raw) || raw == null)
+                return (false, 0);
+            if (raw is bool)
+                throw new ArgumentException($"Include.{key} for relation '{relKey}' must be a non-negative integer.");
+            int val;
+            try
+            {
+                val = Convert.ToInt32(raw);
+            }
+            catch
+            {
+                throw new ArgumentException($"Include.{key} for relation '{relKey}' must be a non-negative integer.");
+            }
+            if (val < 0)
+                throw new ArgumentException($"Include.{key} for relation '{relKey}' cannot be negative: {val}.");
+            return (true, val);
+        }
+
+        private static List<(string RelKey, RelationDef Relation, object Where)> ParseCountTargets(
+            string modelName,
+            Dictionary<string, RelationDef> modelRelations,
+            object rawCount)
+        {
+            var targets = new List<(string, RelationDef, object)>();
+            if (rawCount == null) return targets;
+            if (rawCount is bool rb)
+            {
+                if (!rb) return targets;
+                var sorted = new List<string>();
+                foreach (var kv in modelRelations)
+                    if (kv.Value.RelationType == "many") sorted.Add(kv.Key);
+                sorted.Sort(StringComparer.Ordinal);
+                foreach (var k in sorted) targets.Add((k, modelRelations[k], null));
+                return targets;
+            }
+            if (!(rawCount is Dictionary<string, object> rawMap))
+                throw new ArgumentException($"Invalid _count payload for model '{modelName}'.");
+
+            Dictionary<string, object> selection = rawMap;
+            if (rawMap.TryGetValue("select", out var selObj))
+            {
+                if (rawMap.Count > 1)
+                    throw new ArgumentException($"Unknown option alongside 'select' in _count for model '{modelName}'.");
+                if (selObj == null) return targets;
+                if (selObj is Dictionary<string, bool> sb)
+                {
+                    selection = new Dictionary<string, object>();
+                    foreach (var kv in sb) selection[kv.Key] = kv.Value;
+                }
+                else if (selObj is Dictionary<string, object> sd)
+                {
+                    selection = sd;
+                }
+                else
+                {
+                    throw new ArgumentException($"_count.select for model '{modelName}' must be a dictionary.");
+                }
+            }
+
+            foreach (var kv in selection)
+            {
+                if (kv.Value == null) continue;
+                if (kv.Value is bool bb && !bb) continue;
+                if (!An5Metadata.ResolveRelationForModel(modelName, kv.Key, out var canonKey, out var relation) || relation == null || relation.RelationType != "many")
+                    throw new ArgumentException($"Unknown or non-list relation '{kv.Key}' in _count for model '{modelName}'.");
+
+                object relWhere = null;
+                if (kv.Value is bool bTrue && bTrue)
+                {
+                    relWhere = null;
+                }
+                else if (kv.Value is Dictionary<string, object> optDict)
+                {
+                    foreach (var opt in optDict)
+                    {
+                        if (!string.Equals(opt.Key, "where", StringComparison.OrdinalIgnoreCase))
+                            throw new ArgumentException($"Unsupported option '{opt.Key}' in _count.{canonKey}.");
+                        relWhere = opt.Value;
+                    }
+                }
+                else
+                {
+                    throw new ArgumentException($"Unsupported _count option type for relation '{canonKey}' on '{modelName}'.");
+                }
+                targets.Add((canonKey, relation, relWhere));
+            }
+            return targets;
+        }
+
+        private void ResolveIncludes(List<T> rows, Dictionary<string, object> include)
+            => ResolveIncludesCore(rows, _modelName, include);
+
+        internal void ResolveIncludesCore(System.Collections.IList rows, string modelName, Dictionary<string, object> include)
+        {
+            if (rows == null || rows.Count == 0 || include == null || include.Count == 0) return;
+            var modelRelations = An5Metadata.GetRelationsForModel(modelName);
             if (modelRelations.Count == 0) return;
 
             foreach (var kv in include)
             {
                 var key = kv.Key;
+                if (kv.Value == null) continue;
                 if (kv.Value is bool b && !b) continue;
                 if (key == "_count")
                 {
-                    foreach (var rel in modelRelations)
+                    var countTargets = ParseCountTargets(modelName, modelRelations, kv.Value);
+                    foreach (var target in countTargets)
                     {
-                        if (rel.Value.RelationType != "many") continue;
-                        var (matchKey, joinKey) = An5Metadata.ResolveRelationKeys(_modelName, rel.Value);
+                        var (matchKey, joinKey) = An5Metadata.ResolveRelationKeys(modelName, target.Relation);
                         var relKeys = new HashSet<object>();
+                        var rawList = new List<object>();
                         foreach (var r in rows)
                         {
                             var lk = GetPropValue(r, joinKey);
-                            if (lk != null) relKeys.Add(lk);
+                            var norm = NormalizeJoinKey(lk);
+                            if (norm != null && relKeys.Add(norm)) rawList.Add(lk);
                         }
-                        var childClient = new AdapterTableClient<DictionaryModel>(_adapter, rel.Value.ModelName, _dialect);
+                        var childClient = new AdapterTableClient<DictionaryModel>(_adapter, target.Relation.ModelName, _dialect);
                         var cmap = new Dictionary<object, int>();
-                        if (relKeys.Count > 0)
+                        if (rawList.Count > 0)
                         {
-                            var matches = childClient.FindManyDynamic(new FindManyArgs
-                            {
-                                Where = new Dictionary<string, object> { { matchKey, new Dictionary<string, object> { { "in", ToList(relKeys) } } } },
-                            });
+                            var baseWhere = new Dictionary<string, object> { { matchKey, new Dictionary<string, object> { { "in", rawList } } } };
+                            var countWhere = target.Where is Dictionary<string, object> tw && tw.Count > 0
+                                ? new Dictionary<string, object> { { "AND", new List<object> { baseWhere, tw } } }
+                                : baseWhere;
+                            var matches = childClient.FindManyDynamic(new FindManyArgs { Where = countWhere });
                             foreach (var m in matches)
                             {
                                 var mk = NormalizeJoinKey(GetDictValue(m, matchKey));
@@ -694,24 +816,30 @@ namespace An5Orm
                         {
                             var lk = NormalizeJoinKey(GetPropValue(r, joinKey));
                             var countBox = GetPropValue(r, "_count") as Dictionary<string, object> ?? new Dictionary<string, object>();
-                            countBox[rel.Key] = lk != null && cmap.TryGetValue(lk, out var n) ? n : 0;
+                            countBox[target.RelKey] = lk != null && cmap.TryGetValue(lk, out var n) ? n : 0;
                             TrySetProp(r, "_count", countBox);
                         }
                     }
                     continue;
                 }
 
-                if (!An5Metadata.ResolveRelationForModel(_modelName, key, out _, out var relation) || relation == null) continue;
+                if (!An5Metadata.ResolveRelationForModel(modelName, key, out _, out var relation) || relation == null) continue;
                 var isMany = relation.RelationType == "many";
-                var (relMatchKey, relJoinKey) = An5Metadata.ResolveRelationKeys(_modelName, relation);
+                var (relMatchKey, relJoinKey) = An5Metadata.ResolveRelationKeys(modelName, relation);
 
-                var uniqueKeys = new HashSet<object>();
+                var subArgs = kv.Value as Dictionary<string, object> ?? new Dictionary<string, object>();
+                var takeSpec = ParseIncludePageBound(subArgs, "take", key);
+                var skipSpec = ParseIncludePageBound(subArgs, "skip", key);
+
+                var uniqueNorms = new HashSet<object>();
+                var uniqueKeys = new List<object>();
                 foreach (var r in rows)
                 {
                     var jv = GetPropValue(r, relJoinKey);
-                    if (jv != null) uniqueKeys.Add(jv);
+                    var norm = NormalizeJoinKey(jv);
+                    if (norm != null && uniqueNorms.Add(norm)) uniqueKeys.Add(jv);
                 }
-                if (uniqueKeys.Count == 0)
+                if (uniqueKeys.Count == 0 || (isMany && takeSpec.Has && takeSpec.Value == 0))
                 {
                     foreach (var r in rows)
                         TrySetProp(r, key, isMany ? new List<Dictionary<string, object>>() : null);
@@ -719,13 +847,13 @@ namespace An5Orm
                 }
 
                 var childIncludeClient = new AdapterTableClient<DictionaryModel>(_adapter, relation.ModelName, _dialect);
-                var subArgs = kv.Value as Dictionary<string, object> ?? new Dictionary<string, object>();
-                var subWhere = new Dictionary<string, object>
+                var baseWhereRel = new Dictionary<string, object>
                 {
-                    { relMatchKey, new Dictionary<string, object> { { "in", ToList(uniqueKeys) } } },
+                    { relMatchKey, new Dictionary<string, object> { { "in", uniqueKeys } } },
                 };
-                if (subArgs.TryGetValue("where", out var subWhereVal) && subWhereVal is Dictionary<string, object> sw)
-                    foreach (var swKv in sw) subWhere[swKv.Key] = swKv.Value;
+                var subWhere = subArgs.TryGetValue("where", out var subWhereVal) && subWhereVal is Dictionary<string, object> sw && sw.Count > 0
+                    ? new Dictionary<string, object> { { "AND", new List<object> { baseWhereRel, sw } } }
+                    : baseWhereRel;
 
                 var orderBy = subArgs.TryGetValue("orderBy", out var oB) ? oB : null;
                 var children = childIncludeClient.FindManyDynamic(new FindManyArgs
@@ -734,23 +862,86 @@ namespace An5Orm
                     OrderBy = orderBy,
                 });
 
-                Dictionary<object, List<Dictionary<string, object>>> groupMap = new();
-                foreach (var c in children)
+                var groupMap = new Dictionary<object, List<int>>();
+                for (int idx = 0; idx < children.Count; idx++)
                 {
-                    var gk = NormalizeJoinKey(GetDictValue(c, relMatchKey));
+                    var gk = NormalizeJoinKey(GetDictValue(children[idx], relMatchKey));
                     if (gk == null) continue;
-                    if (!groupMap.TryGetValue(gk, out var list)) { list = new List<Dictionary<string, object>>(); groupMap[gk] = list; }
-                    list.Add(c);
+                    if (!groupMap.TryGetValue(gk, out var list)) { list = new List<int>(); groupMap[gk] = list; }
+                    list.Add(idx);
+                }
+
+                var slicedIdxs = new Dictionary<object, List<int>>();
+                var surviving = new List<Dictionary<string, object>>();
+                var survivingOrder = new List<int>();
+                var seenSurviving = new HashSet<int>();
+                foreach (var pair in groupMap)
+                {
+                    var bucket = pair.Value;
+                    var picked = new List<int>();
+                    if (isMany)
+                    {
+                        for (int i = skipSpec.Value; i < bucket.Count; i++)
+                        {
+                            if (takeSpec.Has && picked.Count >= takeSpec.Value) break;
+                            picked.Add(bucket[i]);
+                        }
+                    }
+                    else if (bucket.Count > 0)
+                    {
+                        picked.Add(bucket[0]);
+                    }
+                    slicedIdxs[pair.Key] = picked;
+                    foreach (var idx in picked)
+                    {
+                        if (seenSurviving.Add(idx))
+                        {
+                            surviving.Add(children[idx]);
+                            survivingOrder.Add(idx);
+                        }
+                    }
+                }
+
+                var nestedInc = subArgs.TryGetValue("include", out var niVal) && niVal is Dictionary<string, object> niDict ? niDict : null;
+                if (nestedInc != null && surviving.Count > 0)
+                {
+                    var deeperClient = new AdapterTableClient<Dictionary<string, object>>(_adapter, relation.ModelName, _dialect);
+                    deeperClient.ResolveIncludesCore(surviving, relation.ModelName, nestedInc);
+                }
+
+                subArgs.TryGetValue("select", out var nestedSel);
+                if (nestedSel != null && surviving.Count > 0 && ArgsHelper.HasRelationSelect(nestedSel, An5Metadata.GetRelationsForModel(relation.ModelName)))
+                {
+                    if (nestedSel is Dictionary<string, object> relSelDict)
+                    {
+                        var deeperClient = new AdapterTableClient<Dictionary<string, object>>(_adapter, relation.ModelName, _dialect);
+                        deeperClient.ResolveIncludesCore(surviving, relation.ModelName, relSelDict);
+                    }
+                }
+
+                var preserveNested = ArgsHelper.CollectIncludeKeys(nestedInc);
+                var projectedByIdx = new Dictionary<int, Dictionary<string, object>>();
+                if (nestedSel != null)
+                {
+                    foreach (var idx in survivingOrder)
+                        projectedByIdx[idx] = ArgsHelper.ProjectDict(children[idx], nestedSel, preserveNested);
                 }
 
                 foreach (var r in rows)
                 {
                     var gk = NormalizeJoinKey(GetPropValue(r, relJoinKey));
-                    var matches = gk != null && groupMap.TryGetValue(gk, out var ml) ? ml : new List<Dictionary<string, object>>();
+                    var idxs = gk != null && slicedIdxs.TryGetValue(gk, out var ml) ? ml : new List<int>();
                     if (isMany)
-                        TrySetProp(r, key, matches);
+                    {
+                        var listOut = new List<Dictionary<string, object>>(idxs.Count);
+                        foreach (var idx in idxs)
+                            listOut.Add(nestedSel != null ? projectedByIdx[idx] : children[idx]);
+                        TrySetProp(r, key, listOut);
+                    }
                     else
-                        TrySetProp(r, key, matches.Count > 0 ? matches[0] : null);
+                    {
+                        TrySetProp(r, key, idxs.Count > 0 ? (nestedSel != null ? projectedByIdx[idxs[0]] : children[idxs[0]]) : null);
+                    }
                 }
             }
         }
@@ -1272,11 +1463,19 @@ namespace An5Orm
                 }
             }
 
-            if (createdRecord != null && args.Include is Dictionary<string, object> inc)
+            var incDictCreate = args.Include as Dictionary<string, object>;
+            if (createdRecord != null && incDictCreate != null)
             {
                 var list = new List<T> { createdRecord };
-                ResolveIncludes(list, inc);
+                ResolveIncludes(list, incDictCreate);
                 createdRecord = list[0];
+            }
+            if (createdRecord != null && args.Select != null)
+            {
+                var list = new List<T> { createdRecord };
+                if (args.Select is Dictionary<string, object> selDict && ArgsHelper.HasRelationSelect(args.Select, modelRelations))
+                    ResolveIncludes(list, selDict);
+                return ApplyProjection(list, args.Select, ArgsHelper.CollectIncludeKeys(incDictCreate))[0];
             }
             return createdRecord;
         }
@@ -1360,11 +1559,19 @@ namespace An5Orm
                 }
             }
 
-            if (updatedRecord != null && args.Include is Dictionary<string, object> inc)
+            var incDictUpdate = args.Include as Dictionary<string, object>;
+            if (updatedRecord != null && incDictUpdate != null)
             {
                 var list = new List<T> { updatedRecord };
-                ResolveIncludes(list, inc);
+                ResolveIncludes(list, incDictUpdate);
                 updatedRecord = list[0];
+            }
+            if (updatedRecord != null && args.Select != null)
+            {
+                var list = new List<T> { updatedRecord };
+                if (args.Select is Dictionary<string, object> selDict && ArgsHelper.HasRelationSelect(args.Select, modelRelations))
+                    ResolveIncludes(list, selDict);
+                return ApplyProjection(list, args.Select, ArgsHelper.CollectIncludeKeys(incDictUpdate))[0];
             }
             return updatedRecord;
         }

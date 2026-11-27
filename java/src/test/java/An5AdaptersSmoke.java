@@ -39,6 +39,7 @@ public final class An5AdaptersSmoke {
     crud();
     relations();
     relationFiltersAndIncludes();
+    includePaginationAndFilteredCount();
     strictFilterValidation();
     aggregation();
     insensitiveAndHavingValidation();
@@ -410,6 +411,77 @@ public final class An5AdaptersSmoke {
           "Postgres relation EXISTS SQL",
           true,
           pgWhere.sql.contains("EXISTS (SELECT 1 FROM \"users\" AS r_author_is_ WHERE r_author_is_.\"id\" = \"posts\".\"authorId\""));
+    } finally {
+      adapter.close();
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static void includePaginationAndFilteredCount() throws Exception {
+    System.out.println("\n[include pagination, filtered _count, AND where, select+include preservation]");
+    An5Adapter adapter = openRelational();
+    try {
+      An5TableClient users = adapter.table("User");
+      An5TableClient posts = adapter.table("Post");
+      posts.create(map("id", "p5", "title", "Alice Paid 2", "published", Integer.valueOf(1), "authorId", "u1"));
+      posts.create(map("id", "p6", "title", "Bob Second", "published", Integer.valueOf(0), "authorId", "u2"));
+      posts.create(map("id", "p7", "title", "Bob Third", "published", Integer.valueOf(1), "authorId", "u2"));
+
+      Map<String, Object> include = new LinkedHashMap<String, Object>();
+      include.put(
+          "posts",
+          map(
+              "where",
+              map("authorId", map("in", list("u1", "u2"))),
+              "orderBy",
+              map("id", "asc"),
+              "skip",
+              Integer.valueOf(1),
+              "take",
+              Integer.valueOf(1),
+              "select",
+              list("id", "title"),
+              "include",
+              map("author", map("select", list("name")))));
+      include.put(
+          "_count",
+          map("select", map("posts", map("where", map("published", Integer.valueOf(1))))));
+
+      List<Map<String, Object>> rows =
+          users.findMany(new An5Query().orderBy("id", "asc").select("name").include(include));
+      equals("include parity: parent count", 3, rows.size());
+      equals("include parity: Select omits id", false, rows.get(0).containsKey("id"));
+      equals("include parity: Alice filtered _count.posts == 2", 2, ((Number) ((Map<?, ?>) rows.get(0).get("_count")).get("posts")).intValue());
+      equals("include parity: Bob filtered _count.posts == 2", 2, ((Number) ((Map<?, ?>) rows.get(1).get("_count")).get("posts")).intValue());
+      equals("include parity: Charlie filtered _count.posts == 0", 0, ((Number) ((Map<?, ?>) rows.get(2).get("_count")).get("posts")).intValue());
+
+      List<Map<String, Object>> alicePosts = (List<Map<String, Object>>) rows.get(0).get("posts");
+      equals("include parity: Alice per-parent skip=1,take=1 count", 1, alicePosts.size());
+      equals("include parity: Alice per-parent post id", "p2", alicePosts.get(0).get("id"));
+      equals("include parity: nested select omits authorId", false, alicePosts.get(0).containsKey("authorId"));
+      Map<?, ?> nestedAuthor = (Map<?, ?>) alicePosts.get(0).get("author");
+      equals("include parity: nested author preserved", "Alice", nestedAuthor.get("name"));
+
+      List<Map<String, Object>> bobPosts = (List<Map<String, Object>>) rows.get(1).get("posts");
+      equals("include parity: Bob per-parent skip=1,take=1 count", 1, bobPosts.size());
+      equals("include parity: Bob per-parent post id", "p6", bobPosts.get(0).get("id"));
+
+      List<Map<String, Object>> zeroTake =
+          users.findMany(new An5Query().orderBy("id", "asc").include(map("posts", map("take", Integer.valueOf(0)))));
+      equals("include parity: take=0 yields empty list", 0, ((List<?>) zeroTake.get(0).get("posts")).size());
+
+      try {
+        users.findMany(new An5Query().include(map("posts", map("take", Integer.valueOf(-1)))));
+        equals("include parity: negative take throws", true, false);
+      } catch (IllegalArgumentException expected) {
+        equals("include parity: negative take throws", true, true);
+      }
+      try {
+        users.findMany(new An5Query().include(map("_count", map("select", map("bogus", Boolean.TRUE)))));
+        equals("include parity: unknown _count relation throws", true, false);
+      } catch (IllegalArgumentException expected) {
+        equals("include parity: unknown _count relation throws", true, true);
+      }
     } finally {
       adapter.close();
     }

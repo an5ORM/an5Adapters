@@ -268,8 +268,32 @@ func selectedFields(selectVal interface{}) (keys []string, hasRelationSelect boo
 	return nil, false
 }
 
+func collectIncludeKeys(include interface{}) []string {
+	var keys []string
+	switch v := include.(type) {
+	case map[string]interface{}:
+		for k, val := range v {
+			if val == nil {
+				continue
+			}
+			if b, ok := val.(bool); ok && !b {
+				continue
+			}
+			keys = append(keys, k)
+		}
+	case map[string]bool:
+		for k, b := range v {
+			if b {
+				keys = append(keys, k)
+			}
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // projectFields keeps only selected fields on a row (mirrors TypeScript projectFields).
-func projectFields(row map[string]interface{}, selectVal interface{}) map[string]interface{} {
+func projectFields(row map[string]interface{}, selectVal interface{}, extraKeys ...string) map[string]interface{} {
 	if row == nil || selectVal == nil {
 		return row
 	}
@@ -312,6 +336,13 @@ func projectFields(row map[string]interface{}, selectVal interface{}) map[string
 		}
 	default:
 		return row
+	}
+	for _, extra := range extraKeys {
+		if v, ok := row[extra]; ok {
+			if _, exists := projected[extra]; !exists {
+				projected[extra] = v
+			}
+		}
 	}
 	if rcount, ok := row["_count"]; ok {
 		projected["_count"] = rcount
@@ -395,7 +426,8 @@ func (t *TableClient) FindMany(ctx context.Context, args *FindManyArgs) ([]map[s
 	hasSkip := skip != 0
 
 	cols := "*"
-	if keys, hasRel := selectedFields(args.Select); len(keys) > 0 && !hasRel {
+	hasInclude := len(collectIncludeKeys(args.Include)) > 0
+	if keys, hasRel := selectedFields(args.Select); len(keys) > 0 && !hasRel && !hasInclude {
 		quoted := make([]string, len(keys))
 		for i, k := range keys {
 			quoted[i] = base.QuoteIdentifier(k, t.Adapter.Dialect)
@@ -482,8 +514,9 @@ func (t *TableClient) FindMany(ctx context.Context, args *FindManyArgs) ([]map[s
 				return nil, err
 			}
 		}
+		extraKeys := collectIncludeKeys(args.Include)
 		for i := range rows {
-			rows[i] = projectFields(rows[i], args.Select)
+			rows[i] = projectFields(rows[i], args.Select, extraKeys...)
 		}
 	}
 	return t.decodeVectorRows(rows), nil
@@ -670,10 +703,12 @@ func (t *TableClient) Create(ctx context.Context, args *CreateArgs) (map[string]
 		}
 	}
 	if args.Select != nil {
-		if err := resolveIncludes(ctx, t.TableName, []map[string]interface{}{created}, args.Select, t.Adapter); err != nil {
-			return nil, err
+		if _, hasRel := selectedFields(args.Select); hasRel {
+			if err := resolveIncludes(ctx, t.TableName, []map[string]interface{}{created}, args.Select, t.Adapter); err != nil {
+				return nil, err
+			}
 		}
-		return projectFields(created, args.Select), nil
+		return projectFields(created, args.Select, collectIncludeKeys(args.Include)...), nil
 	}
 	return created, nil
 }
@@ -825,10 +860,12 @@ func (t *TableClient) Update(ctx context.Context, args *UpdateArgs) (map[string]
 		}
 	}
 	if args.Select != nil {
-		if err := resolveIncludes(ctx, t.TableName, []map[string]interface{}{updated}, args.Select, t.Adapter); err != nil {
-			return nil, err
+		if _, hasRel := selectedFields(args.Select); hasRel {
+			if err := resolveIncludes(ctx, t.TableName, []map[string]interface{}{updated}, args.Select, t.Adapter); err != nil {
+				return nil, err
+			}
 		}
-		return projectFields(updated, args.Select), nil
+		return projectFields(updated, args.Select, collectIncludeKeys(args.Include)...), nil
 	}
 	return updated, nil
 }
@@ -1190,27 +1227,190 @@ func (t *TableClient) VectorSearch(ctx context.Context, args *VectorSearchArgs) 
 	return t.Adapter.VectorSearch(ctx, t.TableName, args.Vector, take, clause, vectorField, distanceMetric, queryArgs...)
 }
 
-// rename function resolves include object against a set of rows using relation metadata.
+func normalizeAdapterJoinKey(v interface{}) (string, bool) {
+	if v == nil {
+		return "", false
+	}
+	switch k := v.(type) {
+	case string:
+		return "s:" + k, true
+	case []byte:
+		return "s:" + string(k), true
+	case int:
+		return fmt.Sprintf("i:%d", k), true
+	case int32:
+		return fmt.Sprintf("i:%d", int64(k)), true
+	case int64:
+		return fmt.Sprintf("i:%d", k), true
+	case uint:
+		return fmt.Sprintf("u:%d", uint64(k)), true
+	case uint32:
+		return fmt.Sprintf("u:%d", uint64(k)), true
+	case uint64:
+		return fmt.Sprintf("u:%d", k), true
+	case float32:
+		return fmt.Sprintf("n:%g", float64(k)), true
+	case float64:
+		if k == float64(int64(k)) {
+			return fmt.Sprintf("i:%d", int64(k)), true
+		}
+		return fmt.Sprintf("n:%g", k), true
+	case bool:
+		return fmt.Sprintf("b:%t", k), true
+	default:
+		return fmt.Sprintf("v:%T:%v", v, v), true
+	}
+}
+
+func parseIncludePageBound(raw interface{}, field string, relKey string) (bool, int, error) {
+	if raw == nil {
+		return false, 0, nil
+	}
+	switch n := raw.(type) {
+	case int:
+		if n < 0 {
+			return false, 0, fmt.Errorf("include.%s for relation '%s' cannot be negative: %d", field, relKey, n)
+		}
+		return true, n, nil
+	case int32:
+		if n < 0 {
+			return false, 0, fmt.Errorf("include.%s for relation '%s' cannot be negative: %d", field, relKey, n)
+		}
+		return true, int(n), nil
+	case int64:
+		if n < 0 {
+			return false, 0, fmt.Errorf("include.%s for relation '%s' cannot be negative: %d", field, relKey, n)
+		}
+		return true, int(n), nil
+	case float64:
+		if n < 0 || n != float64(int(n)) {
+			return false, 0, fmt.Errorf("include.%s for relation '%s' must be a non-negative integer", field, relKey)
+		}
+		return true, int(n), nil
+	default:
+		return false, 0, fmt.Errorf("include.%s for relation '%s' must be a non-negative integer, got %T", field, relKey, raw)
+	}
+}
+
+type adapterCountTarget struct {
+	relKey   string
+	relation base.RelationDef
+	where    interface{}
+}
+
+func parseAdapterCountTargets(modelName string, modelRelations map[string]base.RelationDef, raw interface{}) ([]adapterCountTarget, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	if b, ok := raw.(bool); ok {
+		if !b {
+			return nil, nil
+		}
+		keys := make([]string, 0, len(modelRelations))
+		for rk, rel := range modelRelations {
+			if rel.RelationType == "many" {
+				keys = append(keys, rk)
+			}
+		}
+		sort.Strings(keys)
+		targets := make([]adapterCountTarget, 0, len(keys))
+		for _, rk := range keys {
+			targets = append(targets, adapterCountTarget{relKey: rk, relation: modelRelations[rk]})
+		}
+		return targets, nil
+	}
+
+	var selRaw interface{}
+	switch m := raw.(type) {
+	case map[string]bool:
+		conv := make(map[string]interface{}, len(m))
+		for k, v := range m {
+			conv[k] = v
+		}
+		selRaw = conv
+	case map[string]interface{}:
+		if s, hasSel := m["select"]; hasSel {
+			if len(m) > 1 {
+				return nil, fmt.Errorf("unknown option alongside 'select' in _count for model '%s'", modelName)
+			}
+			selRaw = s
+		} else {
+			selRaw = m
+		}
+	default:
+		return nil, fmt.Errorf("invalid _count payload %T for model '%s'", raw, modelName)
+	}
+
+	if selRaw == nil {
+		return nil, nil
+	}
+	selMap := map[string]interface{}{}
+	switch s := selRaw.(type) {
+	case map[string]bool:
+		for k, v := range s {
+			selMap[k] = v
+		}
+	case map[string]interface{}:
+		selMap = s
+	default:
+		return nil, fmt.Errorf("_count.select for model '%s' must be a map, got %T", modelName, selRaw)
+	}
+
+	keys := make([]string, 0, len(selMap))
+	for k := range selMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var targets []adapterCountTarget
+	for _, k := range keys {
+		sv := selMap[k]
+		if sv == nil {
+			continue
+		}
+		if b, ok := sv.(bool); ok && !b {
+			continue
+		}
+		canonKey, rel, ok := base.ResolveRelationForModel(modelName, k)
+		if !ok || rel.RelationType != "many" {
+			return nil, fmt.Errorf("unknown or non-list relation '%s' in _count for model '%s'", k, modelName)
+		}
+		var countWhere interface{}
+		if b, ok := sv.(bool); ok && b {
+			countWhere = nil
+		} else if om, ok := sv.(map[string]interface{}); ok {
+			for optK, optV := range om {
+				if !strings.EqualFold(optK, "where") {
+					return nil, fmt.Errorf("unsupported option '%s' in _count.%s", optK, canonKey)
+				}
+				countWhere = optV
+			}
+		} else {
+			return nil, fmt.Errorf("unsupported _count option %T for relation '%s'", sv, canonKey)
+		}
+		targets = append(targets, adapterCountTarget{relKey: canonKey, relation: rel, where: countWhere})
+	}
+	return targets, nil
+}
+
+// resolveIncludes resolves an include object against a set of rows using relation metadata.
 func resolveIncludes(ctx context.Context, modelName string, rows []map[string]interface{}, include interface{}, adapter *An5Adapter) error {
 	if len(rows) == 0 || include == nil {
 		return nil
 	}
 	modelRelations := base.GetRelationsForModel(modelName)
 
-	includeMap := include
+	var im map[string]interface{}
 	switch v := include.(type) {
 	case map[string]interface{}:
-		includeMap = v
+		im = v
 	case map[string]bool:
-		m := map[string]interface{}{}
+		im = make(map[string]interface{}, len(v))
 		for k, b := range v {
-			m[k] = b
+			im[k] = b
 		}
-		includeMap = m
 	default:
 		return nil
 	}
-	im := includeMap.(map[string]interface{})
 
 	keys := make([]string, 0, len(im))
 	for k := range im {
@@ -1233,50 +1433,75 @@ func resolveIncludes(ctx context.Context, modelName string, rows []map[string]in
 					row["_count"] = map[string]interface{}{}
 				}
 			}
-			for relKey, relation := range modelRelations {
-				if relation.RelationType != "many" {
-					continue
-				}
-				matchKey, joinKey := base.ResolveRelationKeys(modelName, relation)
+			targets, err := parseAdapterCountTargets(modelName, modelRelations, val)
+			if err != nil {
+				return err
+			}
+			for _, target := range targets {
+				matchKey, joinKey := base.ResolveRelationKeys(modelName, target.relation)
 				uniqueKeys := uniqueSet(rows, joinKey)
 				if len(uniqueKeys) > 0 {
-					relClient := adapter.Table(relation.ModelName)
+					baseWhere := map[string]interface{}{
+						matchKey: map[string]interface{}{"in": uniqueKeys},
+					}
+					var countWhere interface{} = baseWhere
+					if wm, ok := target.where.(map[string]interface{}); ok && len(wm) > 0 {
+						countWhere = map[string]interface{}{"AND": []interface{}{baseWhere, wm}}
+					}
+					relClient := adapter.Table(target.relation.ModelName)
 					related, err := relClient.FindMany(ctx, &FindManyArgs{
-						Where: map[string]interface{}{matchKey: map[string]interface{}{"in": uniqueKeys}},
+						Where: countWhere,
 					})
 					if err != nil {
 						return err
 					}
-					countMap := map[interface{}]int{}
+					countMap := map[string]int{}
 					for _, r := range related {
-						k := r[matchKey]
-						countMap[k]++
+						if tok, ok := normalizeAdapterJoinKey(r[matchKey]); ok {
+							countMap[tok]++
+						}
 					}
 					for _, row := range rows {
-						k := row[joinKey]
 						c := 0
-						if n, ok := countMap[k]; ok {
-							c = n
+						if tok, ok := normalizeAdapterJoinKey(row[joinKey]); ok {
+							c = countMap[tok]
 						}
-						row["_count"].(map[string]interface{})[relKey] = c
+						row["_count"].(map[string]interface{})[target.relKey] = c
 					}
 				} else {
 					for _, row := range rows {
-						row["_count"].(map[string]interface{})[relKey] = 0
+						row["_count"].(map[string]interface{})[target.relKey] = 0
 					}
 				}
 			}
 			continue
 		}
 
-		_, relation, ok := base.ResolveRelationForModel(modelName, key)
+		canonKey, relation, ok := base.ResolveRelationForModel(modelName, key)
 		if !ok {
 			continue
 		}
+		if canonKey == "" {
+			canonKey = key
+		}
 		isMany := relation.RelationType == "many"
 		matchKey, joinKey := base.ResolveRelationKeys(modelName, relation)
+
+		subArgs := map[string]interface{}{}
+		if m, ok := val.(map[string]interface{}); ok && m != nil {
+			subArgs = m
+		}
+		hasTake, takeVal, err := parseIncludePageBound(subArgs["take"], "take", canonKey)
+		if err != nil {
+			return err
+		}
+		_, skipVal, err := parseIncludePageBound(subArgs["skip"], "skip", canonKey)
+		if err != nil {
+			return err
+		}
+
 		uniqueKeys := uniqueSet(rows, joinKey)
-		if len(uniqueKeys) == 0 {
+		if len(uniqueKeys) == 0 || (isMany && hasTake && takeVal == 0) {
 			for _, row := range rows {
 				if isMany {
 					row[key] = []map[string]interface{}{}
@@ -1287,19 +1512,13 @@ func resolveIncludes(ctx context.Context, modelName string, rows []map[string]in
 			continue
 		}
 
-		subArgs := map[string]interface{}{}
-		if m, ok := val.(map[string]interface{}); ok && m != nil {
-			subArgs = m
-		}
-
-		subWhere := map[string]interface{}{
+		baseWhere := map[string]interface{}{
 			matchKey: map[string]interface{}{"in": uniqueKeys},
 		}
+		var subWhere interface{} = baseWhere
 		if w, has := subArgs["where"]; has {
-			if wm, ok := w.(map[string]interface{}); ok {
-				for k, v := range wm {
-					subWhere[k] = v
-				}
+			if wm, ok := w.(map[string]interface{}); ok && len(wm) > 0 {
+				subWhere = map[string]interface{}{"AND": []interface{}{baseWhere, wm}}
 			}
 		}
 
@@ -1307,43 +1526,92 @@ func resolveIncludes(ctx context.Context, modelName string, rows []map[string]in
 		related, err := relClient.FindMany(ctx, &FindManyArgs{
 			Where:   subWhere,
 			OrderBy: subArgs["orderBy"],
-			Take:    toPositiveInt(subArgs["take"]),
-			Skip:    toPositiveInt(subArgs["skip"]),
 		})
 		if err != nil {
 			return err
 		}
 
-		if nested, has := subArgs["include"]; has {
-			if err := resolveIncludes(ctx, relation.ModelName, related, nested, adapter); err != nil {
+		groupMap := map[string][]int{}
+		for idx, r := range related {
+			if tok, ok := normalizeAdapterJoinKey(r[matchKey]); ok {
+				groupMap[tok] = append(groupMap[tok], idx)
+			}
+		}
+
+		slicedByTok := map[string][]int{}
+		var surviving []map[string]interface{}
+		var survivingIdxs []int
+		seenIdx := map[int]bool{}
+		for tok, bucket := range groupMap {
+			var picked []int
+			if isMany {
+				if skipVal < len(bucket) {
+					for i := skipVal; i < len(bucket); i++ {
+						if hasTake && len(picked) >= takeVal {
+							break
+						}
+						picked = append(picked, bucket[i])
+					}
+				}
+			} else if len(bucket) > 0 {
+				picked = []int{bucket[0]}
+			}
+			slicedByTok[tok] = picked
+			for _, idx := range picked {
+				if !seenIdx[idx] {
+					seenIdx[idx] = true
+					surviving = append(surviving, related[idx])
+					survivingIdxs = append(survivingIdxs, idx)
+				}
+			}
+		}
+
+		nested, hasNested := subArgs["include"]
+		if hasNested && nested != nil && len(surviving) > 0 {
+			if err := resolveIncludes(ctx, relation.ModelName, surviving, nested, adapter); err != nil {
 				return err
 			}
 		}
 
-		outputRows := related
-		if sel, has := subArgs["select"]; has {
-			outputRows = make([]map[string]interface{}, len(related))
-			for i, r := range related {
-				outputRows[i] = projectFields(r, sel)
+		sel, hasSel := subArgs["select"]
+		if hasSel && sel != nil && len(surviving) > 0 {
+			if _, hasRel := selectedFields(sel); hasRel {
+				if err := resolveIncludes(ctx, relation.ModelName, surviving, sel, adapter); err != nil {
+					return err
+				}
 			}
 		}
 
-		groupMap := map[interface{}][]map[string]interface{}{}
-		for i, r := range related {
-			k := r[matchKey]
-			groupMap[k] = append(groupMap[k], outputRows[i])
+		extraPreserve := collectIncludeKeys(nested)
+		projectedByIdx := map[int]map[string]interface{}{}
+		if hasSel && sel != nil {
+			for _, idx := range survivingIdxs {
+				projectedByIdx[idx] = projectFields(related[idx], sel, extraPreserve...)
+			}
 		}
 
 		for _, row := range rows {
-			k := row[joinKey]
-			matches := groupMap[k]
-			if matches == nil {
-				matches = []map[string]interface{}{}
+			var matchedIdxs []int
+			if tok, ok := normalizeAdapterJoinKey(row[joinKey]); ok {
+				matchedIdxs = slicedByTok[tok]
 			}
 			if isMany {
-				row[key] = matches
-			} else if len(matches) > 0 {
-				row[key] = matches[0]
+				out := make([]map[string]interface{}, 0, len(matchedIdxs))
+				for _, idx := range matchedIdxs {
+					if hasSel && sel != nil {
+						out = append(out, projectedByIdx[idx])
+					} else {
+						out = append(out, related[idx])
+					}
+				}
+				row[key] = out
+			} else if len(matchedIdxs) > 0 {
+				idx := matchedIdxs[0]
+				if hasSel && sel != nil {
+					row[key] = projectedByIdx[idx]
+				} else {
+					row[key] = related[idx]
+				}
 			} else {
 				row[key] = nil
 			}
@@ -1353,15 +1621,16 @@ func resolveIncludes(ctx context.Context, modelName string, rows []map[string]in
 }
 
 func uniqueSet(rows []map[string]interface{}, key string) []interface{} {
-	seen := map[interface{}]bool{}
+	seen := map[string]bool{}
 	var out []interface{}
 	for _, r := range rows {
 		v := r[key]
-		if v == nil {
+		tok, ok := normalizeAdapterJoinKey(v)
+		if !ok {
 			continue
 		}
-		if !seen[v] {
-			seen[v] = true
+		if !seen[tok] {
+			seen[tok] = true
 			out = append(out, v)
 		}
 	}

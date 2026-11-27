@@ -9,6 +9,8 @@ import an5.adapters.base.SqliteVectors;
 import an5.adapters.base.Vectors;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -131,8 +133,9 @@ public class An5TableClient {
 
     Map<String, RelationDef> relations = Metadata.relationsFor(modelName);
     List<String> selected = query.selectValue();
+    boolean hasInclude = !collectIncludeKeys(query.includeValue()).isEmpty();
     String columns = "SELECT *";
-    if (selected != null && !selected.isEmpty() && !hasRelationSelect(selected, relations)) {
+    if (selected != null && !selected.isEmpty() && !hasRelationSelect(selected, relations) && !hasInclude) {
       columns = "SELECT " + quoteAll(selected);
     }
 
@@ -147,14 +150,14 @@ public class An5TableClient {
     sql.append(dialect.pagination(query.takeValue(), query.skipValue(), orderSql));
 
     List<Map<String, Object>> rows = adapter.exec(sql.toString(), where.params);
-    if (query.includeValue() != null && !query.includeValue().isEmpty()) {
+    if (hasInclude) {
       resolveIncludes(modelName, relations, rows, query.includeValue());
     }
     if (selected != null) {
       if (hasRelationSelect(selected, relations)) {
         resolveIncludes(modelName, relations, rows, relationSelect(selected, relations));
       }
-      rows = projectFields(rows, selected);
+      rows = projectFields(rows, selected, collectIncludeKeys(query.includeValue()));
     }
     return decodeVectorRows(rows);
   }
@@ -704,6 +707,147 @@ public class An5TableClient {
 
   // ─── Relations ──────────────────────────────────────────────────────────────────
 
+  private static final class CountTarget {
+    final String relKey;
+    final RelationDef relation;
+    final Object where;
+
+    CountTarget(String relKey, RelationDef relation, Object where) {
+      this.relKey = relKey;
+      this.relation = relation;
+      this.where = where;
+    }
+  }
+
+  private static String joinKeyToken(Object value) {
+    if (value == null) {
+      return null;
+    }
+    if (value instanceof Boolean) {
+      return "b:" + value;
+    }
+    if (value instanceof Number) {
+      if (value instanceof Double || value instanceof Float) {
+        double d = ((Number) value).doubleValue();
+        if (d == Math.rint(d) && d >= Long.MIN_VALUE && d <= Long.MAX_VALUE) {
+          return "i:" + ((long) d);
+        }
+        return "d:" + d;
+      }
+      return "i:" + ((Number) value).longValue();
+    }
+    return "s:" + String.valueOf(value);
+  }
+
+  private static Integer parseIncludePageBound(Object raw, String field, String relKey) {
+    if (raw == null) {
+      return null;
+    }
+    if (!(raw instanceof Number)) {
+      throw new IllegalArgumentException(
+          "include." + field + " for relation '" + relKey + "' must be a non-negative integer");
+    }
+    double d = ((Number) raw).doubleValue();
+    if (d < 0 || d != Math.rint(d) || d > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException(
+          "include." + field + " for relation '" + relKey + "' must be a non-negative integer");
+    }
+    return Integer.valueOf((int) d);
+  }
+
+  private static List<CountTarget> parseCountTargets(
+      String currentModel, Map<String, RelationDef> relations, Object countSpec) {
+    List<CountTarget> targets = new ArrayList<CountTarget>();
+    if (countSpec == null) {
+      return targets;
+    }
+    if (countSpec instanceof Boolean) {
+      if (!Boolean.TRUE.equals(countSpec)) {
+        return targets;
+      }
+      List<String> keys = new ArrayList<String>();
+      for (Map.Entry<String, RelationDef> entry : relations.entrySet()) {
+        if (entry.getValue().isMany()) {
+          keys.add(entry.getKey());
+        }
+      }
+      Collections.sort(keys);
+      for (String k : keys) {
+        targets.add(new CountTarget(k, relations.get(k), null));
+      }
+      return targets;
+    }
+    if (!(countSpec instanceof Map)) {
+      throw new IllegalArgumentException("Invalid _count payload for model '" + currentModel + "'");
+    }
+    Map<?, ?> rawMap = (Map<?, ?>) countSpec;
+    Map<?, ?> selection = rawMap;
+    if (rawMap.containsKey("select")) {
+      if (rawMap.size() > 1) {
+        throw new IllegalArgumentException(
+            "Unknown option alongside 'select' in _count for model '" + currentModel + "'");
+      }
+      Object selObj = rawMap.get("select");
+      if (selObj == null) {
+        return targets;
+      }
+      if (!(selObj instanceof Map)) {
+        throw new IllegalArgumentException("_count.select for model '" + currentModel + "' must be a map");
+      }
+      selection = (Map<?, ?>) selObj;
+    }
+
+    for (Map.Entry<?, ?> entry : selection.entrySet()) {
+      Object val = entry.getValue();
+      if (val == null || Boolean.FALSE.equals(val)) {
+        continue;
+      }
+      String relKey = String.valueOf(entry.getKey());
+      RelationDef relation = relations.get(relKey);
+      if (relation == null || !relation.isMany()) {
+        throw new IllegalArgumentException(
+            "Unknown or non-list relation '" + relKey + "' in _count for model '" + currentModel + "'");
+      }
+      Object countWhere = null;
+      if (Boolean.TRUE.equals(val)) {
+        countWhere = null;
+      } else if (val instanceof Map) {
+        Map<?, ?> optMap = (Map<?, ?>) val;
+        for (Map.Entry<?, ?> opt : optMap.entrySet()) {
+          String optKey = String.valueOf(opt.getKey());
+          if (!"where".equals(optKey)) {
+            throw new IllegalArgumentException(
+                "Unsupported option '" + optKey + "' in _count." + relKey);
+          }
+          countWhere = opt.getValue();
+        }
+      } else {
+        throw new IllegalArgumentException(
+            "Unsupported _count option for relation '" + relKey + "' on '" + currentModel + "'");
+      }
+      targets.add(new CountTarget(relKey, relation, countWhere));
+    }
+    return targets;
+  }
+
+  private static List<String> extractSelectFieldNames(Object selectObj) {
+    List<String> fields = new ArrayList<String>();
+    if (selectObj instanceof List) {
+      for (Object field : (List<?>) selectObj) {
+        if (field != null && !String.valueOf(field).isEmpty()) {
+          fields.add(String.valueOf(field));
+        }
+      }
+    } else if (selectObj instanceof Map) {
+      for (Map.Entry<?, ?> entry : ((Map<?, ?>) selectObj).entrySet()) {
+        if (Boolean.TRUE.equals(entry.getValue()) && entry.getKey() != null) {
+          fields.add(String.valueOf(entry.getKey()));
+        }
+      }
+    }
+    return fields;
+  }
+
   /** Eager-loads relations onto rows already fetched, in place. */
   @SuppressWarnings("unchecked")
   private void resolveIncludes(
@@ -724,7 +868,7 @@ public class An5TableClient {
       }
 
       if ("_count".equals(key)) {
-        applyRelationCounts(relations, rows);
+        applyRelationCounts(currentModel, relations, rows, value);
         continue;
       }
 
@@ -737,73 +881,125 @@ public class An5TableClient {
       String matchKey = keys[0];
       String joinKey = keys[1];
 
+      Integer skipVal = null;
+      Integer takeVal = null;
+      Map<String, Object> nestedIncludeMap = null;
+      List<String> nestedSelectFields = null;
+      Object extraWhere = null;
+      Object subOrderBy = null;
+
+      if (value instanceof Map) {
+        Map<String, Object> options = (Map<String, Object>) value;
+        extraWhere = options.get("where");
+        subOrderBy = options.get("orderBy");
+        skipVal = parseIncludePageBound(options.get("skip"), "skip", key);
+        takeVal = parseIncludePageBound(options.get("take"), "take", key);
+        if (options.get("include") instanceof Map) {
+          nestedIncludeMap = (Map<String, Object>) options.get("include");
+        }
+        if (options.get("select") != null) {
+          List<String> extracted = extractSelectFieldNames(options.get("select"));
+          if (!extracted.isEmpty()) {
+            nestedSelectFields = extracted;
+          }
+        }
+      }
+
       List<Object> uniqueKeys = uniqueKeys(rows, joinKey);
-      if (uniqueKeys.isEmpty()) {
+      if (uniqueKeys.isEmpty() || (isMany && takeVal != null && takeVal.intValue() == 0)) {
         for (Map<String, Object> row : rows) {
           row.put(key, isMany ? new ArrayList<Object>() : null);
         }
         continue;
       }
 
-      Map<String, Object> nestedWhere = single(matchKey, single("in", uniqueKeys));
+      Map<String, Object> baseWhere = single(matchKey, single("in", uniqueKeys));
+      Map<String, Object> nestedWhere = baseWhere;
+      if (extraWhere instanceof Map && !((Map<?, ?>) extraWhere).isEmpty()) {
+        nestedWhere = single("AND", Arrays.<Object>asList(baseWhere, extraWhere));
+      }
       An5Query nested = new An5Query().where(nestedWhere);
-      if (value instanceof Map) {
-        Map<String, Object> options = (Map<String, Object>) value;
-        Object extra = options.get("where");
-        if (extra instanceof Map) {
-          for (Map.Entry<String, Object> condition : ((Map<String, Object>) extra).entrySet()) {
-            nestedWhere.put(condition.getKey(), condition.getValue());
-          }
-        }
-        if (options.get("orderBy") != null) {
-          nested.orderBy(options.get("orderBy"));
-        }
-        if (options.get("skip") instanceof Number) {
-          nested.skip(((Number) options.get("skip")).intValue());
-        }
-        if (options.get("take") instanceof Number) {
-          nested.take(((Number) options.get("take")).intValue());
-        }
+      if (subOrderBy != null) {
+        nested.orderBy(subOrderBy);
       }
 
       List<Map<String, Object>> related = adapter.table(relation.modelName).findMany(nested);
-      List<Map<String, Object>> projected = related;
-      if (value instanceof Map) {
-        Map<String, Object> options = (Map<String, Object>) value;
-        if (options.get("include") instanceof Map) {
-          resolveIncludes(
-              relation.modelName,
-              Metadata.relationsFor(relation.modelName),
-              related,
-              (Map<String, Object>) options.get("include"));
+
+      Map<String, List<Integer>> groups = new LinkedHashMap<String, List<Integer>>();
+      for (int i = 0; i < related.size(); i++) {
+        String token = joinKeyToken(related.get(i).get(matchKey));
+        if (token == null) {
+          continue;
         }
-        if (options.get("select") instanceof List) {
-          List<String> fields = new ArrayList<String>();
-          for (Object field : (List<?>) options.get("select")) {
-            if (field != null && !String.valueOf(field).isEmpty()) {
-              fields.add(String.valueOf(field));
+        if (!groups.containsKey(token)) {
+          groups.put(token, new ArrayList<Integer>());
+        }
+        groups.get(token).add(Integer.valueOf(i));
+      }
+
+      Map<String, List<Integer>> slicedByToken = new LinkedHashMap<String, List<Integer>>();
+      List<Map<String, Object>> surviving = new ArrayList<Map<String, Object>>();
+      List<Integer> survivingIdxs = new ArrayList<Integer>();
+      Set<Integer> seenIdx = new LinkedHashSet<Integer>();
+      int skipOffset = skipVal != null ? skipVal.intValue() : 0;
+
+      for (Map.Entry<String, List<Integer>> grp : groups.entrySet()) {
+        List<Integer> bucket = grp.getValue();
+        List<Integer> picked = new ArrayList<Integer>();
+        if (isMany) {
+          for (int i = skipOffset; i < bucket.size(); i++) {
+            if (takeVal != null && picked.size() >= takeVal.intValue()) {
+              break;
             }
+            picked.add(bucket.get(i));
           }
-          projected = projectFields(related, fields);
+        } else if (!bucket.isEmpty()) {
+          picked.add(bucket.get(0));
+        }
+        slicedByToken.put(grp.getKey(), picked);
+        for (Integer idx : picked) {
+          if (seenIdx.add(idx)) {
+            survivingIdxs.add(idx);
+            surviving.add(related.get(idx.intValue()));
+          }
         }
       }
 
-      Map<Object, List<Map<String, Object>>> groups = new LinkedHashMap<Object, List<Map<String, Object>>>();
-      String groupColumn = matchKey;
-      for (int i = 0; i < related.size(); i++) {
-        Object groupKey = related.get(i).get(groupColumn);
-        if (!groups.containsKey(groupKey)) {
-          groups.put(groupKey, new ArrayList<Map<String, Object>>());
-        }
-        groups.get(groupKey).add(projected.get(i));
+      Map<String, RelationDef> childRelations = Metadata.relationsFor(relation.modelName);
+      if (nestedIncludeMap != null && !surviving.isEmpty()) {
+        resolveIncludes(relation.modelName, childRelations, surviving, nestedIncludeMap);
       }
-      String rowColumn = joinKey;
+      if (nestedSelectFields != null && !surviving.isEmpty() && hasRelationSelect(nestedSelectFields, childRelations)) {
+        resolveIncludes(relation.modelName, childRelations, surviving, relationSelect(nestedSelectFields, childRelations));
+      }
+
+      Map<Integer, Map<String, Object>> projectedByIdx = new LinkedHashMap<Integer, Map<String, Object>>();
+      if (nestedSelectFields != null) {
+        List<Map<String, Object>> projectedList =
+            projectFields(surviving, nestedSelectFields, collectIncludeKeys(nestedIncludeMap));
+        for (int i = 0; i < survivingIdxs.size(); i++) {
+          projectedByIdx.put(survivingIdxs.get(i), projectedList.get(i));
+        }
+      }
+
       for (Map<String, Object> row : rows) {
-        List<Map<String, Object>> matches = groups.get(row.get(rowColumn));
+        String token = joinKeyToken(row.get(joinKey));
+        List<Integer> matchedIdxs = token != null ? slicedByToken.get(token) : null;
         if (isMany) {
-          row.put(key, matches == null ? new ArrayList<Object>() : matches);
+          List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
+          if (matchedIdxs != null) {
+            for (Integer idx : matchedIdxs) {
+              out.add(nestedSelectFields != null ? projectedByIdx.get(idx) : related.get(idx.intValue()));
+            }
+          }
+          row.put(key, out);
         } else {
-          row.put(key, matches == null || matches.isEmpty() ? null : matches.get(0));
+          if (matchedIdxs != null && !matchedIdxs.isEmpty()) {
+            Integer idx = matchedIdxs.get(0);
+            row.put(key, nestedSelectFields != null ? projectedByIdx.get(idx) : related.get(idx.intValue()));
+          } else {
+            row.put(key, null);
+          }
         }
       }
     }
@@ -811,39 +1007,47 @@ public class An5TableClient {
 
   @SuppressWarnings("unchecked")
   private void applyRelationCounts(
-      Map<String, RelationDef> relations, List<Map<String, Object>> rows) throws SQLException {
+      String currentModel,
+      Map<String, RelationDef> relations,
+      List<Map<String, Object>> rows,
+      Object countSpec)
+      throws SQLException {
     for (Map<String, Object> row : rows) {
-      row.put("_count", new LinkedHashMap<String, Object>());
-    }
-    for (Map.Entry<String, RelationDef> entry : relations.entrySet()) {
-      RelationDef relation = entry.getValue();
-      if (!relation.isMany()) {
-        continue;
+      if (!(row.get("_count") instanceof Map)) {
+        row.put("_count", new LinkedHashMap<String, Object>());
       }
-      List<Object> uniqueKeys = uniqueKeys(rows, relation.localKey);
+    }
+    List<CountTarget> targets = parseCountTargets(currentModel, relations, countSpec);
+    for (CountTarget target : targets) {
+      String[] keys = Metadata.relationKeys(currentModel, target.relation);
+      String matchKey = keys[0];
+      String joinKey = keys[1];
+      List<Object> uniqueKeys = uniqueKeys(rows, joinKey);
       if (uniqueKeys.isEmpty()) {
         for (Map<String, Object> row : rows) {
-          ((Map<String, Object>) row.get("_count")).put(entry.getKey(), 0);
+          ((Map<String, Object>) row.get("_count")).put(target.relKey, Integer.valueOf(0));
         }
         continue;
       }
       Map<String, Integer> counts = new LinkedHashMap<String, Integer>();
+      Map<String, Object> baseWhere = single(matchKey, single("in", uniqueKeys));
+      Map<String, Object> countWhere = baseWhere;
+      if (target.where instanceof Map && !((Map<?, ?>) target.where).isEmpty()) {
+        countWhere = single("AND", Arrays.<Object>asList(baseWhere, target.where));
+      }
       List<Map<String, Object>> related =
-          adapter
-              .table(relation.modelName)
-              .findMany(new An5Query().where(single(relation.foreignKey, single("in", uniqueKeys))));
+          adapter.table(target.relation.modelName).findMany(new An5Query().where(countWhere));
       for (Map<String, Object> row : related) {
-        Object key = row.get(relation.foreignKey);
-        if (key == null) {
+        String token = joinKeyToken(row.get(matchKey));
+        if (token == null) {
           continue;
         }
-        String asString = String.valueOf(key);
-        counts.put(asString, counts.containsKey(asString) ? counts.get(asString) + 1 : 1);
+        counts.put(token, counts.containsKey(token) ? counts.get(token) + 1 : 1);
       }
       for (Map<String, Object> row : rows) {
-        Object key = row.get(relation.localKey);
-        Integer count = key == null ? null : counts.get(String.valueOf(key));
-        ((Map<String, Object>) row.get("_count")).put(entry.getKey(), count == null ? 0 : count);
+        String token = joinKeyToken(row.get(joinKey));
+        Integer count = token == null ? null : counts.get(token);
+        ((Map<String, Object>) row.get("_count")).put(target.relKey, count == null ? Integer.valueOf(0) : count);
       }
     }
   }
@@ -952,12 +1156,12 @@ public class An5TableClient {
     List<Map<String, Object>> rows = new ArrayList<Map<String, Object>>();
     rows.add(row);
     Map<String, RelationDef> relations = Metadata.relationsFor(modelName);
-    if (query.includeValue() != null && !query.includeValue().isEmpty()) {
+    if (!collectIncludeKeys(query.includeValue()).isEmpty()) {
       resolveIncludes(modelName, relations, rows, query.includeValue());
     }
     if (query.selectValue() != null) {
       resolveIncludes(modelName, relations, rows, relationSelect(query.selectValue(), relations));
-      return projectFields(rows, query.selectValue()).get(0);
+      return projectFields(rows, query.selectValue(), collectIncludeKeys(query.includeValue())).get(0);
     }
     return row;
   }
@@ -980,17 +1184,31 @@ public class An5TableClient {
         .include(query.includeValue());
   }
 
-  private static List<Object> uniqueKeys(List<Map<String, Object>> rows, String column) {
-    Set<Object> seen = new LinkedHashSet<Object>();
-    for (Map<String, Object> row : rows) {
-      Object value = row.get(column);
-      // Numbers are normalised so that a key read as an int in one row and a long in the
-      // next does not turn into two `IN` values for the same row.
-      if (value != null) {
-        seen.add(value instanceof Number ? ((Number) value).doubleValue() : value);
+  private static List<String> collectIncludeKeys(Map<String, Object> include) {
+    List<String> keys = new ArrayList<String>();
+    if (include == null || include.isEmpty()) {
+      return keys;
+    }
+    for (Map.Entry<String, Object> entry : include.entrySet()) {
+      Object val = entry.getValue();
+      if (val != null && !Boolean.FALSE.equals(val)) {
+        keys.add(entry.getKey());
       }
     }
-    return new ArrayList<Object>(seen);
+    return keys;
+  }
+
+  private static List<Object> uniqueKeys(List<Map<String, Object>> rows, String column) {
+    Set<String> seenTokens = new LinkedHashSet<String>();
+    List<Object> unique = new ArrayList<Object>();
+    for (Map<String, Object> row : rows) {
+      Object value = row.get(column);
+      String token = joinKeyToken(value);
+      if (token != null && seenTokens.add(token)) {
+        unique.add(value);
+      }
+    }
+    return unique;
   }
 
   /** The columns, quoted for this dialect and joined into a comma-separated list. */
@@ -1026,6 +1244,11 @@ public class An5TableClient {
 
   private static List<Map<String, Object>> projectFields(
       List<Map<String, Object>> rows, List<String> selected) {
+    return projectFields(rows, selected, Collections.<String>emptyList());
+  }
+
+  private static List<Map<String, Object>> projectFields(
+      List<Map<String, Object>> rows, List<String> selected, Collection<String> extraKeys) {
     if (selected == null || selected.isEmpty()) {
       return rows;
     }
@@ -1037,7 +1260,14 @@ public class An5TableClient {
           kept.put(field, row.get(field));
         }
       }
-      if (row.containsKey("_count")) {
+      if (extraKeys != null) {
+        for (String extra : extraKeys) {
+          if (extra != null && row.containsKey(extra) && !kept.containsKey(extra)) {
+            kept.put(extra, row.get(extra));
+          }
+        }
+      }
+      if (row.containsKey("_count") && !kept.containsKey("_count")) {
         kept.put("_count", row.get("_count"));
       }
       projected.add(kept);

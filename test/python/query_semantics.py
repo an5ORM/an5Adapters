@@ -434,6 +434,61 @@ class QuerySemantics(unittest.TestCase):
         with self.assertRaises(ValueError):
             _build_having({"_sum": {"missing_field": {"gt": 1}}}, {}, "sqlite", by_fields=["userId"], model_name="order")
 
+    def test_include_pagination_and_filtered_count(self):
+        set_adapter_metadata(TEST_METADATA)
+        db = create_an5_adapter("sqlite:///:memory:")
+        try:
+            db.execute("CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT, isActive INTEGER, score INTEGER, createdAt TEXT)")
+            db.execute("CREATE TABLE orders (id TEXT PRIMARY KEY, userId TEXT, totalAmount INTEGER, createdAt TEXT)")
+            db.user.create({"id": "u1", "email": "alice@example.com", "isActive": 1, "score": 100, "createdAt": "2026-01-01"})
+            db.user.create({"id": "u2", "email": "bob@example.com", "isActive": 1, "score": 200, "createdAt": "2026-01-02"})
+            db.user.create({"id": "u3", "email": "carol@example.com", "isActive": 0, "score": 300, "createdAt": "2026-01-03"})
+            db.order.create({"id": "o1", "userId": "u1", "totalAmount": 50, "createdAt": "2026-01-01"})
+            db.order.create({"id": "o2", "userId": "u1", "totalAmount": 120, "createdAt": "2026-01-02"})
+            db.order.create({"id": "o3", "userId": "u1", "totalAmount": 220, "createdAt": "2026-01-03"})
+            db.order.create({"id": "o4", "userId": "u2", "totalAmount": 80, "createdAt": "2026-01-04"})
+            db.order.create({"id": "o5", "userId": "u2", "totalAmount": 190, "createdAt": "2026-01-05"})
+
+            # Per-parent skip/take, nested where filtering on join key (AND composition), select+include preservation, and filtered _count
+            users = db.user.find_many(
+                order_by={"id": "asc"},
+                select={"email": True},
+                include={
+                    "orders": {
+                        "where": {"user_id": {"in": ["u1", "u2"]}},
+                        "order_by": {"id": "asc"},
+                        "skip": 1,
+                        "take": 1,
+                        "select": {"totalAmount": True},
+                        "include": {"user": {"select": {"email": True}}},
+                    },
+                    "_count": {"select": {"orders": {"where": {"total_amount": {"gte": 100}}}}},
+                },
+            )
+            self.assertEqual([u["email"] for u in users], ["alice@example.com", "bob@example.com", "carol@example.com"])
+            self.assertNotIn("id", users[0])
+            self.assertEqual(users[0]["_count"], {"orders": 2})
+            self.assertEqual(len(users[0]["orders"]), 1)
+            self.assertEqual(users[0]["orders"][0]["totalAmount"], 120)
+            self.assertNotIn("id", users[0]["orders"][0])
+            self.assertEqual(users[0]["orders"][0]["user"], {"email": "alice@example.com"})
+            self.assertEqual(users[1]["_count"], {"orders": 1})
+            self.assertEqual([o["totalAmount"] for o in users[1]["orders"]], [190])
+            self.assertEqual(users[2]["_count"], {"orders": 0})
+            self.assertEqual(users[2]["orders"], [])
+
+            # take=0 yields empty lists per parent
+            zero_take = db.user.find_many(order_by={"id": "asc"}, include={"orders": {"take": 0}})
+            self.assertEqual([u["orders"] for u in zero_take], [[], [], []])
+
+            # Strict validation on negative take and unknown _count relation
+            with self.assertRaises(ValueError):
+                db.user.find_many(include={"orders": {"take": -1}})
+            with self.assertRaises(ValueError):
+                db.user.find_many(include={"_count": {"select": {"nonexistent": True}}})
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

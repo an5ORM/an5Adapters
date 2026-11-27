@@ -131,6 +131,25 @@ def _normalize_operator_dict(raw: Dict[str, Any], field_name: str) -> Dict[str, 
     return normalized
 
 
+def resolve_relation_keys(model_name: str, relation: Dict[str, str]) -> tuple[str, str]:
+    """Return `(child_key, parent_key)` matching FK-side vs inverse relations."""
+    raw_fk = relation.get("foreignKey", "id")
+    raw_lk = relation.get("localKey", "id")
+    if relation.get("relationType") == "many":
+        return raw_fk, raw_lk
+    # Generated RELATION_MAP records foreignKey on the referencing model (parent)
+    # and localKey on the referenced model (child), matching _resolve_includes.
+    # Hand-written fixtures may reverse them; disambiguate via model_fields.
+    parent_fields = get_field_map_for_model(model_name)
+    child_fields = get_field_map_for_model(relation.get("modelName", ""))
+    if (
+        (child_fields and raw_fk in child_fields and raw_lk not in child_fields)
+        or (parent_fields and raw_lk in parent_fields and raw_fk not in parent_fields)
+    ):
+        return raw_fk, raw_lk
+    return raw_lk, raw_fk
+
+
 def _parse_relation_filter(model_name: str, relation: Dict[str, str], value: Any, params: Dict, dialect: str, prefix: str = "", self_ref: str = "") -> Optional[str]:
     if is_dataclass(value) and not isinstance(value, type):
         value = _normalize_dataclass_dict(value)
@@ -150,23 +169,7 @@ def _parse_relation_filter(model_name: str, relation: Dict[str, str], value: Any
 
     child_table = _quote_table(_resolve_table(relation.get("modelName", "")), dialect)
     child_alias = f"r_{_sanitize_param_name(prefix)}"
-
-    raw_fk = relation.get("foreignKey", "id")
-    raw_lk = relation.get("localKey", "id")
-    if is_many:
-        child_key, parent_key = raw_fk, raw_lk
-    else:
-        # Generated RELATION_MAP records foreignKey on the referencing model (parent)
-        # and localKey on the referenced model (child), matching _resolve_includes.
-        # Hand-written fixtures may reverse them to match sql.ts; disambiguate via model_fields.
-        parent_key, child_key = raw_fk, raw_lk
-        parent_fields = get_field_map_for_model(model_name)
-        child_fields = get_field_map_for_model(relation.get("modelName", ""))
-        if (
-            (child_fields and raw_fk in child_fields and raw_lk not in child_fields)
-            or (parent_fields and raw_lk in parent_fields and raw_fk not in parent_fields)
-        ):
-            child_key, parent_key = raw_fk, raw_lk
+    child_key, parent_key = resolve_relation_keys(model_name, relation)
 
     fk = _quote(child_key, dialect)
     lk = _quote(parent_key, dialect)

@@ -571,12 +571,80 @@ INSERT INTO rel_order_items VALUES (1000,100,'AN5-PRO'),(1001,102,'BASIC');";
             CheckThrows<ArgumentException>("reject non-dict where", () =>
                 usersTbl.FindMany(new FindManyArgs { Where = "not-a-dict" }));
 
+            IncludePaginationAndFilteredCount(adapter);
             GroupByHavingAndInsensitiveFilters(adapter);
         }
         finally
         {
             An5AdapterMetadata.Set(new AdapterMetadata());
         }
+    }
+
+    private static void IncludePaginationAndFilteredCount(An5Adapter adapter)
+    {
+        Console.WriteLine("\n[include pagination, filtered _count, AND where composition, select+include preservation]");
+        adapter.ExecuteRaw("INSERT INTO rel_orders VALUES (104,1,220,'paid'),(105,2,180,'paid'),(106,2,210,'paid');");
+        var usersTbl = adapter.Table<RelUser>("User");
+
+        var users = usersTbl.FindMany(new FindManyArgs
+        {
+            OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+            Select = new List<string> { "Email" },
+            Include = new Dictionary<string, object>
+            {
+                {
+                    "orders", new Dictionary<string, object>
+                    {
+                        { "where", new Dictionary<string, object> { { "user_id", new Dictionary<string, object> { { "in", new List<object> { 1, 2 } } } } } },
+                        { "orderBy", new Dictionary<string, object> { { "id", "asc" } } },
+                        { "skip", 1 },
+                        { "take", 1 },
+                        { "select", new List<string> { "id", "total" } },
+                        {
+                            "include", new Dictionary<string, object>
+                            {
+                                { "user", new Dictionary<string, object> { { "select", new List<string> { "email" } } } },
+                            }
+                        },
+                    }
+                },
+                {
+                    "_count", new Dictionary<string, object>
+                    {
+                        {
+                            "select", new Dictionary<string, object>
+                            {
+                                { "orders", new Dictionary<string, object> { { "where", new Dictionary<string, object> { { "status", "paid" } } } } },
+                            }
+                        },
+                    }
+                },
+            },
+        });
+
+        Check("include parity: parent count", users.Count, 3);
+        Check("include parity: Select strips Id while preserving Email", users[0].Id == 0 && users[0].Email == "alice@example.com", true);
+        Check("include parity: alice filtered _count.orders == 2", Convert.ToInt32(users[0]._count["orders"]), 2);
+        Check("include parity: bob filtered _count.orders == 2", Convert.ToInt32(users[1]._count["orders"]), 2);
+        Check("include parity: carol filtered _count.orders == 0", Convert.ToInt32(users[2]._count["orders"]), 0);
+        Check("include parity: alice per-parent skip=1,take=1 -> [101]", users[0].Orders.Count == 1 && Convert.ToInt32(users[0].Orders[0]["id"]) == 101, true);
+        Check("include parity: alice nested select strips user_id", users[0].Orders[0].ContainsKey("user_id"), false);
+        var nestedUser = users[0].Orders[0]["user"] as Dictionary<string, object>;
+        Check("include parity: alice nested user email preserved", nestedUser != null ? nestedUser["email"] : null, "alice@example.com");
+        Check("include parity: bob per-parent skip=1,take=1 -> [105]", users[1].Orders.Count == 1 && Convert.ToInt32(users[1].Orders[0]["id"]) == 105, true);
+        Check("include parity: carol orders empty", users[2].Orders.Count, 0);
+
+        var zeroTake = usersTbl.FindMany(new FindManyArgs
+        {
+            OrderBy = new Dictionary<string, object> { { "id", "asc" } },
+            Include = new Dictionary<string, object> { { "orders", new Dictionary<string, object> { { "take", 0 } } } },
+        });
+        Check("include parity: take=0 yields empty lists", zeroTake.All(u => u.Orders.Count == 0), true);
+
+        CheckThrows<ArgumentException>("include parity: reject negative take", () =>
+            usersTbl.FindMany(new FindManyArgs { Include = new Dictionary<string, object> { { "orders", new Dictionary<string, object> { { "take", -1 } } } } }));
+        CheckThrows<ArgumentException>("include parity: reject unknown _count relation", () =>
+            usersTbl.FindMany(new FindManyArgs { Include = new Dictionary<string, object> { { "_count", new Dictionary<string, object> { { "select", new Dictionary<string, object> { { "bogus", true } } } } } } }));
     }
 
     private static void GroupByHavingAndInsensitiveFilters(An5Adapter adapter)

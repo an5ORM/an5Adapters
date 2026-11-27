@@ -53,6 +53,7 @@ import {
   getRelationsForModel,
   resolveModelRelation,
   resolveRelationKeys,
+  type RelationDef,
 } from './base/metadata';
 export type { An5AdapterConfig, Dialect, QueryEngine, TransactionHandle } from './base/types';
 export { setAdapterMetadata, createAdapterProxy, type AdapterMetadata } from './base/metadata';
@@ -135,18 +136,90 @@ function toNonNegativeInt(value: unknown, fallback = 0): number {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
-function projectFields(row: any, select: any): any {
+function joinKeyToken(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'bigint') return `n:${value.toString()}`;
+  if (typeof value === 'number') return Number.isFinite(value) ? `n:${value}` : null;
+  if (typeof value === 'boolean') return `b:${value ? '1' : '0'}`;
+  return `${typeof value}:${String(value)}`;
+}
+
+function parseIncludePageBound(value: unknown, field: 'take' | 'skip', relKey: string): { has: boolean; value: number } {
+  if (value === undefined || value === null) return { has: false, value: 0 };
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(`Include.${field} for relation '${relKey}' must be a non-negative integer`);
+  }
+  return { has: true, value: n };
+}
+
+function collectIncludeKeys(include: any): string[] {
+  if (!include || typeof include !== 'object' || Array.isArray(include)) return [];
+  return Object.entries(include)
+    .filter(([, val]) => Boolean(val))
+    .map(([key]) => key);
+}
+
+function projectFields(row: any, select: any, extraKeys: string[] = []): any {
   if (!row || !select || typeof select !== 'object') return row;
   const projected: any = {};
-  for (const [key, val] of Object.entries(select)) {
-    if (val) {
-      projected[key] = row[key];
+  if (Array.isArray(select)) {
+    for (const key of select) {
+      if (typeof key === 'string' && Object.prototype.hasOwnProperty.call(row, key)) {
+        projected[key] = row[key];
+      }
+    }
+  } else {
+    for (const [key, val] of Object.entries(select)) {
+      if (val && Object.prototype.hasOwnProperty.call(row, key)) {
+        projected[key] = row[key];
+      }
     }
   }
-  if (row._count) {
+  for (const extra of extraKeys) {
+    if (extra && Object.prototype.hasOwnProperty.call(row, extra)) {
+      projected[extra] = row[extra];
+    }
+  }
+  if (row._count !== undefined && !Object.prototype.hasOwnProperty.call(projected, '_count')) {
     projected._count = row._count;
   }
   return projected;
+}
+
+function resolveManyRelationCounts(
+  modelName: string,
+  modelRelations: Record<string, RelationDef>,
+  countSpec: any
+): Array<{ relKey: string; relation: RelationDef; where?: any }> {
+  if (!countSpec) return [];
+  if (countSpec === true) {
+    return Object.entries(modelRelations)
+      .filter(([, rel]) => rel.relationType === 'many')
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([relKey, relation]) => ({ relKey, relation }));
+  }
+  if (typeof countSpec !== 'object') {
+    throw new Error(`Invalid _count payload for model '${modelName}'`);
+  }
+  const selection = 'select' in countSpec ? countSpec.select : countSpec;
+  if (!selection) return [];
+  if (typeof selection !== 'object' || Array.isArray(selection)) {
+    throw new Error(`_count.select for model '${modelName}' must be an object`);
+  }
+  const targets: Array<{ relKey: string; relation: RelationDef; where?: any }> = [];
+  for (const [relKey, relSpec] of Object.entries(selection)) {
+    if (!relSpec) continue;
+    const match = resolveModelRelation(modelName, relKey);
+    if (!match || match.relation.relationType !== 'many') {
+      throw new Error(`Unknown or non-list relation '${relKey}' in _count for model '${modelName}'`);
+    }
+    const where = typeof relSpec === 'object' && relSpec !== null && 'where' in relSpec
+      ? (relSpec as any).where
+      : undefined;
+    targets.push({ relKey: match.name || relKey, relation: match.relation, where });
+  }
+  return targets;
 }
 
 async function resolveIncludes(
@@ -163,28 +236,30 @@ async function resolveIncludes(
 
     if (key === '_count') {
       for (const row of rows) {
-        if (!row._count) row._count = {};
+        if (!row._count || typeof row._count !== 'object') row._count = {};
       }
-      for (const [relKey, relation] of Object.entries(modelRelations)) {
-        if (relation.relationType === 'many') {
-          const uniqueKeys = Array.from(new Set(rows.map(r => r[relation.localKey]).filter(k => k !== undefined && k !== null)));
-          if (uniqueKeys.length > 0) {
-            const relClient = adapter.table(relation.modelName);
-            const relatedRows = await relClient.findMany({
-              where: { [relation.foreignKey]: { in: uniqueKeys } },
-            });
-            const countMap = new Map<any, number>();
-            relatedRows.forEach((r: any) => {
-              const k = r[relation.foreignKey];
-              countMap.set(k, (countMap.get(k) || 0) + 1);
-            });
-            rows.forEach(r => {
-              const k = r[relation.localKey];
-              r._count[relKey] = countMap.get(k) || 0;
-            });
-          } else {
-            rows.forEach(r => { r._count[relKey] = 0; });
-          }
+      const targets = resolveManyRelationCounts(modelName, modelRelations, value);
+      for (const target of targets) {
+        const { childKey, parentKey } = resolveRelationKeys(modelName, target.relation, undefined, true);
+        const uniqueKeys = Array.from(new Set(rows.map(r => r[parentKey]).filter(k => k !== undefined && k !== null)));
+        if (uniqueKeys.length > 0) {
+          const baseWhere = { [childKey]: { in: uniqueKeys } };
+          const countWhere = target.where && typeof target.where === 'object' && Object.keys(target.where).length > 0
+            ? { AND: [baseWhere, target.where] }
+            : baseWhere;
+          const relClient = adapter.table(target.relation.modelName);
+          const relatedRows = await relClient.findMany({ where: countWhere });
+          const countMap = new Map<string, number>();
+          relatedRows.forEach((r: any) => {
+            const token = joinKeyToken(r[childKey]);
+            if (token !== null) countMap.set(token, (countMap.get(token) || 0) + 1);
+          });
+          rows.forEach(r => {
+            const token = joinKeyToken(r[parentKey]);
+            r._count[target.relKey] = token !== null ? (countMap.get(token) || 0) : 0;
+          });
+        } else {
+          rows.forEach(r => { r._count[target.relKey] = 0; });
         }
       }
       continue;
@@ -196,52 +271,82 @@ async function resolveIncludes(
 
     const isMany = relation.relationType === 'many';
     const { childKey: matchKey, parentKey: joinKey } = resolveRelationKeys(modelName, relation, undefined, true);
+    const subArgs: any = typeof value === 'object' ? { ...value } : {};
+    const takeSpec = parseIncludePageBound(subArgs.take, 'take', key);
+    const skipSpec = parseIncludePageBound(subArgs.skip, 'skip', key);
     const uniqueKeys = Array.from(new Set(rows.map(r => r[joinKey]).filter(k => k !== undefined && k !== null)));
 
-    if (uniqueKeys.length === 0) {
+    if (uniqueKeys.length === 0 || (isMany && takeSpec.has && takeSpec.value === 0)) {
       rows.forEach(r => { r[key] = isMany ? [] : null; });
       continue;
     }
 
-    const subArgs: any = typeof value === 'object' ? { ...value } : {};
     const nestedInclude = subArgs.include;
     const nestedSelect = subArgs.select;
-
-    const subWhere: any = {
-      [matchKey]: { in: uniqueKeys },
-      ...(subArgs.where || {}),
-    };
+    const baseWhere = { [matchKey]: { in: uniqueKeys } };
+    const subWhere: any = subArgs.where && typeof subArgs.where === 'object' && Object.keys(subArgs.where).length > 0
+      ? { AND: [baseWhere, subArgs.where] }
+      : baseWhere;
 
     const relClient = adapter.table(relation.modelName);
     const relatedRows = await relClient.findMany({
       where: subWhere,
       orderBy: subArgs.orderBy,
-      take: subArgs.take,
-      skip: subArgs.skip,
     });
 
-    if (nestedInclude) {
-      await resolveIncludes(relation.modelName, relatedRows, nestedInclude, adapter);
+    const groupMap = new Map<string, any[]>();
+    relatedRows.forEach((r: any) => {
+      const token = joinKeyToken(r[matchKey]);
+      if (token === null) return;
+      if (!groupMap.has(token)) groupMap.set(token, []);
+      groupMap.get(token)!.push(r);
+    });
+
+    const slicedByToken = new Map<string, any[]>();
+    const survivingRows: any[] = [];
+    const seenSurviving = new Set<any>();
+    for (const [token, bucket] of groupMap.entries()) {
+      const picked = isMany
+        ? bucket.slice(skipSpec.value, takeSpec.has ? skipSpec.value + takeSpec.value : undefined)
+        : bucket.slice(0, 1);
+      slicedByToken.set(token, picked);
+      for (const item of picked) {
+        if (!seenSurviving.has(item)) {
+          seenSurviving.add(item);
+          survivingRows.push(item);
+        }
+      }
     }
 
-    const outputRows = nestedSelect && typeof nestedSelect === 'object'
-      ? relatedRows.map((r: any) => projectFields(r, nestedSelect))
-      : relatedRows;
+    if (nestedInclude && survivingRows.length > 0) {
+      await resolveIncludes(relation.modelName, survivingRows, nestedInclude, adapter);
+    }
+    if (nestedSelect && typeof nestedSelect === 'object' && survivingRows.length > 0) {
+      const childRelations = getRelationsForModel(relation.modelName);
+      const hasNestedRelationSelect = Object.keys(nestedSelect).some(k => k === '_count' || Boolean(childRelations[k]));
+      if (hasNestedRelationSelect) {
+        await resolveIncludes(relation.modelName, survivingRows, nestedSelect, adapter);
+      }
+    }
 
-    const groupMap = new Map<any, any[]>();
-    relatedRows.forEach((r: any, idx: number) => {
-      const k = r[matchKey];
-      if (!groupMap.has(k)) groupMap.set(k, []);
-      groupMap.get(k)!.push(outputRows[idx]);
-    });
+    const preserveKeys = collectIncludeKeys(nestedInclude);
+    const projectedMap = new Map<any, any>();
+    if (nestedSelect && typeof nestedSelect === 'object') {
+      for (const item of survivingRows) {
+        projectedMap.set(item, projectFields(item, nestedSelect, preserveKeys));
+      }
+    }
 
     rows.forEach(r => {
-      const k = r[joinKey];
-      const matches = groupMap.get(k) || [];
+      const token = joinKeyToken(r[joinKey]);
+      const rawMatches = token !== null ? (slicedByToken.get(token) || []) : [];
+      const finalMatches = nestedSelect && typeof nestedSelect === 'object'
+        ? rawMatches.map(item => projectedMap.get(item))
+        : rawMatches;
       if (isMany) {
-        r[key] = matches;
+        r[key] = finalMatches;
       } else {
-        r[key] = matches[0] || null;
+        r[key] = finalMatches[0] || null;
       }
     });
   }
@@ -929,12 +1034,14 @@ export class AdapterTableClient<T = any> {
     const hasSkip = skip !== undefined && skip !== null;
 
     let cols = "*";
+    const hasInclude = Boolean(args?.include && typeof args.include === 'object' && Object.keys(args.include).length > 0);
     if (args?.select && typeof args.select === "object") {
       const relationKeys = getRelationsForModel(this.modelName);
-      const hasRelationSelect = Object.keys(args.select).some(k => k === '_count' || relationKeys[k]);
+      const selectKeys = Array.isArray(args.select) ? args.select : Object.keys(args.select).filter(k => args.select[k] === true);
+      const hasRelationSelect = selectKeys.some(k => k === '_count' || relationKeys[k]);
       const fields = getFieldsForModel(this.modelName);
-      const selectedKeys = Object.keys(args.select).filter(k => args.select[k] === true && (Object.keys(fields).length === 0 || fields[k]));
-      if (selectedKeys.length > 0 && !hasRelationSelect) {
+      const selectedKeys = selectKeys.filter(k => typeof k === 'string' && (Object.keys(fields).length === 0 || fields[k]));
+      if (selectedKeys.length > 0 && !hasRelationSelect && !hasInclude) {
         cols = selectedKeys.map(k => quote(k, this.dialect)).join(", ");
       }
     }
@@ -981,11 +1088,11 @@ export class AdapterTableClient<T = any> {
     }
     if (args?.select && typeof args.select === 'object') {
       const relationKeys = getRelationsForModel(this.modelName);
-      const hasRelationSelect = Object.keys(args.select).some(k => k === '_count' || relationKeys[k]);
+      const hasRelationSelect = !Array.isArray(args.select) && Object.keys(args.select).some(k => k === '_count' || relationKeys[k]);
       if (hasRelationSelect) {
         await resolveIncludes(this.modelName, rows, args.select, this.adapter);
       }
-      return rows.map((r: any) => projectFields(r, args.select));
+      return rows.map((r: any) => projectFields(r, args.select, collectIncludeKeys(args?.include)));
     }
 
     return rows;
@@ -1070,8 +1177,10 @@ export class AdapterTableClient<T = any> {
       await resolveIncludes(this.modelName, [createdRecord], args.include, this.adapter);
     }
     if (args.select) {
-      await resolveIncludes(this.modelName, [createdRecord], args.select, this.adapter);
-      return projectFields(createdRecord, args.select);
+      if (!Array.isArray(args.select)) {
+        await resolveIncludes(this.modelName, [createdRecord], args.select, this.adapter);
+      }
+      return projectFields(createdRecord, args.select, collectIncludeKeys(args.include));
     }
 
     return createdRecord as T;
@@ -1191,8 +1300,10 @@ export class AdapterTableClient<T = any> {
       await resolveIncludes(this.modelName, [updatedRecord], args.include, this.adapter);
     }
     if (args.select) {
-      await resolveIncludes(this.modelName, [updatedRecord], args.select, this.adapter);
-      return projectFields(updatedRecord, args.select);
+      if (!Array.isArray(args.select)) {
+        await resolveIncludes(this.modelName, [updatedRecord], args.select, this.adapter);
+      }
+      return projectFields(updatedRecord, args.select, collectIncludeKeys(args.include));
     }
 
     return updatedRecord as T;

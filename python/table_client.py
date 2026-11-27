@@ -5,12 +5,12 @@ import json
 import uuid
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 try:
-    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_having, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model, resolve_field_name, resolve_relation_key
+    from .base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_having, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model, resolve_field_name, resolve_relation_key, resolve_relation_keys
     from .base.sql import _normalize_dataclass_dict
     from .base.vectors import decode_vector, encode_vector, is_vector_field, needs_vector_encoding, run_sqlite_vector_search, vector_distance
     from .base.vector_providers import VectorProviderError
 except ImportError:
-    from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_having, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model, resolve_field_name, resolve_relation_key
+    from base import DIALECT_MSSQL, DIALECT_POSTGRES, DIALECT_SQLITE, get_fields_for_model, _build_having, _build_order_by, _parse_where, _quote, _quote_table, _resolve_table, get_relations_for_model, resolve_field_name, resolve_relation_key, resolve_relation_keys
     from base.sql import _normalize_dataclass_dict
     from base.vectors import decode_vector, encode_vector, is_vector_field, needs_vector_encoding, run_sqlite_vector_search, vector_distance
     from base.vector_providers import VectorProviderError
@@ -37,7 +37,13 @@ def _has_relation_select(select: Any, relations: Dict) -> bool:
     return False
 
 
-def _project_fields(row: Dict, select: Any) -> Dict:
+def _collect_include_keys(include: Any) -> List[str]:
+    if not isinstance(include, dict):
+        return []
+    return [str(k) for k, v in include.items() if v]
+
+
+def _project_fields(row: Dict, select: Any, extra_keys: Optional[List[str]] = None) -> Dict:
     """Keep only selected fields on a row (mirrors TypeScript projectFields)."""
     if not row or not select:
         return row
@@ -45,7 +51,11 @@ def _project_fields(row: Dict, select: Any) -> Dict:
     for key in _selected_fields(select):
         if key in row:
             projected[key] = row[key]
-    if "_count" in row:
+    if extra_keys:
+        for extra in extra_keys:
+            if extra in row and extra not in projected:
+                projected[extra] = row[extra]
+    if "_count" in row and "_count" not in projected:
         projected["_count"] = row["_count"]
     return projected
 
@@ -140,6 +150,64 @@ def _normalize_write_data(model_name: str, data: Any) -> Dict[str, Any]:
     return out
 
 
+def _join_key_token(value: Any) -> Optional[tuple]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return ("b", value)
+    if isinstance(value, (int, float)):
+        return ("n", value)
+    if isinstance(value, (bytes, bytearray)):
+        return ("s", bytes(value).decode("utf-8", errors="replace"))
+    return ("v", str(value))
+
+
+def _parse_include_bound(value: Any, field: str, rel_key: str) -> tuple[bool, int]:
+    if value is None:
+        return False, 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"include.{field} for relation '{rel_key}' must be a non-negative integer")
+    return True, value
+
+
+def _parse_count_targets(model_name: str, model_relations: Dict, count_spec: Any) -> List[tuple[str, Dict, Any]]:
+    if not count_spec:
+        return []
+    if count_spec is True:
+        return [
+            (rk, rel, None)
+            for rk, rel in sorted(model_relations.items())
+            if rel.get("relationType") == "many"
+        ]
+    if is_dataclass(count_spec) and not isinstance(count_spec, type):
+        count_spec = _normalize_dataclass_dict(count_spec)
+    if not isinstance(count_spec, dict):
+        raise ValueError(f"Invalid _count payload for model '{model_name}'")
+    selection = count_spec["select"] if "select" in count_spec else count_spec
+    if not selection:
+        return []
+    if not isinstance(selection, dict):
+        raise ValueError(f"_count.select for model '{model_name}' must be a dict")
+    targets: List[tuple[str, Dict, Any]] = []
+    for raw_key, rel_spec in selection.items():
+        if not rel_spec:
+            continue
+        canon_key = resolve_relation_key(model_name, str(raw_key)) or str(raw_key)
+        relation = model_relations.get(canon_key)
+        if not relation or relation.get("relationType") != "many":
+            raise ValueError(f"Unknown or non-list relation '{raw_key}' in _count for model '{model_name}'")
+        rel_where = None
+        if isinstance(rel_spec, dict):
+            unknown = [k for k in rel_spec if k != "where"]
+            if unknown:
+                raise ValueError(f"Unsupported option(s) in _count.{canon_key}: {', '.join(unknown)}")
+            rel_where = rel_spec.get("where")
+        elif rel_spec is not True:
+            raise ValueError(f"Unsupported _count option for relation '{canon_key}'")
+        targets.append((canon_key, relation, rel_where))
+    return targets
+
+
 def _resolve_includes(model_name: str, rows: List[Dict], include: Any, adapter: Any) -> None:
     """Eager-load relation rows and attach them onto each row (mirrors TypeScript resolveIncludes)."""
     if not rows or not include:
@@ -157,20 +225,34 @@ def _resolve_includes(model_name: str, rows: List[Dict], include: Any, adapter: 
             for row in rows:
                 if "_count" not in row or row["_count"] is None:
                     row["_count"] = {}
-            for rel_key, relation in model_relations.items():
-                if relation.get("relationType") != "many":
-                    continue
-                unique_keys = list({row.get(relation["localKey"]) for row in rows if row.get(relation["localKey"]) is not None})
+            for rel_key, relation, count_where in _parse_count_targets(model_name, model_relations, value):
+                match_key, join_key = resolve_relation_keys(model_name, relation)
+                unique_keys: List[Any] = []
+                seen_tokens = set()
+                for row in rows:
+                    rv = row.get(join_key)
+                    tok = _join_key_token(rv)
+                    if tok is not None and tok not in seen_tokens:
+                        seen_tokens.add(tok)
+                        unique_keys.append(rv)
                 if unique_keys:
+                    base_where: Dict[str, Any] = {match_key: {"in": unique_keys}}
+                    if is_dataclass(count_where) and not isinstance(count_where, type):
+                        count_where = _normalize_dataclass_dict(count_where)
+                    if isinstance(count_where, dict) and count_where:
+                        sub_where: Dict[str, Any] = {"AND": [base_where, count_where]}
+                    else:
+                        sub_where = base_where
                     rel_client = adapter.table(relation["modelName"])
-                    related = rel_client.find_many(where={relation["foreignKey"]: {"in": unique_keys}})
-                    count_map = {}
+                    related = rel_client.find_many(where=sub_where)
+                    count_map: Dict[tuple, int] = {}
                     for r in related:
-                        k = r.get(relation["foreignKey"])
-                        count_map[k] = count_map.get(k, 0) + 1
+                        tok = _join_key_token(r.get(match_key))
+                        if tok is not None:
+                            count_map[tok] = count_map.get(tok, 0) + 1
                     for row in rows:
-                        k = row.get(relation["localKey"])
-                        row["_count"][rel_key] = count_map.get(k, 0)
+                        tok = _join_key_token(row.get(join_key))
+                        row["_count"][rel_key] = count_map.get(tok, 0) if tok is not None else 0
                 else:
                     for row in rows:
                         row["_count"][rel_key] = 0
@@ -181,49 +263,90 @@ def _resolve_includes(model_name: str, rows: List[Dict], include: Any, adapter: 
             continue
 
         is_many = relation.get("relationType") == "many"
-        local_key = relation["localKey"]
-        foreign_key = relation["foreignKey"]
-        join_key = local_key if is_many else foreign_key
-        match_key = foreign_key if is_many else local_key
-        unique_keys = list({row.get(join_key) for row in rows if row.get(join_key) is not None})
+        match_key, join_key = resolve_relation_keys(model_name, relation)
+        sub_args = _normalize_dataclass_dict(value) if is_dataclass(value) and not isinstance(value, type) else (dict(value) if isinstance(value, dict) else {})
+        has_take, take_val = _parse_include_bound(sub_args.get("take"), "take", key)
+        _, skip_val = _parse_include_bound(sub_args.get("skip"), "skip", key)
 
-        if not unique_keys:
+        unique_keys: List[Any] = []
+        seen_tokens = set()
+        for row in rows:
+            rv = row.get(join_key)
+            tok = _join_key_token(rv)
+            if tok is not None and tok not in seen_tokens:
+                seen_tokens.add(tok)
+                unique_keys.append(rv)
+
+        if not unique_keys or (is_many and has_take and take_val == 0):
             for row in rows:
                 row[key] = [] if is_many else None
             continue
 
-        sub_args = value if isinstance(value, dict) else {}
-        sub_where = {match_key: {"in": unique_keys}}
-        if sub_args.get("where"):
-            extra_where = _normalize_dataclass_dict(sub_args["where"]) if is_dataclass(sub_args["where"]) else sub_args["where"]
-            if isinstance(extra_where, dict):
-                sub_where.update(extra_where)
+        base_where = {match_key: {"in": unique_keys}}
+        extra_where = sub_args.get("where")
+        if extra_where:
+            if is_dataclass(extra_where) and not isinstance(extra_where, type):
+                extra_where = _normalize_dataclass_dict(extra_where)
+            if isinstance(extra_where, dict) and extra_where:
+                sub_where: Dict[str, Any] = {"AND": [base_where, extra_where]}
+            else:
+                sub_where = base_where
+        else:
+            sub_where = base_where
 
         rel_client = adapter.table(relation["modelName"])
         related = rel_client.find_many(
             where=sub_where,
             order_by=sub_args.get("orderBy") or sub_args.get("order_by"),
-            take=sub_args.get("take"),
-            skip=sub_args.get("skip") or 0,
         )
 
-        if sub_args.get("include"):
-            _resolve_includes(relation["modelName"], related, sub_args["include"], adapter)
+        group_map: Dict[tuple, List[Dict]] = {}
+        for r in related:
+            tok = _join_key_token(r.get(match_key))
+            if tok is not None:
+                group_map.setdefault(tok, []).append(r)
 
-        output_rows = related
-        if sub_args.get("select"):
-            sub_select = _resolve_select(relation["modelName"], sub_args["select"])
-            output_rows = [_project_fields(r, sub_select) for r in related]
+        sliced_map: Dict[tuple, List[Dict]] = {}
+        surviving: List[Dict] = []
+        seen_ids = set()
+        for tok, bucket in group_map.items():
+            if is_many:
+                end = skip_val + take_val if has_take else None
+                picked = bucket[skip_val:end]
+            else:
+                picked = bucket[:1]
+            sliced_map[tok] = picked
+            for item in picked:
+                obj_id = id(item)
+                if obj_id not in seen_ids:
+                    seen_ids.add(obj_id)
+                    surviving.append(item)
 
-        group_map = {}
-        for i, r in enumerate(related):
-            k = r.get(foreign_key if is_many else local_key)
-            group_map.setdefault(k, []).append(output_rows[i])
+        nested_include = sub_args.get("include")
+        if nested_include and surviving:
+            _resolve_includes(relation["modelName"], surviving, nested_include, adapter)
+
+        nested_select_raw = sub_args.get("select")
+        nested_select = _resolve_select(relation["modelName"], nested_select_raw) if nested_select_raw else None
+        if nested_select and surviving:
+            child_rels = get_relations_for_model(relation["modelName"])
+            if _has_relation_select(nested_select, child_rels):
+                _resolve_includes(relation["modelName"], surviving, nested_select, adapter)
+
+        preserve_keys = _collect_include_keys(_resolve_include(relation["modelName"], nested_include))
+        projected_by_id: Dict[int, Dict] = {}
+        if nested_select:
+            for item in surviving:
+                projected_by_id[id(item)] = _project_fields(item, nested_select, preserve_keys)
 
         for row in rows:
-            k = row.get(local_key if is_many else foreign_key)
-            matches = group_map.get(k) or []
-            row[key] = matches if is_many else (matches[0] if matches else None)
+            tok = _join_key_token(row.get(join_key))
+            raw_matches = sliced_map.get(tok, []) if tok is not None else []
+            if nested_select:
+                final_matches = [projected_by_id[id(item)] for item in raw_matches]
+            else:
+                final_matches = raw_matches
+            row[key] = final_matches if is_many else (final_matches[0] if final_matches else None)
 
 
 def _split_relation_writes(model_name: str, data: Dict) -> (Dict, Dict):
@@ -458,8 +581,9 @@ class AdapterTableClient(Generic[T]):
         order_sql = _build_order_by(order_by, self._dialect, model_name=self._model)
 
         relations = get_relations_for_model(self._model)
+        has_include = bool(include and isinstance(include, dict) and any(include.values()))
         cols = "SELECT *"
-        if select and len(_selected_fields(select)) > 0 and not _has_relation_select(select, relations):
+        if select and len(_selected_fields(select)) > 0 and not _has_relation_select(select, relations) and not has_include:
             cols = "SELECT " + ", ".join(_quote(c, self._dialect) for c in _selected_fields(select))
 
         query = f"{cols} FROM {self._table_sql}{self._nolock}"
@@ -476,7 +600,7 @@ class AdapterTableClient(Generic[T]):
         if select:
             if _has_relation_select(select, relations):
                 _resolve_includes(self._model, rows, select, self._adapter)
-            rows = [_project_fields(r, select) for r in rows]
+            rows = [_project_fields(r, select, _collect_include_keys(include)) for r in rows]
         return rows
 
     def find_first(self, where=None, order_by=None, select=None, include=None) -> Optional[T]:
@@ -544,8 +668,9 @@ class AdapterTableClient(Generic[T]):
         if include:
             _resolve_includes(self._model, [created], include, self._adapter)
         if select:
-            _resolve_includes(self._model, [created], select, self._adapter)
-            return _project_fields(created, select)
+            if _has_relation_select(select, relations):
+                _resolve_includes(self._model, [created], select, self._adapter)
+            return _project_fields(created, select, _collect_include_keys(include))
         return created
 
     def create_many(self, data: List[Any], skip_duplicates: bool = False) -> Dict:
@@ -604,8 +729,9 @@ class AdapterTableClient(Generic[T]):
         if include and updated:
             _resolve_includes(self._model, [updated], include, self._adapter)
         if select and updated:
-            _resolve_includes(self._model, [updated], select, self._adapter)
-            return _project_fields(updated, select)
+            if _has_relation_select(select, relations):
+                _resolve_includes(self._model, [updated], select, self._adapter)
+            return _project_fields(updated, select, _collect_include_keys(include))
         return updated
 
     def update_many(self, where: Optional[Any], data: Any) -> Dict:

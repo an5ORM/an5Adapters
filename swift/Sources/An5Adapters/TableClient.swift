@@ -36,9 +36,11 @@ public struct TableClient {
         let orderBy = SQLBuilder.orderBy(query.orderBy, dialect: dialect)
         let relations = metadata.relations(model)
         let selected = query.select ?? []
+        let includeKeys = collectIncludeKeys(query.include)
+        let hasInclude = !includeKeys.isEmpty
 
         let columns: String
-        if !selected.isEmpty && !hasRelationSelect(selected, relations) {
+        if !selected.isEmpty && !hasRelationSelect(selected, relations) && !hasInclude {
             columns = "SELECT " + selected.map { dialect.quote($0) }.joined(separator: ", ")
         } else {
             columns = "SELECT *"
@@ -50,14 +52,14 @@ public struct TableClient {
         sql += dialect.pagination(take: query.take, skip: query.skip, orderBy: orderBy)
 
         var rows = try adapter.query(sql, parameters(clause.parameters))
-        if let include = query.include, !include.isEmpty {
+        if hasInclude, let include = query.include {
             try resolveIncludes(for: model, relations, rows: &rows, include: include)
         }
         if let select = query.select {
             if hasRelationSelect(select, relations) {
                 try resolveIncludes(for: model, relations, rows: &rows, include: relationSelect(select, relations))
             }
-            rows = rows.map { project($0, selected: select) }
+            rows = rows.map { project($0, selected: select, preserve: includeKeys) }
         }
         return decodeVectorRows(rows)
     }
@@ -492,6 +494,97 @@ public struct TableClient {
 
     // ─── Relations ──────────────────────────────────────────────────────────────
 
+    private func parseIncludePageBound(_ raw: Any?, field: String, relKey: String) throws -> Int? {
+        guard let raw else { return nil }
+        if raw is Bool {
+            throw An5Error.invalidQuery("include.\(field) for relation '\(relKey)' must be a non-negative integer")
+        }
+        let value: Int
+        if let i = raw as? Int {
+            value = i
+        } else if let i64 = raw as? Int64 {
+            value = Int(i64)
+        } else if let num = raw as? NSNumber {
+            value = num.intValue
+        } else {
+            throw An5Error.invalidQuery("include.\(field) for relation '\(relKey)' must be a non-negative integer")
+        }
+        if value < 0 {
+            throw An5Error.invalidQuery("include.\(field) for relation '\(relKey)' cannot be negative: \(value)")
+        }
+        return value
+    }
+
+    private func collectIncludeKeys(_ include: Include?) -> [String] {
+        guard let include else { return [] }
+        return include.compactMap { key, val in
+            guard let val else { return nil }
+            if let flag = val as? Bool, !flag { return nil }
+            return key
+        }
+    }
+
+    private func asIncludeDict(_ raw: Any?) -> [String: Any?]? {
+        if let dict = raw as? [String: Any?] { return dict }
+        if let dict = raw as? [String: Any] { return dict.mapValues { Optional<Any>.some($0) } }
+        return nil
+    }
+
+    private func parseCountTargets(
+        for modelName: String,
+        _ relations: [String: RelationDef],
+        spec: Any?
+    ) throws -> [(relKey: String, relation: RelationDef, where: Where?)] {
+        guard let spec else { return [] }
+        if let flag = spec as? Bool {
+            guard flag else { return [] }
+            return relations
+                .filter { $0.value.isMany }
+                .sorted { $0.key < $1.key }
+                .map { ($0.key, $0.value, nil) }
+        }
+        guard let rawDict = asIncludeDict(spec) else {
+            throw An5Error.invalidQuery("Invalid _count payload for model '\(modelName)'")
+        }
+        let selection: [String: Any?]
+        if rawDict.keys.contains("select") {
+            if rawDict.count > 1 {
+                throw An5Error.invalidQuery("Unknown option alongside 'select' in _count for model '\(modelName)'")
+            }
+            guard let selRaw = rawDict["select"] ?? nil else { return [] }
+            guard let selDict = asIncludeDict(selRaw) else {
+                throw An5Error.invalidQuery("_count.select for model '\(modelName)' must be a dictionary")
+            }
+            selection = selDict
+        } else {
+            selection = rawDict
+        }
+
+        var targets: [(String, RelationDef, Where?)] = []
+        for (relKey, rawVal) in selection.sorted(by: { $0.key < $1.key }) {
+            guard let rawVal else { continue }
+            if let flag = rawVal as? Bool, !flag { continue }
+            guard let relation = relations[relKey], relation.isMany else {
+                throw An5Error.invalidQuery("Unknown or non-list relation '\(relKey)' in _count for model '\(modelName)'")
+            }
+            var countWhere: Where? = nil
+            if let flag = rawVal as? Bool, flag {
+                countWhere = nil
+            } else if let optDict = asIncludeDict(rawVal) {
+                for (optKey, optVal) in optDict {
+                    guard optKey == "where" else {
+                        throw An5Error.invalidQuery("Unsupported option '\(optKey)' in _count.\(relKey)")
+                    }
+                    countWhere = asIncludeDict(optVal)
+                }
+            } else {
+                throw An5Error.invalidQuery("Unsupported _count option for relation '\(relKey)' on '\(modelName)'")
+            }
+            targets.append((relKey, relation, countWhere))
+        }
+        return targets
+    }
+
     /// Eager-loads relations onto rows already fetched.
     private func resolveIncludes(
         for modelName: String,
@@ -502,19 +595,23 @@ public struct TableClient {
         guard !rows.isEmpty, !include.isEmpty else { return }
 
         for (key, value) in include {
-            if value == nil || (value is Bool && value as? Bool == false) { continue }
+            guard let value else { continue }
+            if let flag = value as? Bool, !flag { continue }
 
             if key == "_count" {
-                try applyRelationCounts(relations, rows: &rows)
+                try applyRelationCounts(for: modelName, relations, rows: &rows, spec: value)
                 continue
             }
             guard let relation = relations[key] else { continue }
 
             let isMany = relation.isMany
             let (matchKey, joinKey) = metadata.relationKeys(modelName, relation)
+            let options = asIncludeDict(value) ?? [:]
+            let skipVal = try parseIncludePageBound(options["skip"] ?? nil, field: "skip", relKey: key) ?? 0
+            let takeVal = try parseIncludePageBound(options["take"] ?? nil, field: "take", relKey: key)
 
             let uniqueKeys = uniqueValues(rows, column: joinKey)
-            guard !uniqueKeys.isEmpty else {
+            guard !uniqueKeys.isEmpty, !(isMany && takeVal == 0) else {
                 for index in rows.indices {
                     if isMany {
                         rows[index][key] = [Row]()
@@ -525,42 +622,77 @@ public struct TableClient {
                 continue
             }
 
-            let options = value as? [String: Any?] ?? [:]
             var nested = Query()
-            var nestedFilter: Where = [matchKey: ["in": uniqueKeys]]
-            if let extra = options["where"] as? Where {
-                for (column, condition) in extra { nestedFilter[column] = condition }
+            let baseFilter: Where = [matchKey: ["in": uniqueKeys]]
+            if let extra = asIncludeDict(options["where"] ?? nil), !extra.isEmpty {
+                nested.filter = ["AND": [baseFilter, extra]]
+            } else {
+                nested.filter = baseFilter
             }
-            nested.filter = nestedFilter
             nested.orderBy = SQLBuilder.orderEntries(cell(options, "orderBy"))
-            if let skip = options["skip"] as? Int { nested.skip = max(0, skip) }
-            if let take = options["take"] as? Int { nested.take = take }
 
-            var related = try adapter.table(relation.modelName).findMany(nested)
-            if let nestedInclude = options["include"] as? Include {
+            let related = try adapter.table(relation.modelName).findMany(nested)
+
+            var groups: [String: [Int]] = [:]
+            for (idx, row) in related.enumerated() {
+                groups[groupKey(cell(row, matchKey)), default: []].append(idx)
+            }
+
+            var slicedByKey: [String: [Int]] = [:]
+            var surviving: [Row] = []
+            var origToSurviving: [Int: Int] = [:]
+            for (k, bucket) in groups {
+                var picked: [Int] = []
+                if isMany {
+                    if skipVal < bucket.count {
+                        for i in skipVal..<bucket.count {
+                            if let cap = takeVal, picked.count >= cap { break }
+                            picked.append(bucket[i])
+                        }
+                    }
+                } else if let firstIdx = bucket.first {
+                    picked.append(firstIdx)
+                }
+                slicedByKey[k] = picked
+                for idx in picked where origToSurviving[idx] == nil {
+                    origToSurviving[idx] = surviving.count
+                    surviving.append(related[idx])
+                }
+            }
+
+            let nestedInclude = asIncludeDict(options["include"] ?? nil)
+            let childRelations = metadata.relations(relation.modelName)
+            if let nestedInclude, !surviving.isEmpty {
                 try resolveIncludes(
                     for: relation.modelName,
-                    metadata.relations(relation.modelName),
-                    rows: &related,
+                    childRelations,
+                    rows: &surviving,
                     include: nestedInclude
                 )
             }
-            var projected = related
-            if let nestedSelect = options["select"] as? [String] {
-                projected = related.map { project($0, selected: nestedSelect) }
+            let nestedSelect = options["select"] as? [String]
+            if let nestedSelect, !surviving.isEmpty, hasRelationSelect(nestedSelect, childRelations) {
+                try resolveIncludes(
+                    for: relation.modelName,
+                    childRelations,
+                    rows: &surviving,
+                    include: relationSelect(nestedSelect, childRelations)
+                )
             }
 
-            let groupColumn = matchKey
-            var groups: [String: [Row]] = [:]
-            for (index, row) in related.enumerated() {
-                groups[groupKey(cell(row, groupColumn)), default: []].append(projected[index])
+            let preserveNested = collectIncludeKeys(nestedInclude)
+            if let nestedSelect {
+                for i in surviving.indices {
+                    surviving[i] = project(surviving[i], selected: nestedSelect, preserve: preserveNested)
+                }
             }
-            let rowColumn = joinKey
+
             for index in rows.indices {
-                let matches = groups[groupKey(cell(rows[index], rowColumn))] ?? []
+                let matchedOrig = slicedByKey[groupKey(cell(rows[index], joinKey))] ?? []
+                let matched = matchedOrig.compactMap { origToSurviving[$0].map { surviving[$0] } }
                 if isMany {
-                    rows[index][key] = matches
-                } else if let first = matches.first {
+                    rows[index][key] = matched
+                } else if let first = matched.first {
                     rows[index][key] = first
                 } else {
                     rows[index].updateValue(nil, forKey: key)
@@ -569,29 +701,46 @@ public struct TableClient {
         }
     }
 
-    private func applyRelationCounts(_ relations: [String: RelationDef], rows: inout [Row]) throws {
-        for index in rows.indices { rows[index]["_count"] = [String: Int]() }
-        for (name, relation) in relations where relation.isMany {
-            let uniqueKeys = uniqueValues(rows, column: relation.localKey)
+    private func applyRelationCounts(
+        for modelName: String,
+        _ relations: [String: RelationDef],
+        rows: inout [Row],
+        spec: Any?
+    ) throws {
+        for index in rows.indices {
+            if !(rows[index]["_count"] is [String: Int]) {
+                rows[index]["_count"] = [String: Int]()
+            }
+        }
+        let targets = try parseCountTargets(for: modelName, relations, spec: spec)
+        for target in targets {
+            let (matchKey, joinKey) = metadata.relationKeys(modelName, target.relation)
+            let uniqueKeys = uniqueValues(rows, column: joinKey)
             guard !uniqueKeys.isEmpty else {
                 for index in rows.indices {
                     var totals = rows[index]["_count"] as? [String: Int] ?? [:]
-                    totals[name] = 0
+                    totals[target.relKey] = 0
                     rows[index]["_count"] = totals
                 }
                 continue
             }
-            let related = try adapter.table(relation.modelName)
-                .findMany(filter: [relation.foreignKey: ["in": uniqueKeys]])
+            let baseFilter: Where = [matchKey: ["in": uniqueKeys]]
+            let countFilter: Where
+            if let extra = target.where, !extra.isEmpty {
+                countFilter = ["AND": [baseFilter, extra]]
+            } else {
+                countFilter = baseFilter
+            }
+            let related = try adapter.table(target.relation.modelName).findMany(filter: countFilter)
             var counts: [String: Int] = [:]
             for row in related {
-                let key = groupKey(cell(row, relation.foreignKey))
+                let key = groupKey(cell(row, matchKey))
                 counts[key, default: 0] += 1
             }
             for index in rows.indices {
-                let key = groupKey(cell(rows[index], relation.localKey))
+                let key = groupKey(cell(rows[index], joinKey))
                 var totals = rows[index]["_count"] as? [String: Int] ?? [:]
-                totals[name] = counts[key] ?? 0
+                totals[target.relKey] = counts[key] ?? 0
                 rows[index]["_count"] = totals
             }
         }
@@ -651,12 +800,13 @@ public struct TableClient {
         guard let row else { return nil }
         var rows = [row]
         let relations = metadata.relations(model)
-        if let include = query.include, !include.isEmpty {
+        let includeKeys = collectIncludeKeys(query.include)
+        if !includeKeys.isEmpty, let include = query.include {
             try resolveIncludes(for: model, relations, rows: &rows, include: include)
         }
         if let select = query.select {
             try resolveIncludes(for: model, relations, rows: &rows, include: relationSelect(select, relations))
-            return project(rows[0], selected: select)
+            return project(rows[0], selected: select, preserve: includeKeys)
         }
         return rows[0]
     }
@@ -680,11 +830,14 @@ public struct TableClient {
         return include
     }
 
-    private func project(_ row: Row, selected: [String]) -> Row {
+    private func project(_ row: Row, selected: [String], preserve: [String] = []) -> Row {
         guard !selected.isEmpty else { return row }
         var projected: Row = [:]
         for field in selected where row.keys.contains(field) { projected[field] = row[field] }
-        if let count = row["_count"] { projected["_count"] = count }
+        for extra in preserve where row.keys.contains(extra) && !projected.keys.contains(extra) {
+            projected[extra] = row[extra]
+        }
+        if let count = row["_count"], !projected.keys.contains("_count") { projected["_count"] = count }
         return projected
     }
 

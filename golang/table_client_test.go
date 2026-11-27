@@ -349,3 +349,137 @@ func TestTableClientGroupByHavingPerFieldCountAndPagination(t *testing.T) {
 		t.Fatal("expected GroupBy error for ungrouped scalar field in Having")
 	}
 }
+
+func TestIncludePaginationFilteredCountAndSelectPreservation(t *testing.T) {
+	ctx := context.Background()
+	defer registerSampleRelationMetadata()()
+
+	adapter, st := openMockAdapter(t, "sqlite-include-parity", "sqlite://test.db", func(query string, _ []driver.NamedValue) ([]string, [][]driver.Value) {
+		switch {
+		case strings.Contains(query, `FROM "users"`):
+			return []string{"id", "email"}, [][]driver.Value{
+				{int64(1), "alice@example.com"},
+				{int64(2), "bob@example.com"},
+			}
+		case strings.Contains(query, `FROM "orders"`):
+			if strings.Contains(query, `"status" = ?`) {
+				return []string{"id", "user_id", "total", "status"}, [][]driver.Value{
+					{int64(10), int64(1), int64(200), "paid"},
+					{int64(12), int64(1), int64(300), "paid"},
+					{int64(21), int64(2), int64(150), "paid"},
+				}
+			}
+			return []string{"id", "user_id", "total", "status"}, [][]driver.Value{
+				{int64(10), int64(1), int64(200), "paid"},
+				{int64(11), int64(1), int64(50), "open"},
+				{int64(12), int64(1), int64(300), "paid"},
+				{int64(20), int64(2), int64(80), "open"},
+				{int64(21), int64(2), int64(150), "paid"},
+			}
+		default:
+			return nil, nil
+		}
+	})
+
+	rows, err := adapter.Table("User").FindMany(ctx, &an5adapters.FindManyArgs{
+		OrderBy: map[string]interface{}{"id": "asc"},
+		Select:  []string{"email"},
+		Include: map[string]interface{}{
+			"orders": map[string]interface{}{
+				"where":   map[string]interface{}{"user_id": map[string]interface{}{"in": []interface{}{1, 2}}},
+				"orderBy": map[string]interface{}{"id": "asc"},
+				"skip":    1,
+				"take":    1,
+				"select":  []string{"id", "total"},
+				"include": map[string]interface{}{
+					"user": map[string]interface{}{
+						"select": []string{"email"},
+					},
+				},
+			},
+			"_count": map[string]interface{}{
+				"select": map[string]interface{}{
+					"orders": map[string]interface{}{
+						"where": map[string]interface{}{"status": "paid"},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("FindMany with include/select/_count failed: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(rows))
+	}
+
+	// Verify parent SQL kept all columns so join key `id` remained available before projection.
+	if !strings.HasPrefix(st.queries[0].sql, `SELECT * FROM "users"`) {
+		t.Fatalf("parent query with Select+Include must fetch *, got: %s", st.queries[0].sql)
+	}
+	// Verify child query wrapped nested `where` in AND and did NOT emit global LIMIT/OFFSET.
+	var orderIncludeSQL string
+	for _, q := range st.queries {
+		if strings.Contains(q.sql, `FROM "orders"`) && !strings.Contains(q.sql, `"status" = ?`) {
+			orderIncludeSQL = q.sql
+			break
+		}
+	}
+	if orderIncludeSQL == "" || !strings.Contains(orderIncludeSQL, "AND") || strings.Contains(orderIncludeSQL, "LIMIT") || strings.Contains(orderIncludeSQL, "OFFSET") {
+		t.Fatalf("unexpected child batch SQL: %s", orderIncludeSQL)
+	}
+
+	// Top-level Select must strip `id` while preserving included `orders` and `_count`.
+	if _, hasID := rows[0]["id"]; hasID {
+		t.Fatalf("expected top-level Select to omit `id`, got %#v", rows[0])
+	}
+	u0Count := rows[0]["_count"].(map[string]interface{})
+	if u0Count["orders"] != 2 {
+		t.Fatalf("expected filtered u0 _count.orders == 2, got %#v", u0Count)
+	}
+	u1Count := rows[1]["_count"].(map[string]interface{})
+	if u1Count["orders"] != 1 {
+		t.Fatalf("expected filtered u1 _count.orders == 1, got %#v", u1Count)
+	}
+
+	u0Orders := rows[0]["orders"].([]map[string]interface{})
+	u1Orders := rows[1]["orders"].([]map[string]interface{})
+	if len(u0Orders) != 1 || u0Orders[0]["id"] != int64(11) {
+		t.Fatalf("expected u0 per-parent skip=1,take=1 to yield [order 11], got %#v", u0Orders)
+	}
+	if _, hasUID := u0Orders[0]["user_id"]; hasUID {
+		t.Fatalf("expected nested Select to omit `user_id`, got %#v", u0Orders[0])
+	}
+	if nestedUser, ok := u0Orders[0]["user"].(map[string]interface{}); !ok || nestedUser["email"] != "alice@example.com" {
+		t.Fatalf("expected preserved nested `user` relation on projected order, got %#v", u0Orders[0])
+	}
+	if len(u1Orders) != 1 || u1Orders[0]["id"] != int64(21) {
+		t.Fatalf("expected u1 per-parent skip=1,take=1 to yield [order 21], got %#v", u1Orders)
+	}
+
+	// Verify take=0 short-circuits without querying child table.
+	st.mu.Lock()
+	st.queries = nil
+	st.mu.Unlock()
+	zeroRows, err := adapter.Table("User").FindMany(ctx, &an5adapters.FindManyArgs{
+		Include: map[string]interface{}{"orders": map[string]interface{}{"take": 0}},
+	})
+	if err != nil {
+		t.Fatalf("take=0 include failed: %v", err)
+	}
+	if len(zeroRows[0]["orders"].([]map[string]interface{})) != 0 || len(st.queries) != 1 {
+		t.Fatalf("expected empty slice and only 1 parent query for take=0, got %d queries", len(st.queries))
+	}
+
+	// Negative take and unknown _count relation must fail.
+	if _, err := adapter.Table("User").FindMany(ctx, &an5adapters.FindManyArgs{
+		Include: map[string]interface{}{"orders": map[string]interface{}{"take": -1}},
+	}); err == nil {
+		t.Fatal("expected error for negative include.take")
+	}
+	if _, err := adapter.Table("User").FindMany(ctx, &an5adapters.FindManyArgs{
+		Include: map[string]interface{}{"_count": map[string]interface{}{"select": map[string]interface{}{"bogus": true}}},
+	}); err == nil {
+		t.Fatal("expected error for unknown _count relation")
+	}
+}

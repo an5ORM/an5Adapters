@@ -121,6 +121,46 @@ async function runGeneratedMetadataOrientationSuite() {
     await assert.rejects(() => user.findMany({ where: { bogusField: 'x' } }), /Unknown field 'bogusField'/);
     await assert.rejects(() => user.findMany({ where: { name: { bogusOp: 'x' } } }), /Unknown filter operator 'bogusOp'/);
     await assert.rejects(() => user.findMany({ where: { orders: { is: {} } } }), /Unsupported relation filter operator 'is'/);
+    await assert.rejects(() => user.findMany({ include: { orders: { take: -1 } } }), /non-negative integer/);
+    await assert.rejects(() => user.findMany({ include: { _count: { select: { nonexistent: true } } } }), /Unknown or non-list relation/);
+
+    // Multi-parent per-parent include skip/take, take=0, safe AND nested where on join column, select+include, and filtered _count
+    await db._executeRaw("INSERT INTO [orders] ([id], [userId], [status]) VALUES (11, 1, 'open'), (12, 1, 'paid'), (21, 2, 'paid'), (22, 2, 'paid')");
+    const pagedUsers = await user.findMany({
+      orderBy: { id: 'asc' },
+      select: { name: true },
+      include: {
+        orders: {
+          orderBy: { id: 'asc' },
+          skip: 1,
+          take: 1,
+          where: { userId: { in: [1, 2] } },
+          select: { id: true, status: true },
+          include: { user: { select: { name: true } } },
+        },
+        _count: { select: { orders: { where: { status: 'paid' } } } },
+      },
+    });
+    assert.equal(pagedUsers.length, 2);
+    assert.equal('id' in pagedUsers[0], false);
+    assert.equal(pagedUsers[0].name, 'Alice');
+    assert.equal(pagedUsers[0]._count.orders, 2);
+    assert.equal(pagedUsers[0].orders.length, 1);
+    assert.equal(pagedUsers[0].orders[0].id, 11);
+    assert.equal('userId' in pagedUsers[0].orders[0], false);
+    assert.equal(pagedUsers[0].orders[0].user.name, 'Alice');
+    assert.equal(pagedUsers[1].name, 'Bob');
+    assert.equal(pagedUsers[1]._count.orders, 2);
+    assert.equal(pagedUsers[1].orders.length, 1);
+    assert.equal(pagedUsers[1].orders[0].id, 21);
+    assert.equal(pagedUsers[1].orders[0].user.name, 'Bob');
+
+    const zeroTakeUsers = await user.findMany({
+      orderBy: { id: 'asc' },
+      include: { orders: { take: 0 } },
+    });
+    assert.deepEqual(zeroTakeUsers.map(u => u.orders), [[], []]);
+
     console.log('Generated metadata relation orientation & strict validation suite passed');
   } finally {
     setAdapterMetadata({});
