@@ -118,6 +118,36 @@ class UserFindFirstArgs:
     include: Optional[Any] = None
 
 
+@dataclass
+class UserFindUniqueArgs:
+    where: Optional[UserWhereInput] = None
+    select: Optional[Any] = None
+    include: Optional[Any] = None
+
+
+@dataclass
+class OrderFindManyArgs:
+    where: Optional[Any] = None
+    order_by: Optional[Any] = None
+    take: Optional[int] = None
+    skip: int = 0
+    select: Optional[Any] = None
+    include: Optional[Any] = None
+
+
+@dataclass
+class OrderInclude:
+    _an5_include = True
+    user: Optional[Any] = None
+
+
+@dataclass
+class UserInclude:
+    _an5_include = True
+    orders: Optional[Any] = None
+    _count: Optional[Any] = None
+
+
 TEST_METADATA = {
     "model_to_table": {"User": "users", "user": "users", "Order": "orders", "order": "orders"},
     "model_fields": {
@@ -486,6 +516,37 @@ class QuerySemantics(unittest.TestCase):
                 db.user.find_many(include={"orders": {"take": -1}})
             with self.assertRaises(ValueError):
                 db.user.find_many(include={"_count": {"select": {"nonexistent": True}}})
+
+            # Typed Include and FindUniqueArgs dataclasses (nested FindManyArgs + shorthand Include)
+            typed_paged = db.user.find_many(
+                UserFindManyArgs(
+                    order_by=UserOrderByInput(id="asc"),
+                    select={"email": True},
+                    include=UserInclude(
+                        orders=OrderFindManyArgs(
+                            order_by={"id": "asc"},
+                            skip=1,
+                            take=1,
+                            select={"totalAmount": True},
+                            include=OrderInclude(user={"select": {"email": True}}),
+                        ),
+                        _count={"select": {"orders": {"where": {"total_amount": IntFilter(gte=100)}}}},
+                    ),
+                )
+            )
+            self.assertEqual(typed_paged[0]["orders"][0]["totalAmount"], 120)
+            self.assertEqual(typed_paged[0]["orders"][0]["user"], {"email": "alice@example.com"})
+            self.assertEqual(typed_paged[0]["_count"], {"orders": 2})
+
+            uniq = db.user.find_unique(
+                UserFindUniqueArgs(
+                    where=UserWhereInput(id=StringFilter(equals="u2")),
+                    include=UserInclude(orders=OrderInclude(user=True), _count=True),
+                )
+            )
+            self.assertEqual(len(uniq["orders"]), 2)
+            self.assertEqual(uniq["orders"][0]["user"]["email"], "bob@example.com")
+            self.assertEqual(uniq["_count"], {"orders": 2})
         finally:
             db.close()
 

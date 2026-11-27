@@ -795,4 +795,149 @@ async fn upsert_returns_updated_row_and_include_supports_nested_options_and_coun
         .unwrap()
         .unwrap();
     assert!(orphan["user"].is_null());
+
+    // _count: true only counts to-many relations (Order only has to-one `user`)
+    let order_counts = orders
+        .find_first(&FindManyArgs {
+            r#where: Some(json!({ "id": "o1" })),
+            include: Some(json!({ "_count": true })),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(order_counts.get("_count").is_none());
+
+    // Multi-parent per-parent include skip/take, take=0, and select+include preserving orders without leaking id
+    users
+        .upsert(&UpsertArgs {
+            r#where: Some(json!({ "id": "u2" })),
+            create: json!({ "id": "u2", "email": "bob@example.com", "name": "Bob", "age": 25 })
+                .as_object()
+                .unwrap()
+                .clone(),
+            update: json!({ "name": "Bob" }),
+        })
+        .await
+        .unwrap();
+    db.execute_raw(
+        "INSERT INTO orders (id, user_id, total) VALUES ('o5', 'u2', 80), ('o6', 'u2', 120)",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let paged = users
+        .find_many(&FindManyArgs {
+            order_by: Some(json!({ "id": "asc" })),
+            select: Some(json!({ "name": true })),
+            include: Some(json!({
+                "orders": {
+                    "orderBy": { "total": "asc" },
+                    "skip": 1,
+                    "take": 1,
+                    "select": { "total": true }
+                },
+                "_count": { "select": { "orders": { "where": { "total": { "gte": 100 } } } } }
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(paged.len(), 2);
+    assert!(paged[0].get("id").is_none());
+    assert_eq!(paged[0]["name"].as_str(), Some("Alice Updated"));
+    assert_eq!(paged[0]["orders"].as_array().unwrap().len(), 1);
+    assert_eq!(paged[0]["orders"][0]["total"].as_i64(), Some(150));
+    assert_eq!(paged[0]["_count"]["orders"].as_i64(), Some(2));
+    assert!(paged[1].get("id").is_none());
+    assert_eq!(paged[1]["name"].as_str(), Some("Bob"));
+    assert_eq!(paged[1]["orders"].as_array().unwrap().len(), 1);
+    assert_eq!(paged[1]["orders"][0]["total"].as_i64(), Some(120));
+    assert_eq!(paged[1]["_count"]["orders"].as_i64(), Some(1));
+
+    // Explicit take=0 in nested include yields an empty slice rather than unlimited rows
+    let zero_take = users
+        .find_many(&FindManyArgs {
+            order_by: Some(json!({ "id": "asc" })),
+            include: Some(json!({ "orders": { "take": 0 } })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(zero_take[0]["orders"].as_array().unwrap().is_empty());
+    assert!(zero_take[1]["orders"].as_array().unwrap().is_empty());
+
+    // Strict validation errors (even when parent query returns 0 rows)
+    assert!(users
+        .find_many(&FindManyArgs {
+            take: -1,
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert!(users
+        .find_many(&FindManyArgs {
+            skip: -1,
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert!(users
+        .find_many(&FindManyArgs {
+            r#where: Some(json!({ "id": "nonexistent" })),
+            include: Some(json!({ "orders": { "take": -1 } })),
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert!(users
+        .find_many(&FindManyArgs {
+            include: Some(json!({ "orders": { "take": 1.5 } })),
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert!(users
+        .find_many(&FindManyArgs {
+            include: Some(json!({ "unknownRel": true })),
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert!(users
+        .find_many(&FindManyArgs {
+            include: Some(json!({ "orders": { "bogus": true } })),
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert!(users
+        .find_many(&FindManyArgs {
+            include: Some(json!({ "_count": { "select": { "missing": true } } })),
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert!(orders
+        .find_many(&FindManyArgs {
+            include: Some(json!({ "_count": { "select": { "user": true } } })),
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert!(users
+        .find_many(&FindManyArgs {
+            include: Some(json!({ "_count": { "select": { "orders": { "take": 1 } } } })),
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert!(users
+        .find_many(&FindManyArgs {
+            include: Some(json!({ "_count": { "select": { "orders": true }, "extra": true } })),
+            ..Default::default()
+        })
+        .await
+        .is_err());
 }

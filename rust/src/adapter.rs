@@ -549,6 +549,12 @@ impl TableClient {
 
     /// Fetch rows matching the structured args.
     pub async fn find_many(&self, args: &FindManyArgs) -> Result<Vec<RowMap>> {
+        if args.take < 0 {
+            return Err(format!("take cannot be negative: {}", args.take).into());
+        }
+        if args.skip < 0 {
+            return Err(format!("skip cannot be negative: {}", args.skip).into());
+        }
         let w = self.build_where(&args.r#where)?;
         let order = args
             .order_by
@@ -1269,77 +1275,66 @@ impl TableClient {
     }
 
     async fn resolve_includes(&self, rows: &mut [RowMap], include: &Value) -> Result<()> {
-        self.resolve_select_relations(rows, include).await
+        self.resolve_relations_inner(rows, include, true).await
+    }
+
+    pub fn resolve_select_relations<'a>(
+        &'a self,
+        rows: &'a mut [RowMap],
+        select: &'a Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        self.resolve_relations_inner(rows, select, false)
     }
 
     /// Eager-loads the requested relations and `_count` summaries onto each row.
     ///
     /// Boxed because eager loading re-enters `find_many` on the related table,
     /// which would otherwise make this future infinitely sized.
-    pub fn resolve_select_relations<'a>(
+    fn resolve_relations_inner<'a>(
         &'a self,
         rows: &'a mut [RowMap],
-        select: &'a Value,
+        spec: &'a Value,
+        strict_relations: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            let requested: Vec<(String, Value)> = match select {
+            let requested: Vec<(String, Value)> = match spec {
+                Value::Null => Vec::new(),
                 Value::Array(items) => items
                     .iter()
                     .filter_map(|v| v.as_str().map(|s| (s.to_string(), Value::Bool(true))))
                     .collect(),
-                Value::Object(m) => m
-                    .iter()
-                    .filter(|(_, v)| !matches!(v, Value::Bool(false) | Value::Null))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
+                Value::Object(m) => {
+                    let mut pairs: Vec<(String, Value)> =
+                        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    pairs
+                }
+                _ if strict_relations => {
+                    return Err(format!(
+                        "unsupported include payload for model '{}'",
+                        self.table_name
+                    )
+                    .into());
+                }
                 _ => Vec::new(),
             };
 
-            for (key, spec) in requested {
+            for (key, entry_spec) in requested {
                 if key == "_count" {
-                    let all_relations = get_relations_for_model(&self.table_name);
-                    if all_relations.is_empty() {
+                    let count_targets =
+                        parse_count_targets(&self.table_name, &entry_spec, self.adapter.dialect)?;
+                    if rows.is_empty() || count_targets.is_empty() {
                         continue;
                     }
-                    let count_targets: Vec<(String, Option<Value>)> = match &spec {
-                        Value::Bool(true) => {
-                            let mut names: Vec<String> = all_relations.keys().cloned().collect();
-                            names.sort();
-                            names.into_iter().map(|n| (n, None)).collect()
-                        }
-                        Value::Object(obj) => {
-                            let selection = obj
-                                .get("select")
-                                .and_then(Value::as_object)
-                                .unwrap_or(obj);
-                            selection
-                                .iter()
-                                .filter(|(_, v)| !matches!(v, Value::Bool(false) | Value::Null))
-                                .map(|(rel_key, rel_spec)| {
-                                    let nested_where = rel_spec
-                                        .as_object()
-                                        .and_then(|o| o.get("where").cloned());
-                                    (rel_key.clone(), nested_where)
-                                })
-                                .collect()
-                        }
-                        _ => Vec::new(),
-                    };
-
                     for row in rows.iter_mut() {
                         let mut count_map = row
                             .get("_count")
                             .and_then(Value::as_object)
                             .cloned()
                             .unwrap_or_default();
-                        for (rel_key, nested_where) in &count_targets {
-                            let Some((_, def)) =
-                                resolve_relation_for_model(&self.table_name, rel_key)
-                            else {
-                                continue;
-                            };
+                        for (rel_key, def, nested_where) in &count_targets {
                             let (child_key, parent_key) =
-                                resolve_relation_keys(&self.table_name, &def);
+                                resolve_relation_keys(&self.table_name, def);
                             let Some(parent_value) =
                                 row.get(&parent_key).filter(|v| !v.is_null()).cloned()
                             else {
@@ -1367,26 +1362,96 @@ impl TableClient {
 
                 let def = match resolve_relation_for_model(&self.table_name, &key) {
                     Some((_, d)) => d,
-                    None => continue,
+                    None if !strict_relations => continue,
+                    None => {
+                        return Err(format!(
+                            "unknown relation '{}' in include for model '{}'",
+                            key, self.table_name
+                        )
+                        .into());
+                    }
                 };
+                if matches!(entry_spec, Value::Bool(false) | Value::Null) {
+                    continue;
+                }
+                let opts = match &entry_spec {
+                    Value::Bool(true) => None,
+                    Value::Object(o) => Some(o),
+                    _ => {
+                        return Err(format!(
+                            "include option for relation '{}' on '{}' must be a bool or object",
+                            key, self.table_name
+                        )
+                        .into());
+                    }
+                };
+                if let Some(o) = opts {
+                    for opt_key in o.keys() {
+                        if !matches!(
+                            opt_key.as_str(),
+                            "where" | "orderBy" | "order_by" | "skip" | "take" | "select" | "include"
+                        ) {
+                            return Err(format!(
+                                "unknown include option '{}' for relation '{}' on '{}'",
+                                opt_key, key, self.table_name
+                            )
+                            .into());
+                        }
+                    }
+                }
+
                 let target = self.adapter.table(&def.model_name);
                 let (child_key, parent_key) = resolve_relation_keys(&self.table_name, &def);
 
-                let opts = spec.as_object();
-                let nested_where = opts.and_then(|o| o.get("where")).cloned();
+                let nested_where = match opts.and_then(|o| o.get("where")) {
+                    None | Some(Value::Null) => None,
+                    Some(v) if v.is_object() => {
+                        try_build_where_with_model(
+                            v,
+                            &def.model_name,
+                            self.adapter.dialect,
+                            &|n| self.ph(n),
+                        )?;
+                        Some(v.clone())
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "include.where for relation '{}' on '{}' must be an object",
+                            key, self.table_name
+                        )
+                        .into());
+                    }
+                };
                 let nested_order_by = opts
                     .and_then(|o| o.get("orderBy").or_else(|| o.get("order_by")))
                     .cloned();
                 let nested_skip = opts
-                    .and_then(|o| o.get("skip"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
+                    .map(|o| parse_include_bound(o, "skip", &key))
+                    .transpose()?
+                    .flatten();
                 let nested_take = opts
-                    .and_then(|o| o.get("take"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
+                    .map(|o| parse_include_bound(o, "take", &key))
+                    .transpose()?
+                    .flatten();
                 let nested_select = opts.and_then(|o| o.get("select")).cloned();
                 let nested_include = opts.and_then(|o| o.get("include")).cloned();
+
+                if let Some(ref ni) = nested_include {
+                    if rows.is_empty() || (def.relation_type == "many" && nested_take == Some(0)) {
+                        target.resolve_includes(&mut [], ni).await?;
+                    }
+                }
+
+                if rows.is_empty() {
+                    continue;
+                }
+
+                if def.relation_type == "many" && nested_take == Some(0) {
+                    for row in rows.iter_mut() {
+                        row.insert(key.clone(), Value::Array(Vec::new()));
+                    }
+                    continue;
+                }
 
                 for row in rows.iter_mut() {
                     let parent_value = match row.get(&parent_key) {
@@ -1413,8 +1478,8 @@ impl TableClient {
                         .find_many(&FindManyArgs {
                             r#where: Some(child_where),
                             order_by: nested_order_by.clone(),
-                            skip: nested_skip,
-                            take: nested_take,
+                            skip: nested_skip.unwrap_or(0),
+                            take: nested_take.unwrap_or(0),
                             select: nested_select.clone(),
                             include: nested_include.clone(),
                         })
@@ -1438,6 +1503,138 @@ impl TableClient {
             }
             Ok(())
         })
+    }
+}
+
+fn parse_include_bound(opts: &Map<String, Value>, field: &str, rel_key: &str) -> Result<Option<i64>> {
+    let Some(raw) = opts.get(field) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let Some(n) = raw.as_i64() else {
+        return Err(format!(
+            "include.{} for relation '{}' must be a non-negative integer",
+            field, rel_key
+        )
+        .into());
+    };
+    if n < 0 {
+        return Err(format!(
+            "include.{} for relation '{}' cannot be negative: {}",
+            field, rel_key, n
+        )
+        .into());
+    }
+    Ok(Some(n))
+}
+
+fn parse_count_targets(
+    model_name: &str,
+    spec: &Value,
+    dialect: Dialect,
+) -> Result<Vec<(String, crate::base::RelationDef, Option<Value>)>> {
+    match spec {
+        Value::Null | Value::Bool(false) => Ok(Vec::new()),
+        Value::Bool(true) => {
+            let all_relations = get_relations_for_model(model_name);
+            let mut names: Vec<String> = all_relations
+                .iter()
+                .filter(|(_, d)| d.relation_type == "many")
+                .map(|(k, _)| k.clone())
+                .collect();
+            names.sort();
+            Ok(names
+                .into_iter()
+                .filter_map(|k| all_relations.get(&k).cloned().map(|d| (k, d, None)))
+                .collect())
+        }
+        Value::Object(obj) => {
+            let selection = if let Some(sel) = obj.get("select") {
+                if obj.len() > 1 {
+                    return Err(format!(
+                        "unknown option alongside 'select' in _count for model '{}'",
+                        model_name
+                    )
+                    .into());
+                }
+                match sel {
+                    Value::Null => return Ok(Vec::new()),
+                    Value::Object(m) => m,
+                    _ => {
+                        return Err(format!(
+                            "_count.select for model '{}' must be an object",
+                            model_name
+                        )
+                        .into());
+                    }
+                }
+            } else {
+                obj
+            };
+            let mut keys: Vec<&String> = selection.keys().collect();
+            keys.sort();
+            let mut targets = Vec::new();
+            for rel_key in keys {
+                let rel_spec = &selection[rel_key];
+                let Some((canon_key, def)) = resolve_relation_for_model(model_name, rel_key) else {
+                    return Err(format!(
+                        "unknown relation '{}' in _count for model '{}'",
+                        rel_key, model_name
+                    )
+                    .into());
+                };
+                if def.relation_type != "many" {
+                    return Err(format!(
+                        "relation '{}' on '{}' is to-one and cannot be counted in _count",
+                        canon_key, model_name
+                    )
+                    .into());
+                }
+                match rel_spec {
+                    Value::Null | Value::Bool(false) => continue,
+                    Value::Bool(true) => targets.push((canon_key, def, None)),
+                    Value::Object(rel_obj) => {
+                        for ok in rel_obj.keys() {
+                            if ok != "where" {
+                                return Err(format!(
+                                    "unknown option '{}' in _count.{} for model '{}'",
+                                    ok, canon_key, model_name
+                                )
+                                .into());
+                            }
+                        }
+                        let nested_where = match rel_obj.get("where") {
+                            None | Some(Value::Null) => None,
+                            Some(w) if w.is_object() => {
+                                try_build_where_with_model(w, &def.model_name, dialect, &|n| {
+                                    format!("?{}", n)
+                                })?;
+                                Some(w.clone())
+                            }
+                            Some(_) => {
+                                return Err(format!(
+                                    "_count.{}.where for model '{}' must be an object",
+                                    canon_key, model_name
+                                )
+                                .into());
+                            }
+                        };
+                        targets.push((canon_key, def, nested_where));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unsupported _count option for relation '{}' on '{}'",
+                            canon_key, model_name
+                        )
+                        .into());
+                    }
+                }
+            }
+            Ok(targets)
+        }
+        _ => Err(format!("invalid _count payload for model '{}'", model_name).into()),
     }
 }
 

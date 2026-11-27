@@ -122,17 +122,60 @@ def _resolve_select(model_name: str, select: Any) -> Any:
     return select
 
 
+def _resolve_include_entry(rel_model_name: str, val: Any) -> Any:
+    if val is None or isinstance(val, bool):
+        return val
+    if getattr(val, "_an5_include", False):
+        return {"include": _resolve_include(rel_model_name, val)}
+    if is_dataclass(val) and not isinstance(val, type):
+        out: Dict[str, Any] = {}
+        for f in dc_fields(val):
+            raw_v = getattr(val, f.name)
+            if raw_v is None:
+                continue
+            if f.name == "include":
+                out["include"] = _resolve_include(rel_model_name, raw_v)
+            else:
+                normalized = _normalize_dataclass_dict(raw_v) if is_dataclass(raw_v) and not isinstance(raw_v, type) else raw_v
+                if is_dataclass(raw_v) and isinstance(normalized, dict) and not normalized:
+                    continue
+                out[f.name] = normalized
+        return out
+    if isinstance(val, dict):
+        out = dict(val)
+        if "include" in out and out["include"] is not None:
+            out["include"] = _resolve_include(rel_model_name, out["include"])
+        return out
+    return val
+
+
 def _resolve_include(model_name: str, include: Any) -> Any:
-    if not include or not isinstance(include, dict):
+    if not include:
         return include
+    if is_dataclass(include) and not isinstance(include, type):
+        raw_items = [
+            (f.name, getattr(include, f.name))
+            for f in dc_fields(include)
+            if getattr(include, f.name) is not None
+        ]
+    elif isinstance(include, dict):
+        raw_items = list(include.items())
+    else:
+        return include
+    model_relations = get_relations_for_model(model_name)
     resolved: Dict[str, Any] = {}
-    for k, v in include.items():
+    for k, v in raw_items:
         key_str = str(k)
         if key_str == "_count":
             resolved[key_str] = v
             continue
         rel_key = resolve_relation_key(model_name, key_str)
-        resolved[rel_key if rel_key is not None else key_str] = v
+        target_key = rel_key if rel_key is not None else key_str
+        relation = model_relations.get(target_key)
+        if relation and relation.get("modelName"):
+            resolved[target_key] = _resolve_include_entry(relation["modelName"], v)
+        else:
+            resolved[target_key] = v
     return resolved
 
 
@@ -212,9 +255,9 @@ def _resolve_includes(model_name: str, rows: List[Dict], include: Any, adapter: 
     """Eager-load relation rows and attach them onto each row (mirrors TypeScript resolveIncludes)."""
     if not rows or not include:
         return
+    include = _resolve_include(model_name, include)
     if not isinstance(include, dict):
         return
-    include = _resolve_include(model_name, include)
     model_relations = get_relations_for_model(model_name)
 
     for key, value in include.items():
@@ -264,7 +307,8 @@ def _resolve_includes(model_name: str, rows: List[Dict], include: Any, adapter: 
 
         is_many = relation.get("relationType") == "many"
         match_key, join_key = resolve_relation_keys(model_name, relation)
-        sub_args = _normalize_dataclass_dict(value) if is_dataclass(value) and not isinstance(value, type) else (dict(value) if isinstance(value, dict) else {})
+        normalized_value = _resolve_include_entry(relation["modelName"], value)
+        sub_args = dict(normalized_value) if isinstance(normalized_value, dict) else {}
         has_take, take_val = _parse_include_bound(sub_args.get("take"), "take", key)
         _, skip_val = _parse_include_bound(sub_args.get("skip"), "skip", key)
 
