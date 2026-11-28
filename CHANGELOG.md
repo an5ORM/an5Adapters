@@ -11,6 +11,7 @@
 
 ### Changed
 - `include` pagination is applied per relation and `select` is preserved when combined with `include`; nested `_count` hydration now matches the parent rows.
+- The optional `better-sqlite3` peer accepts both the 11.x and 12.x lines.
 - Rust `upsert` returns the updated row.
 
 ### Fixed

@@ -115,7 +115,7 @@
   },
   "peerDependencies": {
     "mysql2": "^3.0.0",
-    "better-sqlite3": "^11.0.0"
+    "better-sqlite3": "^11.0.0 || ^12.0.0"
   },
   "peerDependenciesMeta": {
     "mysql2": {
