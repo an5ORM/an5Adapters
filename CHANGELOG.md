@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0] - 2026-11-28
+
+### Added
+- **Typed relation filters in every runtime** — `some`, `none` and `every` for to-many relations and `is`/`isNot` (`is_not`) for to-one relations, compiled to `EXISTS` subqueries with relation-key resolution (`ResolveRelationKeys` / `resolveRelationKeys`) and per-operator aliases so several filters on the same relation do not collide. Available in TypeScript, Python, .NET, Go, Rust, Java, Kotlin and Swift.
+- **Case-insensitive string matching** — `mode: 'insensitive'` on string filters, using `ILIKE` on PostgreSQL and `LOWER()` comparisons on the other dialects. Invalid modes are rejected.
+- **`groupBy` HAVING** — filter aggregate results (`_count`, `_sum`, `_avg`, `_min`, `_max`) and grouped scalar fields with `AND`/`OR`/`NOT`, plus per-field `_count` and filtered relation counts (`_count: { select, where }`). Kotlin and Swift expose `relationCounts()`.
+- **Strict query validation** — unknown filter fields and operators, unknown or duplicate relation operators, invalid `mode` values and malformed `_count`/`having` payloads throw instead of being ignored. Python resolves snake_case keys and accepts filter dataclasses; Go adds `BoolFilter.Not`; Swift compares `NSNull`.
+- **SQLite offset pagination** for the Rust and Go runtimes, and Google Sheets `groupBy` parity.
+
+### Changed
+- `include` pagination is applied per relation and `select` is preserved when combined with `include`; nested `_count` hydration now matches the parent rows.
+- Rust `upsert` returns the updated row.
+
+### Fixed
+- Nested `not` filters inherit the outer `mode: 'insensitive'` and can override it.
+- AND composition across relation and scalar filters no longer drops sibling conditions.
+- Kotlin and Swift `ViewClient` accept the same `findUnique` and `groupBy` query types as the model clients.
+- The Gradle build check rebuilds when cached outputs are stale.
+
 ## [0.2.18] - 2026-11-15
 
 ### Changed

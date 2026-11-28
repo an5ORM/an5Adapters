@@ -6,10 +6,12 @@ Standalone runtime database adapter and query engine for AN5 ORM. Provides conne
 
 - **Dynamic Model Access** — Access models directly via `db.user.findMany()` or `db.User.create()` (proxy resolves casing/plurals via metadata); `db.table('User')` is the escape hatch for runtime-known model names
 - **Typed Model Access** — Bind generated delegates for full type-safety: `createAn5Adapter<{ user: UserTableClient }>({...})`, plus the `TypedAn5Adapter` / `AdapterAPI` helper types
-- **Relations & Eager Loading** — Query nested relations with `include`, relation-level `select`, `where`, `orderBy`, pagination, and `_count`
+- **Relations & Eager Loading** — Query nested relations with `include`, relation-level `select`, `where`, `orderBy`, pagination, and `_count`; filter related rows with `some`, `none`, `every`, `is`, and `isNot`
 - **Nested Writes** — Create and update records with nested relation writes (`create`, `update`, `disconnect`)
 - **Query Builder & Dialects** — Dialect-aware SQL formatting for MSSQL, PostgreSQL, MySQL, and SQLite
-- **Aggregations & GroupBy** — Standard ORM aggregates (`_count`, `_sum`, `_avg`, `_min`, `_max`) and `groupBy`
+- **Aggregations & GroupBy** — Standard ORM aggregates (`_count`, `_sum`, `_avg`, `_min`, `_max`), `groupBy` with HAVING filters, and per-field or filtered relation counts
+- **Case-Insensitive Matching** — `mode: 'insensitive'` on string filters, using `ILIKE` on PostgreSQL and `LOWER()` comparisons elsewhere
+- **Strict Validation** — Unknown fields, operators, relation keys, modes, and malformed aggregate payloads throw instead of being silently ignored
 - **Field Math Operators** — Atomic updates with `increment`, `decrement`, `multiply`, `divide`, `set`
 - **Vector Search** — Similarity search using external vector databases (NBase, Qdrant, Chroma, Pinecone, Weaviate, Milvus), pgvector (PostgreSQL), `VECTOR_DISTANCE` (MSSQL), SQLite, or in-memory cosine/euclidean/dot similarity
 - **Real Transactions** — Interactive and callback transactions (`$transaction(async tx => ...)` and `$begin()/$commit()/$rollback()`)
@@ -510,6 +512,10 @@ return all remaining rows or groups. Supply `orderBy` for stable row pagination;
 `groupBy` orders by its grouping fields when pagination has no explicit ordering.
 With relation metadata configured, `groupBy.where` supports the same relation
 filters as `findMany.where`, including `some`, `none`, `every`, `is`, and `isNot`.
+`groupBy.having` filters aggregate results (`_count`, `_sum`, `_avg`, `_min`,
+`_max`) and grouped scalar fields, and accepts `AND`/`OR`/`NOT`. String filters
+accept `mode: 'insensitive'`; an unknown mode, field, operator, or relation key
+is an error rather than a silently dropped condition.
 
 ---
 
